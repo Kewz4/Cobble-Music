@@ -18,9 +18,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Repository = 'Kewz4/Cobble-Music'
-$UpdaterVersion = '1.2.4'
-# SHA-256 of CobbleMusicUpdater.exe from updater-v1.2.4.
-$ExpectedUpdaterSha256 = '874D592A9880CB755779E7EF04B9D0E45F8D08A0DDE8C00CC486B322AAC9F64F'
+$UpdaterVersion = '1.2.5'
+# SHA-256 of CobbleMusicUpdater.exe from updater-v1.2.5.
+$ExpectedUpdaterSha256 = 'BB0A6F43DD8CE2A01CDAC504988BF25337A76CEAE6656B4DB297C3D535AAC1E0'
 # Keep first-time bootstrap and updater install quick and non-hanging on bad networks.
 $DownloadTimeoutSeconds = 30
 # Prism's QSettings INI parser requires escaped quotes in the physical
