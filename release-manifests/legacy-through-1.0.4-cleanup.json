@@ -50,6 +50,16 @@
     "sha256": "f90123fa679e170163f976819c851fc4bd6840d19cf95dde3ff8fe3682eed343"
   },
   {
+    "path": "mods/infinite-music-0.4.6.jar.disabled-by-cobble-music",
+    "size": 45913,
+    "sha256": "f90123fa679e170163f976819c851fc4bd6840d19cf95dde3ff8fe3682eed343"
+  },
+  {
+    "path": "mods/infinite-music-0.4.6.jar.disabled-by-cobble-music.disabled",
+    "size": 45913,
+    "sha256": "f90123fa679e170163f976819c851fc4bd6840d19cf95dde3ff8fe3682eed343"
+  },
+  {
     "path": "mods/minecraft-cursor-fabric-3.11.3+1.21.1.jar",
     "size": 295354,
     "sha256": "cf2e26a1bfe7957872e549069fca322b9e6f277c93ab3d78dc4163e18a4a166d"
@@ -81,6 +91,16 @@
   },
   {
     "path": "mods/timm-1.1.2-1.21.1.jar",
+    "size": 155336231,
+    "sha256": "e843d529412a65f58e28a67e0b1829583f65e63872cad5e9c1f261dad7129c0a"
+  },
+  {
+    "path": "mods/timm-1.1.2-1.21.1.jar.disabled-by-cobble-music",
+    "size": 155336231,
+    "sha256": "e843d529412a65f58e28a67e0b1829583f65e63872cad5e9c1f261dad7129c0a"
+  },
+  {
+    "path": "mods/timm-1.1.2-1.21.1.jar.disabled-by-cobble-music.disabled",
     "size": 155336231,
     "sha256": "e843d529412a65f58e28a67e0b1829583f65e63872cad5e9c1f261dad7129c0a"
   },

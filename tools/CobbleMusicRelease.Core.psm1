@@ -115,7 +115,7 @@ function Assert-CobbleSourcePathPolicy {
         if ($underMods.Contains('/')) {
             throw "$Context is nested runtime data under mods and may not be distributed: $normalized"
         }
-        if ($underMods -inotmatch '\.jar(?:\.disabled|\.disabled-by-cobble-music)?$') {
+        if ($underMods -inotmatch '\.jar(?:\.disabled)?$') {
             throw "$Context is not an approved top-level mod artifact: $normalized"
         }
     }
@@ -172,7 +172,7 @@ function Get-CobbleManagedSourceFiles {
         $rootFiles = if ($rootName -in @('mods', 'resourcepacks')) {
             $topLevelFiles = @(Get-ChildItem -LiteralPath $rootPath -File -Force)
             $approvedPattern = if ($rootName -ceq 'mods') {
-                '\.jar(?:\.disabled|\.disabled-by-cobble-music)?$'
+                '\.jar(?:\.disabled)?$'
             }
             else {
                 '\.zip$'

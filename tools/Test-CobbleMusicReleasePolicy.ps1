@@ -29,7 +29,8 @@ if (-not $testRoot.StartsWith($temporaryPrefix, [StringComparison]::OrdinalIgnor
 try {
     [IO.Directory]::CreateDirectory($testRoot) | Out-Null
     Write-DummyFile (Join-Path $testRoot 'mods\approved.jar')
-    Write-DummyFile (Join-Path $testRoot 'mods\approved.jar.disabled-by-cobble-music')
+    Write-DummyFile (Join-Path $testRoot 'mods\approved.jar.disabled')
+    Write-DummyFile (Join-Path $testRoot 'mods\legacy.jar.disabled-by-cobble-music')
     Write-DummyFile (Join-Path $testRoot 'mods\mcef-cache\Network\Cookies')
     Write-DummyFile (Join-Path $testRoot 'mods\mcef-libraries\bin\runtime.dll')
     Write-DummyFile (Join-Path $testRoot 'mods\.index\generated.json')
@@ -48,7 +49,7 @@ try {
     $expected = @(
         'config/ReactiveMusic.json5',
         'mods/approved.jar',
-        'mods/approved.jar.disabled-by-cobble-music',
+        'mods/approved.jar.disabled',
         'resourcepacks/approved.zip',
         'resourcepacks/reviewed.zip.rpo'
     )
@@ -60,6 +61,8 @@ try {
         'mods/mcef-cache/Network/Cookies',
         'mods/mcef-libraries/bin/runtime.dll',
         'mods/.index/generated.json',
+        'mods/legacy.jar.disabled-by-cobble-music',
+        'mods/legacy.jar.disabled-by-cobble-music.disabled',
         'resourcepacks/.index/generated.json',
         'resourcepacks/backup.zip.bak',
         'resourcepacks/unreviewed.zip.rpo',
