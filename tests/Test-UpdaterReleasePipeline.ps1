@@ -94,6 +94,19 @@ if (-not $bootstrapHash.Equals($exeHash, [StringComparison]::OrdinalIgnoreCase))
 }
 if ($bootstrapHash -cnotmatch '^[0-9A-F]{64}$') { throw 'Bootstrap updater checksum must be canonical uppercase SHA-256.' }
 
+$bootstrapAssetHash = (Get-FileHash -LiteralPath $BootstrapPath -Algorithm SHA256).Hash
+$updaterDocsPath = Join-Path $Root 'docs\UPDATER.md'
+$updaterDocs = [IO.File]::ReadAllText($updaterDocsPath)
+$docsBootstrapHashPattern = '(?m)^\$expected = ''(?<hash>[0-9A-F]{64})''[ \t]*\r?$'
+$docsBootstrapHashMatches = [regex]::Matches($updaterDocs, $docsBootstrapHashPattern)
+if ($docsBootstrapHashMatches.Count -ne 1) {
+    throw "Updater documentation must contain exactly one canonical bootstrap checksum example; found $($docsBootstrapHashMatches.Count)."
+}
+$docsBootstrapHash = $docsBootstrapHashMatches[0].Groups['hash'].Value
+if (-not $docsBootstrapHash.Equals($bootstrapAssetHash, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Updater documentation bootstrap checksum is stale. Docs=$docsBootstrapHash Bootstrap=$bootstrapAssetHash"
+}
+
 $expectedAssetUri = 'https://github.com/$Repository/releases/download/updater-v$UpdaterVersion/CobbleMusicUpdater.exe'
 $assetUriPattern = '(?m)^[ \t]*\$assetUri[ \t]*=[ \t]*"(?<uri>[^"]+)"[ \t]*\r?$'
 $expectedCommand = '\"$INST_MC_DIR/cobble-music-updater/CobbleMusicUpdater.exe\" --instance-dir \"$INST_DIR\" --minecraft-dir \"$INST_MC_DIR\" --prism-prelaunch'

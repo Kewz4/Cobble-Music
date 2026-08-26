@@ -292,7 +292,7 @@ the player can paste this into PowerShell, replacing the example instance path:
 ```powershell
 $uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.0/Bootstrap-CobbleMusicUpdater.ps1'
 $path = Join-Path $env:TEMP 'Bootstrap-CobbleMusicUpdater.ps1'
-$expected = 'C5FA0140A5F64A68EAC790EBECA2436EF420B44867E4A15B1EBBBDBC37AA5A14'
+$expected = '51749EE47CB76B75DD220ADA3B997B6BCF453D0EF1721448C15C38AB8D3A2545'
 Invoke-WebRequest -Uri $uri -OutFile $path
 if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $expected) { throw 'Bootstrap checksum mismatch.' }
 Unblock-File -LiteralPath $path
