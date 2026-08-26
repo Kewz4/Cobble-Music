@@ -83,10 +83,23 @@ internal sealed class UpdateManifest
     public string ReleaseTag { get; set; } = "";
     public string MinimumUpdaterVersion { get; set; } = "";
     public DateTimeOffset CreatedAtUtc { get; set; }
-    public UpdatePayload Payload { get; set; } = new();
+    public ManifestBase? Base { get; set; }
+    public UpdatePayload? Payload { get; set; }
+    // Schema 1 payloads contain every entry in Files. Schema 2 payloads contain
+    // only these changed/new entries while Files remains the authoritative
+    // complete post-update state.
+    public List<ManifestFile> PayloadFiles { get; set; } = [];
+    // Schema 2 removals carry the exact metadata from the signed base state.
+    public List<ManifestFile> DeletedFiles { get; set; } = [];
     public List<ManifestFile> Files { get; set; } = [];
     public List<string> DeletePaths { get; set; } = [];
     public List<LegacyCleanupFile> LegacyCleanup { get; set; } = [];
+}
+
+internal sealed class ManifestBase
+{
+    public string Version { get; set; } = "";
+    public string ManifestSha256 { get; set; } = "";
 }
 
 internal sealed class UpdatePayload
@@ -132,4 +145,6 @@ internal sealed record RemoteRelease(
     GitHubRelease Release,
     byte[] ManifestBytes,
     byte[] SignatureBytes,
-    IReadOnlyDictionary<string, Uri> AssetUrls);
+    IReadOnlyDictionary<string, Uri> AssetUrls,
+    UpdateManifest Manifest,
+    string ManifestSha256);

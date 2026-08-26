@@ -83,6 +83,43 @@ internal static class LocalStateStore
         {
             return new InstalledState();
         }
+        bool hasIdentity = !string.IsNullOrWhiteSpace(state.Version) || !string.IsNullOrWhiteSpace(state.ManifestSha256);
+        if (hasIdentity && (!Version.TryParse(state.Version, out _)
+            || string.IsNullOrWhiteSpace(state.ManifestSha256)
+            || state.ManifestSha256.Length != 64
+            || state.ManifestSha256.Any(character => !Uri.IsHexDigit(character))))
+        {
+            return new InstalledState();
+        }
+        if (!hasIdentity && state.ManagedFiles.Count != 0)
+        {
+            return new InstalledState();
+        }
+        var seenPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (ManagedFileState file in state.ManagedFiles)
+        {
+            if (file is null)
+            {
+                return new InstalledState();
+            }
+            try
+            {
+                file.Path = PathSafety.NormalizeRelativePath(file.Path);
+            }
+            catch (InvalidDataException)
+            {
+                return new InstalledState();
+            }
+            if (!PathSafety.IsAllowed(file.Path, BuildInfo.SupportedRoots)
+                || file.Size < 0
+                || string.IsNullOrWhiteSpace(file.Sha256)
+                || file.Sha256.Length != 64
+                || file.Sha256.Any(character => !Uri.IsHexDigit(character))
+                || !seenPaths.Add(file.Path))
+            {
+                return new InstalledState();
+            }
+        }
         return state;
     }
 
@@ -91,7 +128,18 @@ internal static class LocalStateStore
         Directory.CreateDirectory(paths.InstallationDirectory);
         string temporary = paths.StatePath + ".new";
         byte[] content = JsonSerializer.SerializeToUtf8Bytes(state, JsonOptions);
-        await File.WriteAllBytesAsync(temporary, content, cancellationToken);
+        await using (var output = new FileStream(
+            temporary,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.None,
+            64 * 1024,
+            FileOptions.Asynchronous | FileOptions.WriteThrough))
+        {
+            await output.WriteAsync(content, cancellationToken);
+            await output.FlushAsync(cancellationToken);
+            output.Flush(flushToDisk: true);
+        }
         File.Move(temporary, paths.StatePath, overwrite: true);
     }
 

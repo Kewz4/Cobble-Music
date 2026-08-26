@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text.Json;
 
 namespace CobbleMusicUpdater;
@@ -11,6 +12,7 @@ internal sealed class ReleaseClient : IDisposable
     private const int MaxReleaseIndexBytes = 4 * 1024 * 1024;
     private const int MaxManifestBytes = 8 * 1024 * 1024;
     private const int MaxSignatureBytes = 64 * 1024;
+    private const int MaxReleasePages = 5;
 
     private readonly HttpClient _http;
     private readonly JsonSerializerOptions _jsonOptions = new()
@@ -34,47 +36,120 @@ internal sealed class ReleaseClient : IDisposable
         _http.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
     }
 
-    public async Task<RemoteRelease?> GetLatestAsync(UpdaterConfiguration configuration, CancellationToken cancellationToken)
+    public async Task<IReadOnlyList<RemoteRelease>> GetUpdateChainAsync(
+        UpdaterConfiguration configuration,
+        InstalledState installedState,
+        CancellationToken cancellationToken)
     {
-        // Do not use GitHub's /releases/latest endpoint here. A normal source
-        // or updater-binary release could otherwise mask the most recent
-        // modpack payload. `modpack-v*` is a deliberately reserved tag
-        // namespace and we choose the highest stable semantic version within it.
-        string endpoint = $"https://api.github.com/repos/{configuration.Repository}/releases?per_page=100";
-        using HttpResponseMessage response = await _http.GetAsync(endpoint, cancellationToken);
-        if (response.StatusCode == HttpStatusCode.NotFound)
+        List<GitHubRelease> releases = await GetPublishedModpackReleasesAsync(configuration, cancellationToken);
+        if (releases.Count == 0)
         {
-            return null;
-        }
-        response.EnsureSuccessStatusCode();
-
-        byte[] releaseIndex = await ReadBoundedBytesAsync(response.Content, MaxReleaseIndexBytes, cancellationToken);
-        List<GitHubRelease>? releases = JsonSerializer.Deserialize<List<GitHubRelease>>(releaseIndex, _jsonOptions);
-        GitHubRelease? release = releases?
-            .Where(candidate => !candidate.Draft
-                && !candidate.Prerelease
-                && candidate.TagName.StartsWith("modpack-v", StringComparison.OrdinalIgnoreCase)
-                && Version.TryParse(candidate.TagName["modpack-v".Length..], out _)
-                && candidate.Assets.Any(asset => string.Equals(asset.Name, configuration.ManifestAsset, StringComparison.Ordinal))
-                && candidate.Assets.Any(asset => string.Equals(asset.Name, configuration.SignatureAsset, StringComparison.Ordinal)))
-            .OrderByDescending(candidate => Version.Parse(candidate.TagName["modpack-v".Length..]))
-            .FirstOrDefault();
-        if (release is null)
-        {
-            return null;
+            return [];
         }
 
-        var assets = release.Assets.ToDictionary(asset => asset.Name, StringComparer.OrdinalIgnoreCase);
-        if (!assets.TryGetValue(configuration.ManifestAsset, out GitHubAsset? manifestAsset)
-            || !assets.TryGetValue(configuration.SignatureAsset, out GitHubAsset? signatureAsset))
+        // Manifests carry the delta base hash, so a chain cannot be selected
+        // safely from tags alone. Verify every candidate first, with bounded
+        // parallelism to avoid serial release latency or API bursts.
+        using var throttle = new SemaphoreSlim(4);
+        Task<RemoteRelease>[] tasks = releases.Select(async release =>
         {
-            throw new InvalidDataException("Latest GitHub release is missing the signed Kewz's Cobblemon manifest assets.");
+            await throttle.WaitAsync(cancellationToken);
+            try
+            {
+                return await DownloadAndVerifyReleaseAsync(release, configuration, cancellationToken);
+            }
+            finally
+            {
+                throttle.Release();
+            }
+        }).ToArray();
+        RemoteRelease[] verified = await Task.WhenAll(tasks);
+        return BuildSequentialChain(verified, installedState);
+    }
+
+    internal static IReadOnlyList<RemoteRelease> BuildSequentialChain(
+        IEnumerable<RemoteRelease> verifiedReleases,
+        InstalledState installedState)
+    {
+        List<RemoteRelease> releases = verifiedReleases
+            .OrderBy(release => Version.Parse(release.Manifest.Version))
+            .ToList();
+        if (releases.GroupBy(release => release.Manifest.Version, StringComparer.OrdinalIgnoreCase).Any(group => group.Count() != 1))
+        {
+            throw new InvalidDataException("Published modpack releases contain duplicate semantic versions.");
         }
 
-        byte[] manifest = await DownloadBytesAsync(new Uri(manifestAsset.BrowserDownloadUrl), MaxManifestBytes, cancellationToken);
-        byte[] signature = await DownloadBytesAsync(new Uri(signatureAsset.BrowserDownloadUrl), MaxSignatureBytes, cancellationToken);
-        var urls = assets.ToDictionary(pair => pair.Key, pair => new Uri(pair.Value.BrowserDownloadUrl), StringComparer.OrdinalIgnoreCase);
-        return new RemoteRelease(release, manifest, signature, urls);
+        bool hasInstalledVersion = Version.TryParse(installedState.Version, out Version? installedVersion);
+        var candidates = new List<List<RemoteRelease>>();
+
+        // An installed delta base is usable only when its exact signed manifest
+        // is still published and verified. The anchor is included so the
+        // engine can compare state metadata to the signed full file set before
+        // it accepts any subsequent delta.
+        if (hasInstalledVersion)
+        {
+            RemoteRelease? anchor = releases.FirstOrDefault(release =>
+                string.Equals(release.Manifest.Version, installedState.Version, StringComparison.Ordinal)
+                && string.Equals(release.ManifestSha256, installedState.ManifestSha256, StringComparison.OrdinalIgnoreCase));
+            if (anchor is not null)
+            {
+                var anchoredPath = new List<RemoteRelease> { anchor };
+                anchoredPath.AddRange(BestDeltaPath(anchor, releases));
+                candidates.Add(anchoredPath);
+            }
+        }
+
+        // A schema-1 release is a complete signed baseline. It may safely
+        // bootstrap a fresh install or replace an older installed version,
+        // after which schema-2 releases are followed by exact base hashes.
+        foreach (RemoteRelease baseline in releases.Where(release =>
+            release.Manifest.SchemaVersion == 1
+            && (!hasInstalledVersion || Version.Parse(release.Manifest.Version) > installedVersion)))
+        {
+            var path = new List<RemoteRelease> { baseline };
+            path.AddRange(BestDeltaPath(baseline, releases));
+            candidates.Add(path);
+        }
+
+        if (candidates.Count == 0)
+        {
+            return [];
+        }
+
+        return candidates
+            .OrderByDescending(path => Version.Parse(path[^1].Manifest.Version))
+            .ThenBy(path => path.Sum(release => release.Manifest.Payload?.Size ?? 0L))
+            .ThenBy(path => path.Count)
+            .First();
+    }
+
+    private static IReadOnlyList<RemoteRelease> BestDeltaPath(
+        RemoteRelease current,
+        IReadOnlyCollection<RemoteRelease> releases)
+    {
+        List<List<RemoteRelease>> paths = releases
+            .Where(candidate => candidate.Manifest.SchemaVersion == 2
+                && candidate.Manifest.Base is not null
+                && string.Equals(candidate.Manifest.Base.Version, current.Manifest.Version, StringComparison.Ordinal)
+                && string.Equals(candidate.Manifest.Base.ManifestSha256, current.ManifestSha256, StringComparison.OrdinalIgnoreCase)
+                && Version.Parse(candidate.Manifest.Version) > Version.Parse(current.Manifest.Version))
+            .Select(candidate =>
+            {
+                var path = new List<RemoteRelease> { candidate };
+                path.AddRange(BestDeltaPath(candidate, releases));
+                return path;
+            })
+            .ToList();
+
+        if (paths.Count == 0)
+        {
+            return [];
+        }
+        return paths
+            .OrderByDescending(path => Version.Parse(path[^1].Manifest.Version))
+            .ThenBy(path => path.Sum(release => release.Manifest.Payload?.Size ?? 0L))
+            .ThenBy(path => path.Count)
+            .First();
     }
 
     public async Task DownloadFileAsync(
@@ -153,6 +228,85 @@ internal sealed class ReleaseClient : IDisposable
     }
 
     public void Dispose() => _http.Dispose();
+
+    private async Task<List<GitHubRelease>> GetPublishedModpackReleasesAsync(
+        UpdaterConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
+        var result = new List<GitHubRelease>();
+        for (int page = 1; page <= MaxReleasePages; page++)
+        {
+            string endpoint = $"https://api.github.com/repos/{configuration.Repository}/releases?per_page=100&page={page}";
+            using HttpResponseMessage response = await _http.GetAsync(endpoint, cancellationToken);
+            if (response.StatusCode == HttpStatusCode.NotFound)
+            {
+                return [];
+            }
+            response.EnsureSuccessStatusCode();
+
+            byte[] releaseIndex = await ReadBoundedBytesAsync(response.Content, MaxReleaseIndexBytes, cancellationToken);
+            List<GitHubRelease>? pageReleases = JsonSerializer.Deserialize<List<GitHubRelease>>(releaseIndex, _jsonOptions);
+            if (pageReleases is null)
+            {
+                throw new InvalidDataException("GitHub returned an invalid release index.");
+            }
+            result.AddRange(pageReleases.Where(candidate => !candidate.Draft
+                && !candidate.Prerelease
+                && candidate.TagName.StartsWith("modpack-v", StringComparison.OrdinalIgnoreCase)
+                && Version.TryParse(candidate.TagName["modpack-v".Length..], out _)
+                && candidate.Assets.Any(asset => string.Equals(asset.Name, configuration.ManifestAsset, StringComparison.Ordinal))
+                && candidate.Assets.Any(asset => string.Equals(asset.Name, configuration.SignatureAsset, StringComparison.Ordinal))));
+            if (pageReleases.Count < 100)
+            {
+                break;
+            }
+            if (page == MaxReleasePages)
+            {
+                throw new InvalidDataException("GitHub has too many releases for the updater's bounded release-chain scan.");
+            }
+        }
+        return result;
+    }
+
+    private async Task<RemoteRelease> DownloadAndVerifyReleaseAsync(
+        GitHubRelease release,
+        UpdaterConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
+        if (release.Assets.GroupBy(asset => asset.Name, StringComparer.OrdinalIgnoreCase).Any(group => group.Count() != 1))
+        {
+            throw new InvalidDataException($"GitHub release {release.TagName} contains duplicate asset names.");
+        }
+        var assets = release.Assets.ToDictionary(asset => asset.Name, StringComparer.OrdinalIgnoreCase);
+        if (!assets.TryGetValue(configuration.ManifestAsset, out GitHubAsset? manifestAsset)
+            || !assets.TryGetValue(configuration.SignatureAsset, out GitHubAsset? signatureAsset))
+        {
+            throw new InvalidDataException($"GitHub release {release.TagName} is missing signed manifest assets.");
+        }
+
+        byte[] manifestBytes = await DownloadBytesAsync(ValidatedAssetUri(manifestAsset), MaxManifestBytes, cancellationToken);
+        byte[] signatureBytes = await DownloadBytesAsync(ValidatedAssetUri(signatureAsset), MaxSignatureBytes, cancellationToken);
+        var urls = assets.ToDictionary(pair => pair.Key, pair => ValidatedAssetUri(pair.Value), StringComparer.OrdinalIgnoreCase);
+        UpdateManifest manifest = ManifestParser.VerifyAndParse(manifestBytes, signatureBytes);
+        ManifestParser.Validate(manifest, configuration, urls);
+        if (!string.Equals(manifest.ReleaseTag, release.TagName, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException("Signed manifest release tag does not match the GitHub release that carried it.");
+        }
+        string manifestHash = Convert.ToHexString(SHA256.HashData(manifestBytes)).ToLowerInvariant();
+        return new RemoteRelease(release, manifestBytes, signatureBytes, urls, manifest, manifestHash);
+    }
+
+    private static Uri ValidatedAssetUri(GitHubAsset asset)
+    {
+        if (!Uri.TryCreate(asset.BrowserDownloadUrl, UriKind.Absolute, out Uri? uri)
+            || uri.Scheme != Uri.UriSchemeHttps
+            || string.IsNullOrWhiteSpace(uri.Host))
+        {
+            throw new InvalidDataException($"GitHub release contains an invalid HTTPS asset URL for {asset.Name}.");
+        }
+        return uri;
+    }
 
     private async Task<byte[]> DownloadBytesAsync(Uri source, int maximumBytes, CancellationToken cancellationToken)
     {

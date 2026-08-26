@@ -63,13 +63,14 @@ internal static class Program
             // configuration must not conceal an interrupted file transaction.
             await TransactionStore.RecoverIfNeededAsync(paths, BuildInfo.SupportedRoots, Log);
             UpdaterConfiguration configuration = LocalStateStore.LoadConfiguration(paths);
+            InstalledState installedState = LocalStateStore.LoadState(paths);
             using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(configuration.NetworkTimeoutSeconds));
 
-            RemoteRelease? release;
+            IReadOnlyList<RemoteRelease> releaseChain;
             try
             {
                 Log("Checking GitHub Releases...");
-                release = await releaseClient.GetLatestAsync(configuration, cancellation.Token);
+                releaseChain = await releaseClient.GetUpdateChainAsync(configuration, installedState, cancellation.Token);
             }
             catch (Exception exception) when (configuration.AllowOfflineLaunch && IsExpectedNetworkFailure(exception))
             {
@@ -81,7 +82,7 @@ internal static class Program
             var engine = new UpdateEngine(paths, configuration, Log, progress);
             try
             {
-                await engine.CheckAndUpdateAsync(release, options.CheckOnly, cancellation.Token);
+                await engine.CheckAndUpdateAsync(releaseChain, options.CheckOnly, cancellation.Token);
                 return 0;
             }
             catch (TransactionRecoveryException)

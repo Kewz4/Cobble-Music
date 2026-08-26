@@ -5,6 +5,8 @@ namespace CobbleMusicUpdater;
 
 internal sealed class UpdateEngine
 {
+    private const long DiskReserveBytes = 256L * 1024 * 1024;
+
     private readonly UpdaterPaths _paths;
     private readonly UpdaterConfiguration _configuration;
     private readonly Action<string> _log;
@@ -22,76 +24,216 @@ internal sealed class UpdateEngine
         _progress = progress;
     }
 
-    public async Task CheckAndUpdateAsync(RemoteRelease? remoteRelease, bool checkOnly, CancellationToken cancellationToken)
+    public async Task CheckAndUpdateAsync(
+        IReadOnlyList<RemoteRelease> releaseChain,
+        bool checkOnly,
+        CancellationToken cancellationToken)
     {
         await TransactionStore.RecoverIfNeededAsync(_paths, BuildInfo.SupportedRoots, _log);
-        if (remoteRelease is null)
+        if (releaseChain.Count == 0)
         {
-            _log("No published update release yet; launching the installed pack.");
-            Report(UpdatePhase.Complete, "No update is published yet — starting Minecraft.");
+            _log("No applicable published update chain; launching the installed pack.");
+            Report(UpdatePhase.Complete, "No applicable update is published — starting Minecraft.");
             return;
         }
 
         Report(UpdatePhase.VerifyingRelease, "Verifying signed update information…");
-        UpdateManifest manifest = ManifestParser.VerifyAndParse(remoteRelease.ManifestBytes, remoteRelease.SignatureBytes);
-        ManifestParser.Validate(manifest, _configuration, remoteRelease.AssetUrls);
-        if (!string.Equals(manifest.ReleaseTag, remoteRelease.Release.TagName, StringComparison.Ordinal))
+        foreach (RemoteRelease release in releaseChain)
         {
-            throw new InvalidDataException("Signed manifest release tag does not match the GitHub release that carried it.");
+            ValidateRemoteRelease(release);
         }
-        InstalledState state = LocalStateStore.LoadState(_paths);
-        string manifestHash = Convert.ToHexString(SHA256.HashData(remoteRelease.ManifestBytes)).ToLowerInvariant();
 
-        if (IsAlreadyInstalled(state, manifest, manifestHash))
+        InstalledState state = LocalStateStore.LoadState(_paths);
+        RemoteRelease targetRelease = releaseChain[^1];
+        UpdateManifest target = targetRelease.Manifest;
+        if (IsAlreadyInstalled(state, target, targetRelease.ManifestSha256))
         {
-            _log($"Already on Kewz's Cobblemon {manifest.Version}.");
+            _log($"Already on Kewz's Cobblemon {target.Version}.");
             Report(UpdatePhase.Complete, "You’re up to date — starting Minecraft.");
             return;
         }
-        if (IsDowngradeOrMutation(state, manifest, manifestHash))
+        if (IsDowngradeOrMutation(state, target, targetRelease.ManifestSha256))
         {
-            _log($"Ignoring non-newer or mutated release {manifest.Version}; keeping local {state.Version}.");
+            _log($"Ignoring non-newer or mutated release {target.Version}; keeping local {state.Version}.");
             Report(UpdatePhase.Complete, "Keeping your installed Kewz's Cobblemon version.");
             return;
         }
 
-        _log($"Update {manifest.Version} is available.");
-        Report(UpdatePhase.UpdateAvailable, $"Update found: Kewz's Cobblemon {manifest.Version}");
+        _log($"Update {target.Version} is available through {releaseChain.Count} verified release step(s).");
+        Report(UpdatePhase.UpdateAvailable, $"Update found: Kewz's Cobblemon {target.Version}");
         if (checkOnly)
         {
-            Report(UpdatePhase.Complete, $"Kewz's Cobblemon {manifest.Version} is ready to install.");
+            Report(UpdatePhase.Complete, $"Kewz's Cobblemon {target.Version} is ready to install.");
             return;
         }
 
         LocalStateStore.AssertWritable(_paths);
-        await DownloadVerifyAndApplyAsync(manifest, manifestHash, remoteRelease.AssetUrls, state, cancellationToken);
-        _log($"Kewz's Cobblemon {manifest.Version} installed successfully.");
-        Report(UpdatePhase.Complete, $"Kewz's Cobblemon {manifest.Version} installed — starting Minecraft.");
+        UpdateManifest? trustedBase = null;
+        string trustedBaseHash = "";
+        foreach (RemoteRelease release in releaseChain)
+        {
+            UpdateManifest manifest = release.Manifest;
+            if (await TryAdoptExistingBaselineAsync(manifest, release.ManifestSha256, state, cancellationToken))
+            {
+                state = LocalStateStore.LoadState(_paths);
+                trustedBase = manifest;
+                trustedBaseHash = release.ManifestSha256;
+                _log($"Adopted the exact existing signed baseline {manifest.Version}; no payload download was needed.");
+                continue;
+            }
+
+            bool sameIdentity = string.Equals(state.Version, manifest.Version, StringComparison.Ordinal)
+                && string.Equals(state.ManifestSha256, release.ManifestSha256, StringComparison.OrdinalIgnoreCase);
+            if (sameIdentity && StateMatchesManifestAndSizes(state, manifest))
+            {
+                trustedBase = manifest;
+                trustedBaseHash = release.ManifestSha256;
+                continue;
+            }
+
+            if (sameIdentity && manifest.SchemaVersion == 2)
+            {
+                throw new InvalidDataException(
+                    $"Installed delta {manifest.Version} is incomplete and cannot be repaired from its changed-files-only payload. Install a full signed baseline first.");
+            }
+            if (IsDowngradeOrMutation(state, manifest, release.ManifestSha256))
+            {
+                throw new InvalidDataException($"Verified update chain is not strictly newer than installed state {state.Version}.");
+            }
+
+            if (manifest.SchemaVersion == 2)
+            {
+                if (trustedBase is null)
+                {
+                    throw new InvalidDataException($"Delta {manifest.Version} has no verified signed base in the release chain.");
+                }
+                await DeltaValidator.ValidateBaseAsync(
+                    manifest,
+                    trustedBase,
+                    trustedBaseHash,
+                    state,
+                    _paths,
+                    _configuration,
+                    cancellationToken);
+            }
+
+            EnsureSufficientDiskSpace(manifest, state);
+            await DownloadVerifyAndApplyAsync(
+                manifest,
+                release.ManifestSha256,
+                release.AssetUrls,
+                state,
+                cancellationToken);
+            state = LocalStateStore.LoadState(_paths);
+            trustedBase = manifest;
+            trustedBaseHash = release.ManifestSha256;
+            _log($"Applied verified release step {manifest.Version}.");
+        }
+
+        _log($"Kewz's Cobblemon {target.Version} installed successfully.");
+        Report(UpdatePhase.Complete, $"Kewz's Cobblemon {target.Version} installed — starting Minecraft.");
     }
 
-    private bool IsAlreadyInstalled(InstalledState state, UpdateManifest manifest, string manifestHash)
+    internal async Task<bool> TryAdoptExistingBaselineAsync(
+        UpdateManifest manifest,
+        string manifestHash,
+        InstalledState state,
+        CancellationToken cancellationToken)
     {
-        if (!string.Equals(state.Version, manifest.Version, StringComparison.Ordinal)
-            || !string.Equals(state.ManifestSha256, manifestHash, StringComparison.OrdinalIgnoreCase)
-            || state.ManagedFiles.Count != manifest.Files.Count)
+        if (manifest.SchemaVersion != 1
+            || !string.IsNullOrWhiteSpace(state.Version)
+            || !string.IsNullOrWhiteSpace(state.ManifestSha256)
+            || state.ManagedFiles.Count != 0)
         {
             return false;
         }
 
-        var recordedFiles = state.ManagedFiles.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
-        foreach (ManifestFile manifestFile in manifest.Files)
+        // Adoption is deliberately all-or-nothing. It is safe only when every
+        // signed file already has exact content and there is no pending named
+        // cleanup whose omission would leave the instance non-canonical.
+        foreach (ManifestFile file in manifest.Files)
         {
-            if (!recordedFiles.TryGetValue(manifestFile.Path, out ManagedFileState? recorded)
-                || recorded.Size != manifestFile.Size
-                || !string.Equals(recorded.Sha256, manifestFile.Sha256, StringComparison.OrdinalIgnoreCase))
+            cancellationToken.ThrowIfCancellationRequested();
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (!File.Exists(target)
+                || new FileInfo(target).Length != file.Size
+                || !PathSafety.IsExpectedHash(await PathSafety.Sha256Async(target, cancellationToken), file.Sha256))
             {
                 return false;
             }
+        }
+        foreach (string cleanupPath in manifest.DeletePaths
+            .Concat(manifest.LegacyCleanup.Select(file => file.Path))
+            .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, cleanupPath);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (File.Exists(target) || Directory.Exists(target))
+            {
+                return false;
+            }
+        }
 
+        var adoptedState = new InstalledState
+        {
+            Version = manifest.Version,
+            ManifestSha256 = manifestHash,
+            AppliedAtUtc = DateTimeOffset.UtcNow,
+            ManagedFiles = manifest.Files.Select(file => new ManagedFileState
+            {
+                Path = file.Path,
+                Size = file.Size,
+                Sha256 = file.Sha256
+            }).ToList()
+        };
+        await LocalStateStore.SaveStateAsync(_paths, adoptedState, cancellationToken);
+        return true;
+    }
+
+    private void ValidateRemoteRelease(RemoteRelease release)
+    {
+        UpdateManifest parsed = ManifestParser.VerifyAndParse(release.ManifestBytes, release.SignatureBytes);
+        ManifestParser.Validate(parsed, _configuration, release.AssetUrls);
+        string actualHash = Convert.ToHexString(SHA256.HashData(release.ManifestBytes)).ToLowerInvariant();
+        if (!string.Equals(parsed.ReleaseTag, release.Release.TagName, StringComparison.Ordinal)
+            || !string.Equals(parsed.Version, release.Manifest.Version, StringComparison.Ordinal)
+            || !string.Equals(actualHash, release.ManifestSha256, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("Verified release-chain metadata changed after selection.");
+        }
+    }
+
+    private bool IsAlreadyInstalled(InstalledState state, UpdateManifest manifest, string manifestHash) =>
+        string.Equals(state.Version, manifest.Version, StringComparison.Ordinal)
+        && string.Equals(state.ManifestSha256, manifestHash, StringComparison.OrdinalIgnoreCase)
+        && StateMatchesManifestAndSizes(state, manifest);
+
+    private bool StateMatchesManifestAndSizes(InstalledState state, UpdateManifest manifest)
+    {
+        if (state.ManagedFiles.Count != manifest.Files.Count)
+        {
+            return false;
+        }
+        Dictionary<string, ManagedFileState> recordedFiles;
+        try
+        {
+            recordedFiles = state.ManagedFiles.ToDictionary(file => PathSafety.NormalizeRelativePath(file.Path), StringComparer.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+        foreach (ManifestFile manifestFile in manifest.Files)
+        {
+            if (!recordedFiles.TryGetValue(manifestFile.Path, out ManagedFileState? recorded)
+                || !ManifestParser.SameFile(recorded, manifestFile))
+            {
+                return false;
+            }
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, manifestFile.Path);
             if (!File.Exists(target) || new FileInfo(target).Length != manifestFile.Size)
             {
-                _log($"Repairing incomplete local Kewz's Cobblemon {manifest.Version} files.");
                 return false;
             }
         }
@@ -118,43 +260,55 @@ internal sealed class UpdateEngine
         string partsDirectory = Path.Combine(workDirectory, "parts");
         string archivePath = Path.Combine(workDirectory, "payload.zip");
         string extractDirectory = Path.Combine(workDirectory, "extracted");
-        Directory.CreateDirectory(partsDirectory);
-
-        using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(_configuration.NetworkTimeoutSeconds));
-        long totalDownloadBytes = checked(manifest.Payload.Parts.Sum(part => part.Size));
-        long completedDownloadBytes = 0;
-        foreach (PayloadPart part in manifest.Payload.Parts)
+        if (manifest.Payload is not null)
         {
-            string partPath = Path.Combine(partsDirectory, part.Name);
-            _log($"Downloading {part.Name}...");
-            long completedBeforePart = completedDownloadBytes;
-            Report(UpdatePhase.Downloading, "Downloading update", completedBeforePart, totalDownloadBytes);
-            await DownloadVerifiedPartAsync(
-                releaseClient,
-                assetUrls[part.Name],
-                part,
-                partPath,
-                downloaded => Report(UpdatePhase.Downloading, "Downloading update", completedBeforePart + downloaded, totalDownloadBytes),
+            Directory.CreateDirectory(partsDirectory);
+            using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(_configuration.NetworkTimeoutSeconds));
+            long totalDownloadBytes = checked(manifest.Payload.Parts.Sum(part => part.Size));
+            long completedDownloadBytes = 0;
+            foreach (PayloadPart part in manifest.Payload.Parts)
+            {
+                string partPath = Path.Combine(partsDirectory, part.Name);
+                _log($"Downloading {part.Name}...");
+                long completedBeforePart = completedDownloadBytes;
+                Report(UpdatePhase.Downloading, "Downloading update", completedBeforePart, totalDownloadBytes);
+                await DownloadVerifiedPartAsync(
+                    releaseClient,
+                    assetUrls[part.Name],
+                    part,
+                    partPath,
+                    downloaded => Report(UpdatePhase.Downloading, "Downloading update", completedBeforePart + downloaded, totalDownloadBytes),
+                    cancellationToken);
+                completedDownloadBytes = checked(completedDownloadBytes + part.Size);
+            }
+
+            _log("Reassembling verified update payload...");
+            Report(UpdatePhase.Reassembling, "Reassembling verified update…");
+            await CombinePartsAndDeleteAsync(manifest.Payload.Parts, partsDirectory, archivePath, cancellationToken);
+            await VerifyFileAsync(archivePath, manifest.Payload.Size, manifest.Payload.Sha256, "update payload", cancellationToken);
+
+            _log("Validating update archive...");
+            Report(UpdatePhase.Validating, "Validating update files…");
+            if (Directory.Exists(extractDirectory))
+            {
+                Directory.Delete(extractDirectory, recursive: true);
+            }
+            Directory.CreateDirectory(extractDirectory);
+            await ExtractAndVerifyAsync(
+                archivePath,
+                extractDirectory,
+                ManifestParser.PayloadContents(manifest),
                 cancellationToken);
-            completedDownloadBytes = checked(completedDownloadBytes + part.Size);
         }
-
-        _log("Reassembling verified update payload...");
-        Report(UpdatePhase.Reassembling, "Reassembling verified update…");
-        await CombinePartsAsync(manifest.Payload.Parts, partsDirectory, archivePath, cancellationToken);
-        await VerifyFileAsync(archivePath, manifest.Payload.Size, manifest.Payload.Sha256, "update payload", cancellationToken);
-
-        _log("Validating update archive...");
-        Report(UpdatePhase.Validating, "Validating update files…");
-        if (Directory.Exists(extractDirectory))
+        else
         {
-            Directory.Delete(extractDirectory, recursive: true);
+            // A deletion-only schema-v2 release has no payload assets.
+            Directory.CreateDirectory(extractDirectory);
         }
-        Directory.CreateDirectory(extractDirectory);
-        await ExtractAndVerifyAsync(archivePath, extractDirectory, manifest.Files, cancellationToken);
 
         _log("Applying verified update...");
-        Report(UpdatePhase.Applying, "Installing verified files", 0, 0, 0, manifest.Files.Count);
+        IReadOnlyCollection<ManifestFile> payloadFiles = ManifestParser.PayloadContents(manifest);
+        Report(UpdatePhase.Applying, "Installing verified files", 0, 0, 0, payloadFiles.Count);
         await ApplyTransactionAsync(manifest, manifestHash, extractDirectory, previousState, cancellationToken);
         TryDeleteDirectory(workDirectory);
     }
@@ -180,7 +334,7 @@ internal sealed class UpdateEngine
         throw new InvalidDataException($"Checksum verification failed for {part.Name}.");
     }
 
-    private static async Task CombinePartsAsync(
+    private static async Task CombinePartsAndDeleteAsync(
         IReadOnlyCollection<PayloadPart> parts,
         string partsDirectory,
         string archivePath,
@@ -189,8 +343,14 @@ internal sealed class UpdateEngine
         await using var destination = new FileStream(archivePath, FileMode.Create, FileAccess.Write, FileShare.None, 1024 * 1024, useAsync: true);
         foreach (PayloadPart part in parts)
         {
-            await using var source = new FileStream(Path.Combine(partsDirectory, part.Name), FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, useAsync: true);
-            await source.CopyToAsync(destination, 1024 * 1024, cancellationToken);
+            string partPath = Path.Combine(partsDirectory, part.Name);
+            await using (var source = new FileStream(partPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, useAsync: true))
+            {
+                await source.CopyToAsync(destination, 1024 * 1024, cancellationToken);
+            }
+            // Keeping consumed chunks while also growing the archive doubles
+            // peak disk use. A failed combine can safely redownload a chunk.
+            File.Delete(partPath);
         }
         await destination.FlushAsync(cancellationToken);
     }
@@ -214,7 +374,7 @@ internal sealed class UpdateEngine
         }
     }
 
-    private async Task ExtractAndVerifyAsync(
+    private static async Task ExtractAndVerifyAsync(
         string archivePath,
         string extractDirectory,
         IReadOnlyCollection<ManifestFile> expectedFiles,
@@ -227,11 +387,10 @@ internal sealed class UpdateEngine
         {
             if (entry.FullName.EndsWith("/", StringComparison.Ordinal))
             {
+                _ = PathSafety.NormalizeRelativePath(entry.FullName.TrimEnd('/'));
                 continue;
             }
 
-            // Reject Unix symbolic-link ZIP entries rather than relying on a
-            // platform-specific extraction behavior.
             int unixFileType = (entry.ExternalAttributes >> 16) & 0xF000;
             if (unixFileType == 0xA000)
             {
@@ -257,7 +416,7 @@ internal sealed class UpdateEngine
 
         if (extracted.Count != expected.Count)
         {
-            throw new InvalidDataException("Update archive is missing one or more signed files.");
+            throw new InvalidDataException("Update archive is missing one or more signed payload files.");
         }
     }
 
@@ -270,12 +429,31 @@ internal sealed class UpdateEngine
     {
         string transactionId = DateTimeOffset.UtcNow.ToString("yyyyMMddHHmmss") + "-" + Guid.NewGuid().ToString("N");
         string backupDirectory = Path.Combine(_paths.LocalDataDirectory, "rollback", transactionId, "files");
-        var journal = new TransactionJournal();
+        var newState = new InstalledState
+        {
+            Version = manifest.Version,
+            ManifestSha256 = manifestHash,
+            AppliedAtUtc = DateTimeOffset.UtcNow,
+            ManagedFiles = manifest.Files.Select(file => new ManagedFileState
+            {
+                Path = file.Path,
+                Size = file.Size,
+                Sha256 = file.Sha256
+            }).ToList()
+        };
+        var journal = new TransactionJournal
+        {
+            PreviousState = previousState,
+            NextState = newState
+        };
+        await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
+
         try
         {
+            IReadOnlyCollection<ManifestFile> payloadFiles = ManifestParser.PayloadContents(manifest);
             int appliedFiles = 0;
-            int totalFiles = manifest.Files.Count;
-            foreach (ManifestFile file in manifest.Files)
+            int totalFiles = payloadFiles.Count + manifest.DeletedFiles.Count;
+            foreach (ManifestFile file in payloadFiles)
             {
                 Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
                 string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
@@ -286,10 +464,7 @@ internal sealed class UpdateEngine
 
                 if (File.Exists(target))
                 {
-                    journal.Operations.Add(new TransactionOperation { Kind = "replace", TargetPath = target, BackupPath = backup });
-                    await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
-                    Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
-                    TransactionStore.MoveOrCopy(target, backup);
+                    await BackupForOperationAsync("replace", target, backup, journal, cancellationToken);
                 }
                 else
                 {
@@ -303,81 +478,32 @@ internal sealed class UpdateEngine
                 Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
             }
 
-            var oldManagedPaths = previousState.ManagedFiles
-                .Select(file => PathSafety.NormalizeRelativePath(file.Path))
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var newManagedPaths = manifest.Files
-                .Select(file => file.Path)
-                .ToHashSet(StringComparer.OrdinalIgnoreCase);
-            // A file is removable only when this updater installed it in an
-            // earlier verified release. That lets a canonical release clean
-            // out obsolete mods/resource packs automatically, while never
-            // sweeping up unrelated player files which were not updater-owned.
-            var requestedDeletes = manifest.DeletePaths
-                .Select(PathSafety.NormalizeRelativePath)
-                .Concat(oldManagedPaths.Except(newManagedPaths, StringComparer.OrdinalIgnoreCase))
-                .Distinct(StringComparer.OrdinalIgnoreCase);
-            foreach (string requestedDeletePath in requestedDeletes)
+            if (manifest.SchemaVersion == 1)
             {
-                if (!oldManagedPaths.Contains(requestedDeletePath) || newManagedPaths.Contains(requestedDeletePath))
-                {
-                    continue;
-                }
-
-                string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, requestedDeletePath);
-                if (!File.Exists(target))
-                {
-                    continue;
-                }
-                string backup = PathSafety.CombineUnder(backupDirectory, requestedDeletePath);
-                PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
-                journal.Operations.Add(new TransactionOperation { Kind = "delete", TargetPath = target, BackupPath = backup });
-                await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
-                Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
-                TransactionStore.MoveOrCopy(target, backup);
+                await ApplySchemaOneDeletesAsync(manifest, previousState, backupDirectory, journal, cancellationToken);
             }
-
-            // First-run migration is intentionally narrower than an ordinary
-            // delete: only named legacy files whose exact expected hash is
-            // still present can be removed. Unknown or player-modified files
-            // are left alone rather than risking a broad folder cleanup.
-            foreach (LegacyCleanupFile legacyFile in manifest.LegacyCleanup)
+            else
             {
-                string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, legacyFile.Path);
-                if (!File.Exists(target))
+                foreach (ManifestFile deletedFile in manifest.DeletedFiles)
                 {
-                    continue;
+                    string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, deletedFile.Path);
+                    if (!File.Exists(target)
+                        || new FileInfo(target).Length != deletedFile.Size
+                        || !PathSafety.IsExpectedHash(await PathSafety.Sha256Async(target, cancellationToken), deletedFile.Sha256))
+                    {
+                        throw new InvalidDataException($"Delta deletion target changed after base validation: {deletedFile.Path}");
+                    }
+                    string backup = PathSafety.CombineUnder(backupDirectory, deletedFile.Path);
+                    PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+                    await BackupForOperationAsync("delete", target, backup, journal, cancellationToken);
+                    appliedFiles++;
+                    Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
                 }
-                PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
-                if (new FileInfo(target).Length != legacyFile.Size
-                    || !PathSafety.IsExpectedHash(await PathSafety.Sha256Async(target, cancellationToken), legacyFile.Sha256))
-                {
-                    _log($"Keeping changed legacy file: {legacyFile.Path}");
-                    continue;
-                }
-
-                string backup = PathSafety.CombineUnder(backupDirectory, legacyFile.Path);
-                journal.Operations.Add(new TransactionOperation { Kind = "delete", TargetPath = target, BackupPath = backup });
-                await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
-                Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
-                TransactionStore.MoveOrCopy(target, backup);
-                _log($"Removed verified legacy file: {legacyFile.Path}");
             }
+            await ApplyLegacyCleanupAsync(manifest.LegacyCleanup, backupDirectory, journal, cancellationToken);
 
-            journal.Committed = true;
+            journal.Phase = "filesApplied";
             await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
-            var newState = new InstalledState
-            {
-                Version = manifest.Version,
-                ManifestSha256 = manifestHash,
-                AppliedAtUtc = DateTimeOffset.UtcNow,
-                ManagedFiles = manifest.Files.Select(file => new ManagedFileState
-                {
-                    Path = file.Path,
-                    Size = file.Size,
-                    Sha256 = file.Sha256
-                }).ToList()
-            };
             await LocalStateStore.SaveStateAsync(_paths, newState, cancellationToken);
             File.Delete(TransactionStore.JournalPath(_paths));
             TryDeleteDirectory(Path.GetDirectoryName(backupDirectory)!);
@@ -389,6 +515,155 @@ internal sealed class UpdateEngine
         }
     }
 
+    private async Task ApplySchemaOneDeletesAsync(
+        UpdateManifest manifest,
+        InstalledState previousState,
+        string backupDirectory,
+        TransactionJournal journal,
+        CancellationToken cancellationToken)
+    {
+        var oldManagedPaths = previousState.ManagedFiles
+            .Select(file => PathSafety.NormalizeRelativePath(file.Path))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var newManagedPaths = manifest.Files.Select(file => file.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var requestedDeletes = manifest.DeletePaths
+            .Concat(oldManagedPaths.Except(newManagedPaths, StringComparer.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+        foreach (string requestedDeletePath in requestedDeletes)
+        {
+            if (!oldManagedPaths.Contains(requestedDeletePath) || newManagedPaths.Contains(requestedDeletePath))
+            {
+                continue;
+            }
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, requestedDeletePath);
+            if (!File.Exists(target))
+            {
+                continue;
+            }
+            string backup = PathSafety.CombineUnder(backupDirectory, requestedDeletePath);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            await BackupForOperationAsync("delete", target, backup, journal, cancellationToken);
+        }
+
+    }
+
+    private async Task ApplyLegacyCleanupAsync(
+        IReadOnlyCollection<LegacyCleanupFile> legacyCleanup,
+        string backupDirectory,
+        TransactionJournal journal,
+        CancellationToken cancellationToken)
+    {
+        foreach (LegacyCleanupFile legacyFile in legacyCleanup)
+        {
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, legacyFile.Path);
+            if (!File.Exists(target))
+            {
+                continue;
+            }
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (new FileInfo(target).Length != legacyFile.Size
+                || !PathSafety.IsExpectedHash(await PathSafety.Sha256Async(target, cancellationToken), legacyFile.Sha256))
+            {
+                _log($"Keeping changed legacy file: {legacyFile.Path}");
+                continue;
+            }
+            string backup = PathSafety.CombineUnder(backupDirectory, legacyFile.Path);
+            await BackupForOperationAsync("delete", target, backup, journal, cancellationToken);
+            _log($"Removed verified legacy file: {legacyFile.Path}");
+        }
+    }
+
+    private async Task BackupForOperationAsync(
+        string kind,
+        string target,
+        string backup,
+        TransactionJournal journal,
+        CancellationToken cancellationToken)
+    {
+        var operation = new TransactionOperation
+        {
+            Kind = kind,
+            TargetPath = target,
+            BackupPath = backup,
+            OriginalSize = new FileInfo(target).Length,
+            OriginalSha256 = await PathSafety.Sha256Async(target, cancellationToken)
+        };
+        journal.Operations.Add(operation);
+        await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
+        Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+        TransactionStore.MoveOrCopy(target, backup);
+        await VerifyFileAsync(backup, operation.OriginalSize, operation.OriginalSha256, "rollback backup", cancellationToken);
+    }
+
+    private void EnsureSufficientDiskSpace(UpdateManifest manifest, InstalledState previousState)
+    {
+        try
+        {
+            long extractedBytes = checked(ManifestParser.PayloadContents(manifest).Sum(file => file.Size));
+            var backupPaths = ManifestParser.PayloadContents(manifest)
+                .Select(file => file.Path)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (manifest.SchemaVersion == 2)
+            {
+                backupPaths.UnionWith(manifest.DeletedFiles.Select(file => file.Path));
+            }
+            else
+            {
+                HashSet<string> newPaths = manifest.Files.Select(file => file.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                backupPaths.UnionWith(previousState.ManagedFiles
+                    .Select(file => PathSafety.NormalizeRelativePath(file.Path))
+                    .Where(path => !newPaths.Contains(path)));
+                backupPaths.UnionWith(manifest.DeletePaths);
+            }
+            backupPaths.UnionWith(manifest.LegacyCleanup.Select(file => file.Path));
+            long rollbackBytes = 0;
+            foreach (string relativePath in backupPaths)
+            {
+                string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, relativePath);
+                if (File.Exists(target))
+                {
+                    rollbackBytes = checked(rollbackBytes + new FileInfo(target).Length);
+                }
+            }
+            long largestPart = manifest.Payload?.Parts.Count > 0
+                ? manifest.Payload.Parts.Max(part => part.Size)
+                : 0L;
+            long localRequired = checked(
+                (manifest.Payload?.Size ?? 0L)
+                + largestPart
+                + extractedBytes
+                + rollbackBytes
+                + DiskReserveBytes);
+            AssertAvailableSpace(_paths.LocalDataDirectory, localRequired, "update staging and rollback");
+
+            string localRoot = Path.GetPathRoot(Path.GetFullPath(_paths.LocalDataDirectory))!;
+            string minecraftRoot = Path.GetPathRoot(Path.GetFullPath(_paths.MinecraftDirectory))!;
+            if (!string.Equals(localRoot, minecraftRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                long minecraftRequired = checked(extractedBytes + DiskReserveBytes);
+                AssertAvailableSpace(_paths.MinecraftDirectory, minecraftRequired, "Minecraft installation");
+            }
+        }
+        catch (OverflowException)
+        {
+            throw new InvalidDataException("Signed update sizes overflow the updater's disk-space calculation.");
+        }
+    }
+
+    private static void AssertAvailableSpace(string path, long requiredBytes, string purpose)
+    {
+        string root = Path.GetPathRoot(Path.GetFullPath(path))
+            ?? throw new IOException($"Could not determine the drive for {purpose}.");
+        long available = new DriveInfo(root).AvailableFreeSpace;
+        if (available < requiredBytes)
+        {
+            throw new IOException(
+                $"Not enough free disk space for {purpose}. Need about {FormatGiB(requiredBytes)}, but only {FormatGiB(available)} is available.");
+        }
+    }
+
+    private static string FormatGiB(long bytes) => $"{bytes / (1024d * 1024d * 1024d):0.00} GiB";
+
     private static void TryDeleteDirectory(string path)
     {
         try
@@ -398,14 +673,8 @@ internal sealed class UpdateEngine
                 Directory.Delete(path, recursive: true);
             }
         }
-        catch (IOException)
-        {
-            // A failed cleanup never compromises an installed or rolled back pack.
-        }
-        catch (UnauthorizedAccessException)
-        {
-            // The next updater run can safely clean its own staging directory.
-        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     private void Report(

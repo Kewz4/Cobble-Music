@@ -1,11 +1,17 @@
+using System.Security.Cryptography;
 using System.Text.Json;
 
 namespace CobbleMusicUpdater;
 
 internal sealed class TransactionJournal
 {
-    public int SchemaVersion { get; set; } = 1;
+    public int SchemaVersion { get; set; } = 2;
+    // Schema 1 compatibility. New journals use Phase and never mark committed
+    // before state.json is durably replaced.
     public bool Committed { get; set; }
+    public string Phase { get; set; } = "applying";
+    public InstalledState? PreviousState { get; set; }
+    public InstalledState? NextState { get; set; }
     public List<TransactionOperation> Operations { get; set; } = [];
 }
 
@@ -14,6 +20,8 @@ internal sealed class TransactionOperation
     public string Kind { get; set; } = "";
     public string TargetPath { get; set; } = "";
     public string BackupPath { get; set; } = "";
+    public long OriginalSize { get; set; } = -1;
+    public string OriginalSha256 { get; set; } = "";
 }
 
 internal sealed class TransactionRecoveryException : IOException
@@ -37,11 +45,12 @@ internal static class TransactionStore
         Directory.CreateDirectory(paths.LocalDataDirectory);
         string destination = JournalPath(paths);
         string temporary = destination + ".new";
-        await File.WriteAllBytesAsync(temporary, JsonSerializer.SerializeToUtf8Bytes(journal, JsonOptions), cancellationToken);
+        byte[] content = JsonSerializer.SerializeToUtf8Bytes(journal, JsonOptions);
+        await DurableWriteAsync(temporary, content, cancellationToken);
         File.Move(temporary, destination, overwrite: true);
     }
 
-    public static Task RecoverIfNeededAsync(
+    public static async Task RecoverIfNeededAsync(
         UpdaterPaths paths,
         IReadOnlyCollection<string> allowedRoots,
         Action<string> log)
@@ -49,7 +58,7 @@ internal static class TransactionStore
         string path = JournalPath(paths);
         if (!File.Exists(path))
         {
-            return Task.CompletedTask;
+            return;
         }
 
         TransactionJournal? journal;
@@ -61,7 +70,7 @@ internal static class TransactionStore
         {
             throw new TransactionRecoveryException("The updater transaction journal is unreadable. Prism will not launch until it is repaired.", exception);
         }
-        if (journal is null || journal.SchemaVersion != 1 || journal.Operations is null)
+        if (journal is null || journal.SchemaVersion is not (1 or 2) || journal.Operations is null)
         {
             throw new TransactionRecoveryException("The updater transaction journal has an unsupported format. Prism will not launch until it is repaired.");
         }
@@ -69,30 +78,77 @@ internal static class TransactionStore
         try
         {
             ValidateJournal(paths, allowedRoots, journal);
-            if (!journal.Committed)
+            bool rollback;
+            if (journal.SchemaVersion == 1)
+            {
+                rollback = !journal.Committed;
+            }
+            else if (string.Equals(journal.Phase, "applying", StringComparison.Ordinal))
+            {
+                rollback = true;
+            }
+            else
+            {
+                InstalledState actualState = LocalStateStore.LoadState(paths);
+                if (StateEquivalent(actualState, journal.NextState!))
+                {
+                    // state.json is the durable commit point. A crash after its
+                    // atomic replacement completes forward by retaining files.
+                    rollback = false;
+                }
+                else if (StateEquivalent(actualState, journal.PreviousState!))
+                {
+                    // A crash before state.json replacement rolls files back.
+                    rollback = true;
+                }
+                else
+                {
+                    throw new TransactionRecoveryException("Updater state is neither the old nor new transaction state; automatic recovery is unsafe.");
+                }
+            }
+
+            if (rollback)
             {
                 log("Recovering an interrupted local update transaction...");
                 foreach (TransactionOperation operation in journal.Operations.AsEnumerable().Reverse())
                 {
-                    Restore(paths, operation, log);
+                    Restore(paths, operation, journal.SchemaVersion, log);
+                }
+                if (journal.SchemaVersion == 2)
+                {
+                    await LocalStateStore.SaveStateAsync(paths, journal.PreviousState!, CancellationToken.None);
                 }
             }
             File.Delete(path);
             TryDeleteRecoveredRollbackDirectories(paths, journal.Operations);
-            return Task.CompletedTask;
         }
         catch (TransactionRecoveryException)
         {
             throw;
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or CryptographicException)
         {
             throw new TransactionRecoveryException("The updater could not safely recover its last transaction. Prism will not launch to avoid a partial modpack.", exception);
         }
     }
 
-    private static void ValidateJournal(UpdaterPaths paths, IReadOnlyCollection<string> allowedRoots, TransactionJournal journal)
+    private static void ValidateJournal(
+        UpdaterPaths paths,
+        IReadOnlyCollection<string> allowedRoots,
+        TransactionJournal journal)
     {
+        if (journal.SchemaVersion == 2)
+        {
+            if (journal.Phase is not ("applying" or "filesApplied")
+                || journal.PreviousState is null
+                || journal.NextState is null)
+            {
+                throw new TransactionRecoveryException("The updater transaction journal has an invalid schema-2 phase or state snapshot.");
+            }
+            ValidateJournalState(journal.PreviousState, allowedRoots);
+            ValidateJournalState(journal.NextState, allowedRoots);
+        }
+
         string rollbackRoot = Path.Combine(paths.LocalDataDirectory, "rollback");
         foreach (TransactionOperation operation in journal.Operations)
         {
@@ -115,13 +171,62 @@ internal static class TransactionStore
             {
                 throw new TransactionRecoveryException("The updater transaction journal contains an invalid create operation.");
             }
+            if (journal.SchemaVersion == 2 && needsBackup
+                && (operation.OriginalSize < 0
+                    || string.IsNullOrWhiteSpace(operation.OriginalSha256)
+                    || operation.OriginalSha256.Length != 64
+                    || operation.OriginalSha256.Any(character => !Uri.IsHexDigit(character))))
+            {
+                throw new TransactionRecoveryException("The updater transaction journal is missing original-file recovery metadata.");
+            }
         }
     }
 
-    private static void Restore(UpdaterPaths paths, TransactionOperation operation, Action<string> log)
+    private static void ValidateJournalState(InstalledState state, IReadOnlyCollection<string> allowedRoots)
+    {
+        if (state.SchemaVersion != 1 || state.ManagedFiles is null)
+        {
+            throw new TransactionRecoveryException("The updater transaction journal contains an invalid state snapshot.");
+        }
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (ManagedFileState file in state.ManagedFiles)
+        {
+            if (file is null)
+            {
+                throw new TransactionRecoveryException("The updater transaction journal contains an empty state entry.");
+            }
+            string path = PathSafety.NormalizeRelativePath(file.Path);
+            if (!PathSafety.IsAllowed(path, allowedRoots)
+                || file.Size < 0
+                || string.IsNullOrWhiteSpace(file.Sha256)
+                || file.Sha256.Length != 64
+                || file.Sha256.Any(character => !Uri.IsHexDigit(character))
+                || !paths.Add(path))
+            {
+                throw new TransactionRecoveryException("The updater transaction journal contains an unsafe state snapshot.");
+            }
+            file.Path = path;
+        }
+    }
+
+    private static bool StateEquivalent(InstalledState left, InstalledState right)
+    {
+        if (!string.Equals(left.Version, right.Version, StringComparison.Ordinal)
+            || !string.Equals(left.ManifestSha256, right.ManifestSha256, StringComparison.OrdinalIgnoreCase)
+            || left.ManagedFiles.Count != right.ManagedFiles.Count)
+        {
+            return false;
+        }
+        var rightFiles = right.ManagedFiles.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
+        return left.ManagedFiles.All(file => rightFiles.TryGetValue(file.Path, out ManagedFileState? expected)
+            && file.Size == expected.Size
+            && string.Equals(file.Sha256, expected.Sha256, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static void Restore(UpdaterPaths paths, TransactionOperation operation, int journalSchema, Action<string> log)
     {
         PathSafety.AssertNoReparsePointsOnTargetPath(paths.MinecraftDirectory, operation.TargetPath);
-        if (operation.Kind is "replace" or "delete")
+        if ((operation.Kind is "replace" or "delete") && File.Exists(operation.BackupPath))
         {
             PathSafety.AssertNoReparsePointsOnTargetPath(Path.Combine(paths.LocalDataDirectory, "rollback"), operation.BackupPath);
         }
@@ -135,21 +240,66 @@ internal static class TransactionStore
                 break;
             case "replace":
             case "delete":
-                if (!File.Exists(operation.BackupPath))
+                if (journalSchema == 2)
                 {
-                    throw new TransactionRecoveryException($"Rollback backup is missing for {operation.TargetPath}.");
+                    RestoreSchemaTwoBackup(operation);
                 }
-                if (File.Exists(operation.TargetPath))
+                else
                 {
-                    File.Delete(operation.TargetPath);
+                    if (!File.Exists(operation.BackupPath))
+                    {
+                        throw new TransactionRecoveryException($"Rollback backup is missing for {operation.TargetPath}.");
+                    }
+                    if (File.Exists(operation.TargetPath))
+                    {
+                        File.Delete(operation.TargetPath);
+                    }
+                    Directory.CreateDirectory(Path.GetDirectoryName(operation.TargetPath)!);
+                    MoveOrCopy(operation.BackupPath, operation.TargetPath);
                 }
-                Directory.CreateDirectory(Path.GetDirectoryName(operation.TargetPath)!);
-                MoveOrCopy(operation.BackupPath, operation.TargetPath);
                 break;
             default:
                 throw new InvalidDataException($"Unknown updater transaction operation: {operation.Kind}");
         }
         log($"Recovered {Path.GetFileName(operation.TargetPath)}.");
+    }
+
+    private static void RestoreSchemaTwoBackup(TransactionOperation operation)
+    {
+        bool targetExists = File.Exists(operation.TargetPath);
+        bool backupExists = File.Exists(operation.BackupPath);
+        if (targetExists && MatchesOriginal(operation.TargetPath, operation))
+        {
+            // Either mutation had not started, or an earlier recovery already
+            // restored the original. A partial cross-volume backup is stale.
+            if (backupExists)
+            {
+                File.Delete(operation.BackupPath);
+            }
+            return;
+        }
+        if (!backupExists || !MatchesOriginal(operation.BackupPath, operation))
+        {
+            throw new TransactionRecoveryException($"A complete rollback backup is missing for {operation.TargetPath}.");
+        }
+        if (targetExists)
+        {
+            File.Delete(operation.TargetPath);
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(operation.TargetPath)!);
+        MoveOrCopy(operation.BackupPath, operation.TargetPath);
+    }
+
+    private static bool MatchesOriginal(string path, TransactionOperation operation)
+    {
+        var info = new FileInfo(path);
+        if (info.Length != operation.OriginalSize)
+        {
+            return false;
+        }
+        using FileStream input = new(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        string hash = Convert.ToHexString(SHA256.HashData(input)).ToLowerInvariant();
+        return string.Equals(hash, operation.OriginalSha256, StringComparison.OrdinalIgnoreCase);
     }
 
     private static void TryDeleteRecoveredRollbackDirectories(UpdaterPaths paths, IEnumerable<TransactionOperation> operations)
@@ -187,5 +337,13 @@ internal static class TransactionStore
             File.Copy(source, destination, overwrite: true);
             File.Delete(source);
         }
+    }
+
+    private static async Task DurableWriteAsync(string path, byte[] content, CancellationToken cancellationToken)
+    {
+        await using var output = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 64 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough);
+        await output.WriteAsync(content, cancellationToken);
+        await output.FlushAsync(cancellationToken);
+        output.Flush(flushToDisk: true);
     }
 }

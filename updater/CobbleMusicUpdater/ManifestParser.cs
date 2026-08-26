@@ -27,25 +27,30 @@ internal static class ManifestParser
 
     public static void Validate(UpdateManifest manifest, UpdaterConfiguration configuration, IReadOnlyDictionary<string, Uri> assetUrls)
     {
-        if (manifest.SchemaVersion != 1
+        if (manifest.SchemaVersion is not (1 or 2)
             || !string.Equals(manifest.ModpackId, configuration.ModpackId, StringComparison.Ordinal)
             || !string.Equals(manifest.Channel, configuration.Channel, StringComparison.Ordinal)
             || string.IsNullOrWhiteSpace(manifest.Version)
             || string.IsNullOrWhiteSpace(manifest.ReleaseTag)
-            || manifest.Payload is null
-            || manifest.Payload.Parts is null
             || manifest.Files is null
+            || manifest.PayloadFiles is null
+            || manifest.DeletedFiles is null
             || manifest.DeletePaths is null
             || manifest.LegacyCleanup is null
-            || manifest.Payload.Parts.Count == 0
             || manifest.Files.Count == 0)
         {
             throw new InvalidDataException("Signed release manifest does not match this updater or has an unsupported schema.");
         }
 
-        if (!Version.TryParse(manifest.Version, out _)
-            || !Version.TryParse(manifest.MinimumUpdaterVersion, out Version? requiredUpdater)
-            || Version.Parse(BuildInfo.Version) < requiredUpdater)
+        if (!Version.TryParse(manifest.Version, out Version? releaseVersion))
+        {
+            throw new InvalidDataException("Signed release manifest has an invalid version.");
+        }
+        if (!Version.TryParse(manifest.MinimumUpdaterVersion, out Version? requiredUpdater))
+        {
+            throw new InvalidDataException("Signed release manifest has an invalid minimum updater version.");
+        }
+        if (Version.Parse(BuildInfo.Version) < requiredUpdater)
         {
             throw new InvalidDataException($"Release {manifest.Version} requires updater {manifest.MinimumUpdaterVersion}; this updater is {BuildInfo.Version}.");
         }
@@ -54,17 +59,47 @@ internal static class ManifestParser
             throw new InvalidDataException("Signed release manifest has an invalid release tag/version binding.");
         }
 
-        ValidateHash(manifest.Payload.Sha256, "payload");
-        if (manifest.Payload.Size <= 0)
+        Dictionary<string, ManifestFile> files = ValidateFileSet(manifest.Files, configuration, "managed file");
+
+        if (manifest.SchemaVersion == 1)
         {
-            throw new InvalidDataException("Release payload has an invalid size.");
+            if (manifest.Payload is null)
+            {
+                throw new InvalidDataException("Schema 1 release is missing its full payload.");
+            }
+            ValidatePayload(manifest.Payload, assetUrls);
+            ValidateSchemaOne(manifest, configuration, files);
         }
+        else
+        {
+            ValidateSchemaTwo(manifest, configuration, files, releaseVersion, assetUrls);
+        }
+    }
+
+    public static IReadOnlyCollection<ManifestFile> PayloadContents(UpdateManifest manifest) =>
+        manifest.SchemaVersion == 1 ? manifest.Files : manifest.PayloadFiles;
+
+    private static void ValidatePayload(UpdatePayload payload, IReadOnlyDictionary<string, Uri> assetUrls)
+    {
+        if (string.IsNullOrWhiteSpace(payload.ArchiveName)
+            || !string.Equals(payload.ArchiveName, Path.GetFileName(payload.ArchiveName), StringComparison.Ordinal)
+            || payload.ArchiveName.Contains('/')
+            || payload.ArchiveName.Contains('\\')
+            || payload.ArchiveName.Contains(':')
+            || payload.Size <= 0
+            || payload.Parts is null
+            || payload.Parts.Count == 0)
+        {
+            throw new InvalidDataException("Release payload has an invalid archive name or size.");
+        }
+        ValidateHash(payload.Sha256, "payload");
 
         long totalPartSize = 0;
         var seenParts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (PayloadPart part in manifest.Payload.Parts)
+        foreach (PayloadPart part in payload.Parts)
         {
-            if (string.IsNullOrWhiteSpace(part.Name)
+            if (part is null
+                || string.IsNullOrWhiteSpace(part.Name)
                 || !string.Equals(part.Name, Path.GetFileName(part.Name), StringComparison.Ordinal)
                 || part.Name.Contains('/')
                 || part.Name.Contains('\\')
@@ -85,51 +120,162 @@ internal static class ManifestParser
                 throw new InvalidDataException("Release payload parts have an invalid total size.");
             }
         }
-        if (totalPartSize != manifest.Payload.Size)
+        if (totalPartSize != payload.Size)
         {
             throw new InvalidDataException("Release payload part sizes do not match the signed payload size.");
         }
+    }
 
-        var seenFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (ManifestFile file in manifest.Files)
+    private static Dictionary<string, ManifestFile> ValidateFileSet(
+        IEnumerable<ManifestFile> entries,
+        UpdaterConfiguration configuration,
+        string description)
+    {
+        var files = new Dictionary<string, ManifestFile>(StringComparer.OrdinalIgnoreCase);
+        foreach (ManifestFile file in entries)
         {
+            if (file is null)
+            {
+                throw new InvalidDataException($"Release manifest contains an empty {description} entry.");
+            }
             file.Path = PathSafety.NormalizeRelativePath(file.Path);
             if (!PathSafety.IsAllowed(file.Path, configuration.AllowedRoots)
                 || file.Size < 0
-                || !seenFiles.Add(file.Path))
+                || !files.TryAdd(file.Path, file))
             {
-                throw new InvalidDataException($"Release manifest contains an unsafe or duplicate path: {file.Path}");
+                throw new InvalidDataException($"Release manifest contains an unsafe or duplicate {description} path: {file.Path}");
             }
-            ValidateHash(file.Sha256, $"managed file {file.Path}");
+            ValidateHash(file.Sha256, $"{description} {file.Path}");
+        }
+        return files;
+    }
+
+    private static void ValidateSchemaOne(
+        UpdateManifest manifest,
+        UpdaterConfiguration configuration,
+        IReadOnlyDictionary<string, ManifestFile> files)
+    {
+        if (manifest.Base is not null || manifest.PayloadFiles.Count != 0 || manifest.DeletedFiles.Count != 0)
+        {
+            throw new InvalidDataException("Schema 1 releases cannot contain delta-only fields.");
         }
 
-        foreach (string deletePath in manifest.DeletePaths)
+        var seenDeletes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int index = 0; index < manifest.DeletePaths.Count; index++)
         {
-            string normalized = PathSafety.NormalizeRelativePath(deletePath);
-            if (!PathSafety.IsAllowed(normalized, configuration.AllowedRoots))
+            string normalized = PathSafety.NormalizeRelativePath(manifest.DeletePaths[index]);
+            manifest.DeletePaths[index] = normalized;
+            if (!PathSafety.IsAllowed(normalized, configuration.AllowedRoots)
+                || !seenDeletes.Add(normalized)
+                || files.ContainsKey(normalized))
             {
-                throw new InvalidDataException($"Release manifest contains an unsafe deletion path: {deletePath}");
+                throw new InvalidDataException($"Release manifest contains an unsafe, duplicate, or overlapping deletion path: {normalized}");
             }
         }
 
-        var seenLegacyCleanup = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (LegacyCleanupFile legacyFile in manifest.LegacyCleanup)
+        Dictionary<string, LegacyCleanupFile> legacy = ValidateLegacyCleanup(manifest.LegacyCleanup, configuration);
+        if (legacy.Keys.Any(files.ContainsKey))
         {
-            legacyFile.Path = PathSafety.NormalizeRelativePath(legacyFile.Path);
-            if (!PathSafety.IsAllowed(legacyFile.Path, configuration.AllowedRoots)
-                || legacyFile.Size < 0
-                || !seenLegacyCleanup.Add(legacyFile.Path)
-                || seenFiles.Contains(legacyFile.Path))
-            {
-                throw new InvalidDataException($"Release manifest contains an unsafe, duplicate, or overlapping legacy cleanup path: {legacyFile.Path}");
-            }
-            ValidateHash(legacyFile.Sha256, $"legacy cleanup file {legacyFile.Path}");
+            throw new InvalidDataException("Release manifest contains a legacy cleanup path that overlaps a managed file.");
         }
     }
 
-    private static void ValidateHash(string hash, string item)
+    private static void ValidateSchemaTwo(
+        UpdateManifest manifest,
+        UpdaterConfiguration configuration,
+        IReadOnlyDictionary<string, ManifestFile> files,
+        Version releaseVersion,
+        IReadOnlyDictionary<string, Uri> assetUrls)
     {
-        if (hash.Length != 64 || hash.Any(character => !Uri.IsHexDigit(character)))
+        if (manifest.Base is null
+            || !Version.TryParse(manifest.Base.Version, out Version? baseVersion)
+            || baseVersion >= releaseVersion)
+        {
+            throw new InvalidDataException("Schema 2 release has an invalid or non-older base version.");
+        }
+        ValidateHash(manifest.Base.ManifestSha256, "base manifest");
+        if (manifest.DeletePaths.Count != 0)
+        {
+            throw new InvalidDataException("Schema 2 releases must use exact deletedFiles entries instead of path-only deletions.");
+        }
+
+        Dictionary<string, ManifestFile> payloadFiles = ValidateFileSet(manifest.PayloadFiles, configuration, "payload file");
+        Dictionary<string, ManifestFile> deletedFiles = ValidateFileSet(manifest.DeletedFiles, configuration, "deleted file");
+        if (payloadFiles.Count == 0 && deletedFiles.Count == 0)
+        {
+            throw new InvalidDataException("Schema 2 release contains no changes.");
+        }
+
+        if (payloadFiles.Count == 0)
+        {
+            if (manifest.Payload is not null)
+            {
+                throw new InvalidDataException("Deletion-only schema 2 releases must not declare a payload.");
+            }
+        }
+        else
+        {
+            if (manifest.Payload is null)
+            {
+                throw new InvalidDataException("Schema 2 release with changed/new files is missing its payload.");
+            }
+            ValidatePayload(manifest.Payload, assetUrls);
+        }
+
+        foreach ((string path, ManifestFile payloadFile) in payloadFiles)
+        {
+            if (!files.TryGetValue(path, out ManifestFile? postFile) || !SameFile(payloadFile, postFile))
+            {
+                throw new InvalidDataException($"Delta payload file does not exactly match the authoritative post-state: {path}");
+            }
+        }
+        if (deletedFiles.Keys.Any(files.ContainsKey))
+        {
+            throw new InvalidDataException("Delta deletedFiles overlap the authoritative post-state.");
+        }
+        Dictionary<string, LegacyCleanupFile> legacy = ValidateLegacyCleanup(manifest.LegacyCleanup, configuration);
+        if (legacy.Keys.Any(files.ContainsKey) || legacy.Keys.Any(deletedFiles.ContainsKey))
+        {
+            throw new InvalidDataException("Delta legacy cleanup overlaps its signed managed file sets.");
+        }
+    }
+
+    private static Dictionary<string, LegacyCleanupFile> ValidateLegacyCleanup(
+        IEnumerable<LegacyCleanupFile> entries,
+        UpdaterConfiguration configuration)
+    {
+        var files = new Dictionary<string, LegacyCleanupFile>(StringComparer.OrdinalIgnoreCase);
+        foreach (LegacyCleanupFile file in entries)
+        {
+            if (file is null)
+            {
+                throw new InvalidDataException("Release manifest contains an empty legacy cleanup entry.");
+            }
+            file.Path = PathSafety.NormalizeRelativePath(file.Path);
+            if (!PathSafety.IsAllowed(file.Path, configuration.AllowedRoots)
+                || file.Size < 0
+                || !files.TryAdd(file.Path, file))
+            {
+                throw new InvalidDataException($"Release manifest contains an unsafe or duplicate legacy cleanup path: {file.Path}");
+            }
+            ValidateHash(file.Sha256, $"legacy cleanup file {file.Path}");
+        }
+        return files;
+    }
+
+    internal static bool SameFile(ManifestFile left, ManifestFile right) =>
+        left.Size == right.Size
+        && string.Equals(left.Sha256, right.Sha256, StringComparison.OrdinalIgnoreCase);
+
+    internal static bool SameFile(ManagedFileState left, ManifestFile right) =>
+        left.Size == right.Size
+        && string.Equals(left.Sha256, right.Sha256, StringComparison.OrdinalIgnoreCase);
+
+    internal static void ValidateHash(string hash, string item)
+    {
+        if (string.IsNullOrWhiteSpace(hash)
+            || hash.Length != 64
+            || hash.Any(character => !Uri.IsHexDigit(character)))
         {
             throw new InvalidDataException($"Release manifest contains an invalid SHA-256 for {item}.");
         }
