@@ -151,7 +151,7 @@ Updater binaries use their own `updater-v*` releases and are completely
 separate from signed `modpack-v*` payload releases. The updater publisher
 derives the release version from the single `BuildInfo.Version` constant,
 requires the project version to match it, and accepts only canonical
-three-part versions such as `1.2.1` (no leading zeroes or fourth component).
+three-part versions such as `1.2.2` (no leading zeroes or fourth component).
 A new stable updater release must be strictly newer than every existing stable
 `updater-v*` release; exact reruns of their own draft or published release stay
 idempotent, while downgrades and alternate spellings of the same numeric
@@ -279,7 +279,7 @@ one-time setup action—nothing exists on their PC yet that could check GitHub
 when they press Play. The published bootstrap performs that setup safely:
 
 1. verifies the selected Prism instance has `instance.cfg` and `minecraft/`;
-2. downloads the exact `updater-v1.2.1` EXE and checks its SHA-256;
+2. downloads the exact `updater-v1.2.2` EXE and checks its SHA-256;
 3. installs it at `minecraft/cobble-music-updater/CobbleMusicUpdater.exe`;
 4. writes only the updater's own `updater.json` (backing up an existing one);
    and
@@ -291,13 +291,13 @@ unless the player deliberately reruns it with `-Force`. It does not touch
 saves, `options.txt`, `servers.dat`, logs, or resource-pack selections.
 
 After the bootstrap asset has been downloaded from
-[updater-v1.2.1](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.1),
+[updater-v1.2.2](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.2),
 the player can paste this into PowerShell, replacing the example instance path:
 
 ```powershell
-$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.1/Bootstrap-CobbleMusicUpdater.ps1'
+$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.2/Bootstrap-CobbleMusicUpdater.ps1'
 $path = Join-Path $env:TEMP 'Bootstrap-CobbleMusicUpdater.ps1'
-$expected = 'AB6A36DBDBAA2275590634303EAA8D5926D14D0ABE42D966841D15F06368B98F'
+$expected = '9E5DE93558DAE18B3866AA111375CEBF946C0E651AD6816B5C8CF112EF67F1F3'
 Invoke-WebRequest -Uri $uri -OutFile $path
 if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $expected) { throw 'Bootstrap checksum mismatch.' }
 Unblock-File -LiteralPath $path
@@ -311,46 +311,56 @@ updates happen automatically when that player presses Prism's Play button.
 ## Publish a pack update
 
 The canonical source is the current live client, not Claude’s stale `1.0.3`
-`.mrpack` or its retained `mrpack\` folder. The publisher requires an explicit
-mode so accidentally omitting a base version cannot upload the entire pack.
+`.mrpack` or its retained `mrpack\` folder. `-SourceMinecraftDir` is mandatory
+when staging and has no default, so the operator must name the intended
+instance explicitly. The publisher also requires an explicit mode so
+accidentally omitting a base version cannot upload the entire pack.
 Release and base versions use exactly `major.minor.patch` with no leading
 zeroes (for example, `1.0.5`); four-component variants are rejected.
 
 The modpack publisher never builds or loads the updater from the current C#
 working tree. Signing and verification use only
 `updater\dist\win-x64\CobbleMusicUpdater.exe`, whose version, ProductVersion,
-and SHA-256 must exactly match the committed `updater-v1.2.1` bootstrap pin.
+and SHA-256 must exactly match the committed `updater-v1.2.2` bootstrap pin.
 The EXE is held read-locked from checksum verification through each signer or
 verifier process. Keep the private signing key outside the Minecraft source,
 every managed source root, and `release-output`; the publisher rejects those
 locations before it inventories a single source file.
 
-The already-published `1.0.4` release is the full schema-v1 baseline. A new
-baseline is exceptional and must be requested explicitly:
+Release `1.0.5` is a sanitized recovery baseline: it replaces the unsafe 1.0.4
+inventory, excludes generated browser/cache/index data, and performs the
+reviewed exact-hash legacy cleanup. Build it explicitly from the canonical
+client:
 
 ```powershell
-.\tools\Publish-CobbleMusicRelease.ps1 -Version 2.0.0 -FullBaseline
+$source = 'C:\Program Files\Prism Launcher\instances\<canonical instance>\minecraft'
+.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.5 -FullBaseline `
+  -SourceMinecraftDir $source `
+  -LegacyCleanupManifest .\release-manifests\legacy-through-1.0.4-cleanup.json
 ```
 
-Normal releases are signed schema-v2 deltas. They download the prior release's
+Normal later releases are signed schema-v2 deltas. They download the prior release's
 manifest and detached signature, verify the signature with the updater's
 compiled-in public key, require the requested base/version binding, and compare
-that complete signed file set with the canonical live client:
+that complete signed file set with the canonical live client. The source
+updater state must itself match the exact signed base version/hash/inventory:
 
 ```powershell
-.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.5 -BaseVersion 1.0.4
+.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.6 -BaseVersion 1.0.5 `
+  -SourceMinecraftDir $source
 ```
 
 To use reviewed local copies of the base assets, supply both paths:
 
 ```powershell
-.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.5 -BaseVersion 1.0.4 `
+.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.6 -BaseVersion 1.0.5 `
+  -SourceMinecraftDir $source `
   -BaseManifestPath .\reviewed-base\cobble-music-update.json `
   -BaseSignaturePath .\reviewed-base\cobble-music-update.sig
 ```
 
 Local copies do not bypass GitHub identity checks. The publisher still locates
-the currently published, non-draft `modpack-v1.0.4` release through GitHub's
+the currently published, non-draft `modpack-v1.0.5` release through GitHub's
 API and requires the local manifest and signature raw sizes/SHA-256 hashes to
 match their exact `uploaded` release assets. A locally signed but unpublished
 or replaced base is rejected so the resulting delta cannot reference an
@@ -366,6 +376,12 @@ release is valid and has no ZIP or part assets; raw v2 JSON may omit the
 optional `payload` property entirely. Case/Unicode-colliding paths, unsafe
 updater paths, stale or equal versions, incomplete differences, and case-only
 renames are rejected before signing.
+Only approved top-level mod/resource-pack artifacts are inventoried. Nested
+`mods`/`resourcepacks` runtime directories, MCEF cache/libraries, generated
+`.index` data, browser tab state, backup files, and VCS/workspace metadata are
+never distributable. Reviewed `.rpo` sidecars appear only as explicit source
+file entries, and the final authoritative manifest is checked again before
+signing.
 The staging/resume validators mirror updater 1.2's schema rules: a v1 baseline
 must declare a canonical supported `minimumUpdaterVersion` and cannot carry
 delta-only fields, while v2 cannot use path-only `deletePaths`. Truly absent
@@ -429,7 +445,7 @@ window.
 
 Before any GitHub mutation, the publisher additionally requires the local
 pinned updater EXE to match the exact `uploaded` size and GitHub SHA-256 digest
-on the currently published, non-prerelease `updater-v1.2.1` release. It checks
+on the currently published, non-prerelease `updater-v1.2.2` release. It checks
 that dependency again immediately before making the modpack draft public. For
 a v2 delta it also re-fetches the stable base release at that final boundary
 and requires both base manifest and signature to match the identity captured
