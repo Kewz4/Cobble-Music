@@ -255,8 +255,13 @@ instance-specific Prism pre-launch command:
 "$INST_MC_DIR/cobble-music-updater/CobbleMusicUpdater.exe" --instance-dir "$INST_DIR" --minecraft-dir "$INST_MC_DIR" --prism-prelaunch
 ```
 
-It refuses to overwrite a different existing `PreLaunchCommand`; inspect it
-first and use `-Force` only when replacement is deliberate.
+Close Prism Launcher before running either installer. Both scripts fail before
+editing `instance.cfg` while `prismlauncher.exe` is running, then check again
+directly beside the final configuration write to minimize the remaining
+start-between-check-and-save window. They preserve unrelated settings and
+canonicalize `OverrideCommands`, `PreLaunchCommand`, and
+`LogPrePostOutput` to exactly one entry each. A different nonempty pre-launch
+command is still preserved unless `-Force` is deliberate.
 
 The installers write the physical instance.cfg value with escaped quotes,
 which QSettings requires to retain both spaces and quote boundaries when Prism
@@ -292,7 +297,7 @@ the player can paste this into PowerShell, replacing the example instance path:
 ```powershell
 $uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.0/Bootstrap-CobbleMusicUpdater.ps1'
 $path = Join-Path $env:TEMP 'Bootstrap-CobbleMusicUpdater.ps1'
-$expected = '51749EE47CB76B75DD220ADA3B997B6BCF453D0EF1721448C15C38AB8D3A2545'
+$expected = '1A3F80613C4F9B3268EBC1DFD29ED8CB69A1473F82A51C007F9714D87F94FF45'
 Invoke-WebRequest -Uri $uri -OutFile $path
 if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $expected) { throw 'Bootstrap checksum mismatch.' }
 Unblock-File -LiteralPath $path

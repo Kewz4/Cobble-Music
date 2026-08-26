@@ -45,21 +45,36 @@ function Write-Utf8Atomically([string]$Path, [string]$Text) {
 
 function Set-InstanceSetting([string[]]$Lines, [string]$Name, [string]$Value) {
     $escapedName = [regex]::Escape($Name)
-    $index = -1
-    for ($i = 0; $i -lt $Lines.Count; $i++) {
-        if ($Lines[$i] -match "^$escapedName=") { $index = $i; break }
+    $updated = [Collections.Generic.List[string]]::new()
+    $inserted = $false
+    foreach ($existingLine in $Lines) {
+        if ($existingLine -match "^$escapedName=") {
+            if (-not $inserted) {
+                $updated.Add("$Name=$Value")
+                $inserted = $true
+            }
+            continue
+        }
+        $updated.Add($existingLine)
     }
-    $line = "$Name=$Value"
-    if ($index -ge 0) { $Lines[$index] = $line } else { $Lines += $line }
-    return ,$Lines
+    if (-not $inserted) { $updated.Add("$Name=$Value") }
+    return ,$updated.ToArray()
 }
 
-function Get-InstanceSetting([string[]]$Lines, [string]$Name) {
+function Get-InstanceSettingValues([string[]]$Lines, [string]$Name) {
     $escapedName = [regex]::Escape($Name)
+    $values = [Collections.Generic.List[string]]::new()
     foreach ($line in $Lines) {
-        if ($line -match "^$escapedName=(.*)$") { return $Matches[1] }
+        if ($line -match "^$escapedName=(.*)$") { $values.Add($Matches[1]) }
     }
-    return $null
+    return $values.ToArray()
+}
+
+function Assert-PrismLauncherNotRunning {
+    $running = @(Get-Process -Name 'prismlauncher' -ErrorAction SilentlyContinue)
+    if ($running.Count -gt 0) {
+        throw 'Prism Launcher is running. Close every Prism Launcher window and wait for prismlauncher.exe to exit, then rerun. instance.cfg was not changed.'
+    }
 }
 
 function Assert-WritableDirectory([string]$Path) {
@@ -92,12 +107,14 @@ try {
     if (-not (Test-Path -LiteralPath $instanceConfig -PathType Leaf)) {
         throw "Prism instance configuration is missing: $instanceConfig"
     }
+    Assert-PrismLauncherNotRunning
     $instanceText = [IO.File]::ReadAllText($instanceConfig)
     $lineEnding = if ($instanceText.Contains("`r`n")) { "`r`n" } else { "`n" }
     $lines = @($instanceText -split "`r?`n")
-    $existingPreLaunch = Get-InstanceSetting $lines 'PreLaunchCommand'
-    if (-not [string]::IsNullOrWhiteSpace($existingPreLaunch) -and $existingPreLaunch -ne $preLaunch -and -not $Force) {
-        throw "This Prism instance already has a different PreLaunchCommand. The bootstrap will not replace it. Review it and rerun with -Force only if replacement is intentional. Existing command: $existingPreLaunch"
+    $existingPreLaunchValues = @(Get-InstanceSettingValues $lines 'PreLaunchCommand')
+    $conflictingPreLaunchValues = @($existingPreLaunchValues | Where-Object { -not [string]::IsNullOrWhiteSpace($_) -and $_ -cne $preLaunch })
+    if ($conflictingPreLaunchValues.Count -gt 0 -and -not $Force) {
+        throw "This Prism instance already has a different PreLaunchCommand. The bootstrap will not replace it. Review it and rerun with -Force only if replacement is intentional. Existing command: $($conflictingPreLaunchValues[0])"
     }
 
     Assert-WritableDirectory $minecraft
@@ -147,6 +164,7 @@ try {
     $lines = Set-InstanceSetting $lines 'OverrideCommands' 'true'
     $lines = Set-InstanceSetting $lines 'PreLaunchCommand' $preLaunch
     $lines = Set-InstanceSetting $lines 'LogPrePostOutput' 'true'
+    Assert-PrismLauncherNotRunning
     Write-Utf8Atomically $instanceConfig ($lines -join $lineEnding)
 
     Write-Host "Installed verified updater: $targetExe"
