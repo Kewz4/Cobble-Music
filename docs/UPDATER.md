@@ -78,7 +78,7 @@ Release asset.
 ## Maintainer prerequisites
 
 - PowerShell 7 on Windows
-- .NET 10 SDK
+- .NET SDK 10.0.103 exactly (`global.json` disables SDK roll-forward)
 - 7-Zip or NanaZip providing `7z` on `PATH`
 - GitHub CLI authenticated for `Kewz4/Cobble-Music` (`gh auth login`)
 - substantial local free space: staging needs the chunk files, reconstructed
@@ -111,12 +111,22 @@ instances, or release assets.
 ```powershell
 .\tests\Test-ManifestSignature.ps1
 .\tests\Test-TransactionRecovery.ps1
+.\tests\Test-UpdaterBuildReproducibility.ps1
 .\tools\Build-CobbleMusicUpdater.ps1
 ```
 
 The signature test uses a committed public fixture and does not require the
 private key. A maintainer can add `-PrivateKey <offline-key-path>` for an
 optional live signing round trip.
+
+The reproducibility test exports the committed updater source into two clean
+directories with different absolute paths, performs a cold build in each and
+a repeated warm build in one, then compares all three EXEs byte-for-byte and
+by SHA-256. Release builds map their physical source root to a fixed virtual
+path, omit debug/PDB and Source Link data, ignore Git revision metadata, and
+use the exact SDK selected by `global.json`. `.gitattributes` keeps text build
+inputs at LF in every clean checkout while explicitly treating binaries as
+binary.
 
 The builder emits:
 
@@ -134,9 +144,9 @@ separate from signed `modpack-v*` payload releases. The updater publisher
 derives the release version from the single `BuildInfo.Version` constant,
 requires the project version to match it, builds self-contained `win-x64`,
 computes the EXE's SHA-256, and tests a proposed bootstrap containing that
-exact version/hash. Its deterministic build excludes Git's changing revision
-and Source Link metadata, avoiding a checksum cycle when that bootstrap pin is
-committed; GitHub upload still requires every input to be committed.
+exact version/hash. The publisher delegates to the same reproducible builder
+used by local builds, avoiding flag drift and checksum cycles; GitHub upload
+still requires every input to be committed.
 
 First stage locally. This runs every `tests/Test-*.ps1` plus every updater
 `*.Tests.csproj`, atomically refreshes the tracked bootstrap only after they
@@ -248,6 +258,8 @@ updates happen automatically when that player presses Prism's Play button.
 The canonical source is the current live client, not Claude’s stale `1.0.3`
 `.mrpack` or its retained `mrpack\` folder. The publisher requires an explicit
 mode so accidentally omitting a base version cannot upload the entire pack.
+Release and base versions use exactly `major.minor.patch` with no leading
+zeroes (for example, `1.0.5`); four-component variants are rejected.
 
 The already-published `1.0.4` release is the full schema-v1 baseline. A new
 baseline is exceptional and must be requested explicitly:
@@ -265,13 +277,20 @@ that complete signed file set with the canonical live client:
 .\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.5 -BaseVersion 1.0.4
 ```
 
-For an offline/review workflow, supply both exact local base assets as well:
+To use reviewed local copies of the base assets, supply both paths:
 
 ```powershell
 .\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.5 -BaseVersion 1.0.4 `
   -BaseManifestPath .\reviewed-base\cobble-music-update.json `
   -BaseSignaturePath .\reviewed-base\cobble-music-update.sig
 ```
+
+Local copies do not bypass GitHub identity checks. The publisher still locates
+the currently published, non-draft `modpack-v1.0.4` release through GitHub's
+API and requires the local manifest and signature raw sizes/SHA-256 hashes to
+match their exact `uploaded` release assets. A locally signed but unpublished
+or replaced base is rejected so the resulting delta cannot reference an
+unreachable chain.
 
 A v2 manifest still carries the complete authoritative `files` state. Its
 `payloadFiles` contains only changed/new files, while `deletedFiles` contains
@@ -284,6 +303,10 @@ Review `release-output\1.0.5\cobble-music-update.json`, its signature, and all
 generated part hashes. Staging makes no GitHub change. Payload parts default to
 256 MiB; the temporary combined ZIP is removed immediately after splitting so
 staging does not retain a second full copy.
+Before hashing or splitting that ZIP, the publisher streams every archive entry
+and requires its canonical path, uncompressed size, and SHA-256 to exactly
+match `payloadFiles`, with no duplicate, extra, or missing entries. This catches
+a source file that changes after the initial inventory but before archiving.
 
 After review, publish that **exact existing staging**:
 

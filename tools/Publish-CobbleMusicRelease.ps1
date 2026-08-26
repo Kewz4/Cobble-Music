@@ -8,7 +8,7 @@ remote asset inventory before making the release public.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
-    [ValidatePattern('^\d+\.\d+\.\d+(\.\d+)?$')]
+    [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
     [string]$Version,
 
     [string]$SourceMinecraftDir = "C:\Program Files\Prism Launcher\instances\Kewz's Cobblemon - Client 1.0.1\minecraft",
@@ -26,7 +26,7 @@ param(
     ),
     [string]$LegacyCleanupManifest,
 
-    [ValidatePattern('^\d+\.\d+\.\d+(\.\d+)?$')]
+    [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
     [string]$BaseVersion,
     [string]$BaseManifestPath,
     [string]$BaseSignaturePath,
@@ -180,6 +180,15 @@ function New-PayloadParts([object[]]$PayloadFiles) {
     }
     finally { Pop-Location }
 
+    try { Assert-CobblePayloadZipInventory -ZipPath $payloadPath -ExpectedFiles $PayloadFiles | Out-Null }
+    catch {
+        if (Test-Path -LiteralPath $payloadPath -PathType Leaf) {
+            Assert-Under $payloadPath $OutputRoot
+            Remove-Item -LiteralPath $payloadPath -Force
+        }
+        throw
+    }
+
     $payloadSize = (Get-Item -LiteralPath $payloadPath).Length
     $payloadHash = Get-Sha256 $payloadPath
     try {
@@ -223,7 +232,8 @@ function Get-GitHubReleaseByTag([string]$Tag) {
 
 function Get-GitHubReleaseAssets([int64]$ReleaseId) {
     $assets = [Collections.Generic.List[object]]::new()
-    for ($page = 1; $page -le 10; $page++) {
+    for ($page = 1; ; $page++) {
+        if ($page -gt 100) { throw "GitHub release $ReleaseId has more than 10,000 assets; refusing a truncated identity check." }
         $result = @(Invoke-GhJson -Arguments @('api', "repos/$Repository/releases/$ReleaseId/assets?per_page=100&page=$page"))
         foreach ($asset in $result) { $assets.Add($asset) }
         if ($result.Count -lt 100) { break }
@@ -237,17 +247,26 @@ function Resolve-BaseArtifacts([string]$RequestedVersion, [string]$ManifestPath,
     $hasSignature = -not [string]::IsNullOrWhiteSpace($SignaturePath)
     if ($hasManifest -xor $hasSignature) { throw 'Specify both -BaseManifestPath and -BaseSignaturePath, or neither.' }
 
-    if ($hasManifest) {
-        if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw "Base manifest was not found: $ManifestPath" }
-        if (-not (Test-Path -LiteralPath $SignaturePath -PathType Leaf)) { throw "Base signature was not found: $SignaturePath" }
-        return [pscustomobject]@{ ManifestPath = (Resolve-Path -LiteralPath $ManifestPath).Path; SignaturePath = (Resolve-Path -LiteralPath $SignaturePath).Path; TempRoot = $null }
-    }
-
     $tag = "modpack-v$RequestedVersion"
     $release = Get-GitHubReleaseByTag $tag
     if ($null -eq $release -or [bool]$release.draft -or [bool]$release.prerelease) {
         throw "Published stable signed base release was not found: $tag"
     }
+    $publishedAssets = @(Get-GitHubReleaseAssets ([int64]$release.id))
+
+    if ($hasManifest) {
+        if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw "Base manifest was not found: $ManifestPath" }
+        if (-not (Test-Path -LiteralPath $SignaturePath -PathType Leaf)) { throw "Base signature was not found: $SignaturePath" }
+        $resolvedManifest = (Resolve-Path -LiteralPath $ManifestPath).Path
+        $resolvedSignature = (Resolve-Path -LiteralPath $SignaturePath).Path
+        $localAssets = @(
+            [pscustomobject]@{ name = 'cobble-music-update.json'; size = (Get-Item -LiteralPath $resolvedManifest).Length; sha256 = (Get-Sha256 $resolvedManifest) },
+            [pscustomobject]@{ name = 'cobble-music-update.sig'; size = (Get-Item -LiteralPath $resolvedSignature).Length; sha256 = (Get-Sha256 $resolvedSignature) }
+        )
+        Assert-CobblePublishedBaseAssets -LocalAssets $localAssets -RemoteAssets $publishedAssets | Out-Null
+        return [pscustomobject]@{ ManifestPath = $resolvedManifest; SignaturePath = $resolvedSignature; TempRoot = $null }
+    }
+
     $tempRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-music-base-$([Guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Path $tempRoot | Out-Null
     try {
@@ -261,6 +280,11 @@ function Resolve-BaseArtifacts([string]$RequestedVersion, [string]$ManifestPath,
         if (-not (Test-Path -LiteralPath $downloadedManifest -PathType Leaf) -or -not (Test-Path -LiteralPath $downloadedSignature -PathType Leaf)) {
             throw "Base release $tag is missing the signed manifest assets."
         }
+        $downloadedAssets = @(
+            [pscustomobject]@{ name = 'cobble-music-update.json'; size = (Get-Item -LiteralPath $downloadedManifest).Length; sha256 = (Get-Sha256 $downloadedManifest) },
+            [pscustomobject]@{ name = 'cobble-music-update.sig'; size = (Get-Item -LiteralPath $downloadedSignature).Length; sha256 = (Get-Sha256 $downloadedSignature) }
+        )
+        Assert-CobblePublishedBaseAssets -LocalAssets $downloadedAssets -RemoteAssets $publishedAssets | Out-Null
         return [pscustomobject]@{ ManifestPath = $downloadedManifest; SignaturePath = $downloadedSignature; TempRoot = $tempRoot }
     }
     catch {

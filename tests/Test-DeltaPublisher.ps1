@@ -92,6 +92,10 @@ Assert-True (Assert-CobbleV1Manifest -Manifest $baselineManifest) 'Valid schema-
 $badBaseline = $baselineManifest.PSObject.Copy()
 $badBaseline.deletePaths = @('mods/unchanged.jar')
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $badBaseline } 'Baseline deletion overlapping authoritative files was accepted.'
+$fourPartBaseline = $baselineManifest.PSObject.Copy()
+$fourPartBaseline.version = '1.0.4.0'
+$fourPartBaseline.releaseTag = 'modpack-v1.0.4.0'
+Assert-Throws { Assert-CobbleV1Manifest -Manifest $fourPartBaseline } 'Four-part baseline version was accepted.'
 
 $deletionBase = @((New-Record 'mods/keep.jar' 1 'a'), (New-Record 'mods/remove.jar' 2 'b'))
 $deletionCurrent = @((New-Record 'mods/keep.jar' 1 'a'))
@@ -154,6 +158,8 @@ Assert-Throws {
 Assert-Throws { Assert-CobbleVersionAdvance -BaseVersion '1.0.5' -TargetVersion '1.0.5' } 'Equal delta version was accepted.'
 Assert-Throws { Assert-CobbleVersionAdvance -BaseVersion '1.0.5' -TargetVersion '1.0.4' } 'Downgrade delta version was accepted.'
 Assert-Throws { Assert-CobbleVersionAdvance -BaseVersion '1.0.4' -TargetVersion '1.00.5' } 'Non-canonical delta version was accepted.'
+Assert-Throws { Assert-CobbleVersionAdvance -BaseVersion '1.0.4' -TargetVersion '1.0.5.0' } 'Four-part delta version was accepted.'
+Assert-Throws { Assert-CobbleVersionAdvance -BaseVersion '01.0.4' -TargetVersion '1.0.5' } 'Leading-zero base version was accepted.'
 
 $tamperedPayload = $manifest.PSObject.Copy()
 $tamperedPayload.payloadFiles = @($plan.PayloadFiles | Where-Object path -ne 'config/changed.json')
@@ -176,6 +182,22 @@ $remoteAssets = @($expectedAssets | ForEach-Object {
     [pscustomobject]@{ name = $_.name; size = $_.size; digest = "sha256:$($_.sha256)"; state = 'uploaded' }
 })
 Assert-True (@(Assert-CobbleRemoteAssetInventory -ExpectedAssets $expectedAssets -RemoteAssets $remoteAssets -RequireComplete).Count -eq 0) 'Exact remote asset inventory was rejected.'
+$localBaseAssets = @($expectedAssets | Where-Object name -in @('cobble-music-update.json', 'cobble-music-update.sig'))
+Assert-True (Assert-CobblePublishedBaseAssets -LocalAssets $localBaseAssets -RemoteAssets $remoteAssets) 'Exact local base assets did not match the published release assets.'
+
+$mutatedLocalBase = @($localBaseAssets | ForEach-Object { $_.PSObject.Copy() })
+$mutatedLocalBase[0].sha256 = New-Hash '9'
+Assert-Throws { Assert-CobblePublishedBaseAssets -LocalAssets $mutatedLocalBase -RemoteAssets $remoteAssets } 'Local base manifest differing from the published digest was accepted.'
+$wrongSizeLocalBase = @($localBaseAssets | ForEach-Object { $_.PSObject.Copy() })
+$wrongSizeLocalBase[1].size++
+Assert-Throws { Assert-CobblePublishedBaseAssets -LocalAssets $wrongSizeLocalBase -RemoteAssets $remoteAssets } 'Local base signature differing from the published raw size was accepted.'
+
+$unfinishedPublishedBase = @($remoteAssets | ForEach-Object { $_.PSObject.Copy() })
+$unfinishedPublishedBase[1].state = 'starter'
+Assert-Throws { Assert-CobblePublishedBaseAssets -LocalAssets $localBaseAssets -RemoteAssets $unfinishedPublishedBase } 'Non-uploaded published base signature was accepted.'
+
+$missingPublishedBase = @($remoteAssets | Where-Object name -ne 'cobble-music-update.sig')
+Assert-Throws { Assert-CobblePublishedBaseAssets -LocalAssets $localBaseAssets -RemoteAssets $missingPublishedBase } 'Published release missing its exact signature asset was accepted.'
 
 $partialRemote = @($remoteAssets | Where-Object name -ne 'cobble-music-payload.part001')
 $missing = @(Assert-CobbleRemoteAssetInventory -ExpectedAssets $expectedAssets -RemoteAssets $partialRemote)
@@ -204,6 +226,39 @@ Assert-Throws { Get-CobbleRepairableStarterAssets -ExpectedAssets $expectedAsset
 $unexpected = @($remoteAssets) + @([pscustomobject]@{ name = 'extra.bin'; size = 0; digest = "sha256:$(New-Hash '0')"; state = 'uploaded' })
 Assert-Throws { Assert-CobbleRemoteAssetInventory -ExpectedAssets $expectedAssets -RemoteAssets $unexpected | Out-Null } 'Unexpected draft asset was accepted.'
 
+$zipTestRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-publisher-zip-test-$([Guid]::NewGuid().ToString('N'))"
+[IO.Directory]::CreateDirectory($zipTestRoot) | Out-Null
+try {
+    $zipPath = Join-Path $zipTestRoot 'payload.zip'
+    $content = [Text.Encoding]::UTF8.GetBytes('inventoried payload bytes')
+    $zipStream = [IO.File]::Open($zipPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        $zip = [IO.Compression.ZipArchive]::new($zipStream, [IO.Compression.ZipArchiveMode]::Create, $true)
+        try {
+            $entry = $zip.CreateEntry('mods/inventoried.txt')
+            $entryStream = $entry.Open()
+            try { $entryStream.Write($content, 0, $content.Length) }
+            finally { $entryStream.Dispose() }
+        }
+        finally { $zip.Dispose() }
+    }
+    finally { $zipStream.Dispose() }
+
+    $contentHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($content)).ToLowerInvariant()
+    $zipExpected = @([pscustomobject]@{ path = 'mods/inventoried.txt'; size = $content.Length; sha256 = $contentHash })
+    Assert-True (Assert-CobblePayloadZipInventory -ZipPath $zipPath -ExpectedFiles $zipExpected) 'Exact streamed ZIP inventory was rejected.'
+
+    $mutatedInventory = @([pscustomobject]@{ path = 'mods/inventoried.txt'; size = $content.Length; sha256 = (New-Hash '8') })
+    Assert-Throws { Assert-CobblePayloadZipInventory -ZipPath $zipPath -ExpectedFiles $mutatedInventory } 'ZIP content changed after source inventory was accepted.'
+    $wrongPathInventory = @([pscustomobject]@{ path = 'mods/different.txt'; size = $content.Length; sha256 = $contentHash })
+    Assert-Throws { Assert-CobblePayloadZipInventory -ZipPath $zipPath -ExpectedFiles $wrongPathInventory } 'ZIP unexpected/missing entry set was accepted.'
+    $missingEntryInventory = @($zipExpected) + @([pscustomobject]@{ path = 'mods/missing.txt'; size = 1; sha256 = (New-Hash '7') })
+    Assert-Throws { Assert-CobblePayloadZipInventory -ZipPath $zipPath -ExpectedFiles $missingEntryInventory } 'ZIP missing an inventoried entry was accepted.'
+}
+finally {
+    if ([IO.Directory]::Exists($zipTestRoot)) { [IO.Directory]::Delete($zipTestRoot, $true) }
+}
+
 $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($Publisher, [ref]$tokens, [ref]$parseErrors)
@@ -213,5 +268,10 @@ Assert-True ($null -ne $chunkParameter -and $chunkParameter.DefaultValue.Extent.
 
 $modeGateOutput = @(& pwsh -NoProfile -File $Publisher -Version 98.0.0 -FullBaseline -RepairStaleUploads 2>&1)
 Assert-True ($LASTEXITCODE -ne 0 -and ($modeGateOutput -join "`n") -like '*allowed only with -ResumePublish*') '-RepairStaleUploads did not fail closed outside resume mode.'
+
+$fourPartOutput = @(& pwsh -NoProfile -File $Publisher -Version 98.0.0.0 -FullBaseline 2>&1)
+Assert-True ($LASTEXITCODE -ne 0 -and ($fourPartOutput -join "`n") -like '*does not match*pattern*') 'Publisher parameter binding accepted a four-part version.'
+$leadingZeroOutput = @(& pwsh -NoProfile -File $Publisher -Version 98.00.0 -FullBaseline 2>&1)
+Assert-True ($LASTEXITCODE -ne 0 -and ($leadingZeroOutput -join "`n") -like '*does not match*pattern*') 'Publisher parameter binding accepted a leading-zero version.'
 
 Write-Host 'Delta publisher validation, deletion-only, collision, version, and remote-inventory checks passed.'

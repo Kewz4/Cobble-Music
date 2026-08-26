@@ -2,6 +2,7 @@ Set-StrictMode -Version Latest
 
 $script:AllowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $script:Sha256Pattern = '^[0-9a-f]{64}$'
+$script:VersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 
 function Get-CobblePathKey {
     param([Parameter(Mandatory)][string]$Path)
@@ -148,8 +149,9 @@ function Assert-CobbleV1Manifest {
         throw 'Baseline manifest identity, schema, or release tag is invalid.'
     }
     [Version]$parsed = $null
-    if (-not [Version]::TryParse([string]$Manifest.version, [ref]$parsed) -or $parsed.ToString() -cne [string]$Manifest.version) {
-        throw 'Baseline manifest version is invalid or non-canonical.'
+    if ([string]$Manifest.version -cnotmatch $script:VersionPattern -or
+        -not [Version]::TryParse([string]$Manifest.version, [ref]$parsed)) {
+        throw 'Baseline manifest version must use canonical major.minor.patch form.'
     }
     $files = ConvertTo-CobbleFileRecordSet -Entries @($Manifest.files) -Context 'baseline authoritative files'
     Assert-CobblePayloadMetadata $Manifest.payload
@@ -175,11 +177,9 @@ function Assert-CobbleVersionAdvance {
 
     [Version]$base = $null
     [Version]$target = $null
-    if (-not [Version]::TryParse($BaseVersion, [ref]$base) -or -not [Version]::TryParse($TargetVersion, [ref]$target)) {
-        throw "Base and target versions must be valid .NET versions: $BaseVersion -> $TargetVersion"
-    }
-    if ($base.ToString() -cne $BaseVersion -or $target.ToString() -cne $TargetVersion) {
-        throw "Base and target versions must use canonical dotted-decimal form: $BaseVersion -> $TargetVersion"
+    if ($BaseVersion -cnotmatch $script:VersionPattern -or $TargetVersion -cnotmatch $script:VersionPattern -or
+        -not [Version]::TryParse($BaseVersion, [ref]$base) -or -not [Version]::TryParse($TargetVersion, [ref]$target)) {
+        throw "Base and target versions must use canonical major.minor.patch form: $BaseVersion -> $TargetVersion"
     }
     if ($target -le $base) {
         throw "A delta release must advance the version: $BaseVersion -> $TargetVersion"
@@ -337,6 +337,86 @@ function New-CobbleExpectedAssetIndex {
     return [pscustomobject]@{ ByName = $expected }
 }
 
+function Assert-CobblePublishedBaseAssets {
+    param(
+        [Parameter(Mandatory)][object[]]$LocalAssets,
+        [Parameter(Mandatory)][object[]]$RemoteAssets
+    )
+
+    $requiredNames = @('cobble-music-update.json', 'cobble-music-update.sig')
+    $local = (New-CobbleExpectedAssetIndex $LocalAssets).ByName
+    if ($local.Count -ne $requiredNames.Count -or $requiredNames.Where({ -not $local.ContainsKey($_) }).Count -gt 0) {
+        throw 'Local base identity must contain exactly the manifest and detached signature assets.'
+    }
+    foreach ($requiredName in $requiredNames) {
+        if ($local[$requiredName].name -cne $requiredName -or $local[$requiredName].size -le 0) {
+            throw "Local base asset identity is invalid: $requiredName"
+        }
+    }
+
+    $seenRemote = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $matched = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($remote in $RemoteAssets) {
+        $name = [string]$remote.name
+        if (-not $seenRemote.Add($name)) { throw "Published base release contains duplicate or case-colliding assets: $name" }
+        if (-not $local.ContainsKey($name)) { continue }
+
+        $wanted = $local[$name]
+        if ($name -cne $wanted.name -or [string]$remote.state -cne 'uploaded' -or
+            [int64]$remote.size -ne $wanted.size -or [string]$remote.digest -cne "sha256:$($wanted.sha256)") {
+            throw "Local base asset does not exactly match the uploaded published release asset: $name"
+        }
+        [void]$matched.Add($name)
+    }
+    $missing = @($requiredNames | Where-Object { -not $matched.Contains($_) })
+    if ($missing.Count -gt 0) { throw "Published base release is missing exact uploaded identity assets: $($missing -join ', ')" }
+    return $true
+}
+
+function Assert-CobblePayloadZipInventory {
+    param(
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][object[]]$ExpectedFiles
+    )
+
+    if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw "Payload ZIP was not found: $ZipPath" }
+    $expected = ConvertTo-CobbleFileRecordSet -Entries $ExpectedFiles -Context 'payload ZIP expected files'
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $fileStream = [IO.File]::Open($ZipPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $archive = [IO.Compression.ZipArchive]::new($fileStream, [IO.Compression.ZipArchiveMode]::Read, $false)
+        try {
+            foreach ($entry in $archive.Entries) {
+                $path = [string]$entry.FullName
+                if ([string]::IsNullOrWhiteSpace([string]$entry.Name)) { throw "Payload ZIP contains a directory or unnamed entry: $path" }
+                Assert-CobbleManagedPath -Path $path -Context 'payload ZIP entry' | Out-Null
+                $key = Get-CobblePathKey $path
+                if (-not $seen.Add($key)) { throw "Payload ZIP contains a duplicate or case/Unicode-colliding entry: $path" }
+                if (-not $expected.ByKey.ContainsKey($key)) { throw "Payload ZIP contains an unexpected entry: $path" }
+
+                $wanted = $expected.ByKey[$key]
+                if ($path -cne $wanted.path -or [int64]$entry.Length -ne $wanted.size) {
+                    throw "Payload ZIP path/size does not match the inventoried source: $path"
+                }
+                $entryStream = $entry.Open()
+                $hasher = [Security.Cryptography.SHA256]::Create()
+                try { $actualHash = [Convert]::ToHexString($hasher.ComputeHash($entryStream)).ToLowerInvariant() }
+                finally {
+                    $hasher.Dispose()
+                    $entryStream.Dispose()
+                }
+                if ($actualHash -cne $wanted.sha256) { throw "Payload ZIP SHA-256 does not match the inventoried source: $path" }
+            }
+        }
+        finally { $archive.Dispose() }
+    }
+    finally { $fileStream.Dispose() }
+
+    $missing = @($expected.Entries | Where-Object { -not $seen.Contains((Get-CobblePathKey $_.path)) })
+    if ($missing.Count -gt 0) { throw "Payload ZIP is missing inventoried files: $($missing.path -join ', ')" }
+    return $true
+}
+
 function Get-CobbleRepairableStarterAssets {
     param(
         [AllowEmptyCollection()]
@@ -420,6 +500,8 @@ Export-ModuleMember -Function @(
     'Assert-CobbleV1Manifest',
     'New-CobbleDeltaPlan',
     'Assert-CobbleDeltaManifest',
+    'Assert-CobblePublishedBaseAssets',
+    'Assert-CobblePayloadZipInventory',
     'Get-CobbleRepairableStarterAssets',
     'Assert-CobbleRemoteAssetInventory'
 )

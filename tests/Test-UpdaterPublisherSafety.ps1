@@ -5,6 +5,12 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $Publisher = Join-Path $Root 'tools\Publish-CobbleMusicUpdater.ps1'
 if (-not (Test-Path -LiteralPath $Publisher -PathType Leaf)) { throw "Updater publisher is missing: $Publisher" }
+$Builder = Join-Path $Root 'tools\Build-CobbleMusicUpdater.ps1'
+$GlobalJson = Join-Path $Root 'global.json'
+$Attributes = Join-Path $Root '.gitattributes'
+foreach ($path in @($Builder, $GlobalJson, $Attributes)) {
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Updater build-safety input is missing: $path" }
+}
 $ConsoleHarnessProject = Join-Path $Root 'updater\CobbleMusicUpdater.Tests\CobbleMusicUpdater.Tests.csproj'
 if (-not (Test-Path -LiteralPath $ConsoleHarnessProject -PathType Leaf)) { throw "Console updater test harness is missing: $ConsoleHarnessProject" }
 
@@ -36,6 +42,72 @@ foreach ($fragment in $requiredExecutionFragments) {
     }
 }
 
+if (-not $publisherText.Contains('& $BuildScript -Runtime win-x64 -OutputDirectory $publishOutput', [StringComparison]::Ordinal)) {
+    throw 'Updater publisher bypasses the centralized reproducible builder.'
+}
+if ($publisherText.Contains('& dotnet publish $ProjectPath', [StringComparison]::Ordinal)) {
+    throw 'Updater publisher reintroduced a second, drifting dotnet publish path.'
+}
+
+$builderText = [IO.File]::ReadAllText($Builder)
+foreach ($fragment in @(
+    '-p:DebugType=none',
+    '-p:DebugSymbols=false',
+    '-p:Deterministic=true',
+    '-p:DeterministicSourcePaths=true',
+    '-p:ContinuousIntegrationBuild=true',
+    '-p:IncludeSourceRevisionInInformationalVersion=false',
+    '-p:EnableSourceLink=false',
+    '-p:EnableSourceControlManagerQueries=false',
+    '"-p:PathMap=$PathMap"'
+)) {
+    if (-not $builderText.Contains($fragment, [StringComparison]::Ordinal)) {
+        throw "Updater builder lost a reproducibility requirement: $fragment"
+    }
+}
+if ($builderText.Contains('-p:DebugType=embedded', [StringComparison]::Ordinal)) {
+    throw 'Updater release builder reintroduced path-sensitive embedded debug data.'
+}
+
+$sdk = Get-Content -LiteralPath $GlobalJson -Raw | ConvertFrom-Json
+if ([string]$sdk.sdk.version -cne '10.0.103' `
+    -or [string]$sdk.sdk.rollForward -cne 'disable' `
+    -or $sdk.sdk.PSObject.Properties.Name -notcontains 'allowPrerelease' `
+    -or [bool]$sdk.sdk.allowPrerelease) {
+    throw 'global.json no longer pins the reviewed .NET SDK exactly.'
+}
+$attributesText = [IO.File]::ReadAllText($Attributes)
+foreach ($fragment in @('*.cs text eol=lf', '*.ps1 text eol=lf', '*.json text eol=lf', '*.exe binary', '*.dll binary')) {
+    if (-not $attributesText.Contains($fragment, [StringComparison]::Ordinal)) {
+        throw "Stable text/binary Git attribute is missing: $fragment"
+    }
+}
+
+$commentPatternAssignment = [regex]::Match(
+    $publisherText,
+    '(?m)^[ \t]*\$commentPattern[ \t]*=[ \t]*''(?<pattern>[^''\r\n]+)''[ \t]*\r?$')
+if (-not $commentPatternAssignment.Success) { throw 'Could not locate the updater checksum-comment regex in the publisher.' }
+$commentExpression = [regex]::new($commentPatternAssignment.Groups['pattern'].Value)
+foreach ($fixture in @(
+    [pscustomobject]@{ Name = 'LF'; Eol = "`n"; CapturedEol = '' },
+    [pscustomobject]@{ Name = 'CRLF'; Eol = "`r`n"; CapturedEol = "`r" }
+)) {
+    $oldComment = "# SHA-256 of CobbleMusicUpdater.exe from updater-v1.1.0.$($fixture.Eol)"
+    $matches = $commentExpression.Matches($oldComment)
+    if ($matches.Count -ne 1 -or $matches[0].Groups['eol'].Value -cne $fixture.CapturedEol) {
+        throw "Updater checksum-comment regex is not safe for $($fixture.Name) line endings."
+    }
+    $replacement = $commentExpression.Replace(
+        $oldComment,
+        [Text.RegularExpressions.MatchEvaluator]{
+            param($match)
+            '# SHA-256 of CobbleMusicUpdater.exe from updater-v9.9.9.' + $match.Groups['eol'].Value
+        },
+        1)
+    $expected = "# SHA-256 of CobbleMusicUpdater.exe from updater-v9.9.9.$($fixture.Eol)"
+    if ($replacement -cne $expected) { throw "Updater checksum-comment replacement changed $($fixture.Name) line endings." }
+}
+
 $cases = @(
     [pscustomobject]@{
         Name = 'dry-run cannot mutate a draft'
@@ -64,4 +136,4 @@ foreach ($case in $cases) {
     }
 }
 
-Write-Host 'Updater publisher mode-gate checks passed without building or contacting GitHub.'
+Write-Host 'Updater publisher mode-gate, reproducible-builder, and LF/CRLF checksum-comment checks passed without building or contacting GitHub.'

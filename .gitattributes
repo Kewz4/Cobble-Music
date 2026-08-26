@@ -1,0 +1,23 @@
+# Build and release inputs have a repository-stable byte representation.
+.gitattributes text eol=lf
+global.json text eol=lf
+*.cs text eol=lf
+*.csproj text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.ps1 text eol=lf
+*.psm1 text eol=lf
+*.props text eol=lf
+*.targets text eol=lf
+
+# Never let broad text rules rewrite binary payloads or build artifacts.
+*.dll binary
+*.exe binary
+*.jar binary
+*.nupkg binary
+*.ogg binary
+*.mp3 binary
+*.pdb binary
+*.png binary
+*.wav binary
+*.zip binary

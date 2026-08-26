@@ -25,7 +25,7 @@ if ([string]::IsNullOrWhiteSpace($BootstrapPath)) {
 }
 
 function Get-SingleQuotedAssignment([string]$Text, [string]$Name) {
-    $pattern = '(?m)^\s*' + [regex]::Escape('$' + $Name) + '\s*=\s*''(?<value>[^''\r\n]*)''\s*$'
+    $pattern = '(?m)^[ \t]*' + [regex]::Escape('$' + $Name) + '[ \t]*=[ \t]*''(?<value>[^''\r\n]*)''[ \t]*\r?$'
     $matches = [regex]::Matches($Text, $pattern)
     if ($matches.Count -ne 1) { throw "Expected exactly one `$${Name} assignment, found $($matches.Count)." }
     return $matches[0].Groups['value'].Value
@@ -84,17 +84,28 @@ if (-not $bootstrapHash.Equals($exeHash, [StringComparison]::OrdinalIgnoreCase))
 if ($bootstrapHash -cnotmatch '^[0-9A-F]{64}$') { throw 'Bootstrap updater checksum must be canonical uppercase SHA-256.' }
 
 $expectedAssetUri = 'https://github.com/$Repository/releases/download/updater-v$UpdaterVersion/CobbleMusicUpdater.exe'
-$assetMatches = [regex]::Matches(
-    $bootstrap,
-    '(?m)^\s*\$assetUri\s*=\s*"(?<uri>[^"]+)"\s*$')
-if ($assetMatches.Count -ne 1 -or $assetMatches[0].Groups['uri'].Value -cne $expectedAssetUri) {
-    throw 'Bootstrap updater asset URI no longer binds its repository and version variables safely.'
-}
-
+$assetUriPattern = '(?m)^[ \t]*\$assetUri[ \t]*=[ \t]*"(?<uri>[^"]+)"[ \t]*\r?$'
 $expectedCommand = '\"$INST_MC_DIR/cobble-music-updater/CobbleMusicUpdater.exe\" --instance-dir \"$INST_DIR\" --minecraft-dir \"$INST_MC_DIR\" --prism-prelaunch'
-$preLaunchMatches = [regex]::Matches($bootstrap, '(?m)^\$preLaunch = ''(?<command>.*)''$')
-if ($preLaunchMatches.Count -ne 1 -or $preLaunchMatches[0].Groups['command'].Value -cne $expectedCommand) {
-    throw 'Bootstrap Prism pre-launch command is not QSettings-escaped correctly.'
+$preLaunchPattern = '(?m)^\$preLaunch = ''(?<command>[^''\r\n]*)''[ \t]*\r?$'
+$lfBootstrap = [regex]::Replace($bootstrap, '\r\n?|\n', "`n")
+$bootstrapLineEndingFixtures = [ordered]@{
+    LF = $lfBootstrap
+    CRLF = $lfBootstrap.Replace("`n", "`r`n")
+}
+foreach ($fixture in $bootstrapLineEndingFixtures.GetEnumerator()) {
+    if ((Get-SingleQuotedAssignment $fixture.Value 'Repository') -cne $ExpectedRepository `
+        -or (Get-SingleQuotedAssignment $fixture.Value 'UpdaterVersion') -cne $ExpectedVersion `
+        -or -not (Get-SingleQuotedAssignment $fixture.Value 'ExpectedUpdaterSha256').Equals($exeHash, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Bootstrap assignments do not parse safely with $($fixture.Key) line endings."
+    }
+    $assetMatches = [regex]::Matches($fixture.Value, $assetUriPattern)
+    if ($assetMatches.Count -ne 1 -or $assetMatches[0].Groups['uri'].Value -cne $expectedAssetUri) {
+        throw "Bootstrap updater asset URI is invalid with $($fixture.Key) line endings."
+    }
+    $preLaunchMatches = [regex]::Matches($fixture.Value, $preLaunchPattern)
+    if ($preLaunchMatches.Count -ne 1 -or $preLaunchMatches[0].Groups['command'].Value -cne $expectedCommand) {
+        throw "Bootstrap Prism pre-launch command is invalid with $($fixture.Key) line endings."
+    }
 }
 
-Write-Host "Updater release pipeline checks passed for updater-v$ExpectedVersion ($exeHash)."
+Write-Host "Updater release pipeline checks passed for updater-v$ExpectedVersion ($exeHash), including LF/CRLF bootstrap fixtures."

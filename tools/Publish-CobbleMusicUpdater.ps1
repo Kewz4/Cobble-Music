@@ -30,6 +30,8 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $BuildInfoPath = Join-Path $Root 'updater\CobbleMusicUpdater\BuildInfo.cs'
 $ProjectPath = Join-Path $Root 'updater\CobbleMusicUpdater\CobbleMusicUpdater.csproj'
+$BuildScript = Join-Path $Root 'tools\Build-CobbleMusicUpdater.ps1'
+$GlobalJsonPath = Join-Path $Root 'global.json'
 $BootstrapPath = Join-Path $Root 'bootstrap\Bootstrap-CobbleMusicUpdater.ps1'
 $DistExe = Join-Path $Root 'updater\dist\win-x64\CobbleMusicUpdater.exe'
 $PipelineTest = Join-Path $Root 'tests\Test-UpdaterReleasePipeline.ps1'
@@ -94,7 +96,7 @@ function Get-BuildVersion {
 }
 
 function Get-SingleQuotedAssignment([string]$Text, [string]$Name) {
-    $pattern = '(?m)^\s*' + [regex]::Escape('$' + $Name) + '\s*=\s*''(?<value>[^''\r\n]*)''\s*$'
+    $pattern = '(?m)^[ \t]*' + [regex]::Escape('$' + $Name) + '[ \t]*=[ \t]*''(?<value>[^''\r\n]*)''[ \t]*\r?$'
     $matches = [regex]::Matches($Text, $pattern)
     if ($matches.Count -ne 1) { throw "Expected exactly one `$${Name} assignment, found $($matches.Count)." }
     return $matches[0].Groups['value'].Value
@@ -102,7 +104,7 @@ function Get-SingleQuotedAssignment([string]$Text, [string]$Name) {
 
 function Set-SingleQuotedAssignment([string]$Text, [string]$Name, [string]$Value) {
     if ($Value.Contains("'")) { throw "Unsafe single quote in replacement value for `$${Name}." }
-    $pattern = '(?m)^(?<prefix>\s*' + [regex]::Escape('$' + $Name) + '\s*=\s*)''(?<value>[^''\r\n]*)''(?<suffix>\s*)$'
+    $pattern = '(?m)^(?<prefix>[ \t]*' + [regex]::Escape('$' + $Name) + '[ \t]*=[ \t]*)''(?<value>[^''\r\n]*)''(?<suffix>[ \t]*)(?<eol>\r?)$'
     $expression = [regex]::new($pattern)
     $matches = $expression.Matches($Text)
     if ($matches.Count -ne 1) { throw "Expected exactly one `$${Name} assignment, found $($matches.Count)." }
@@ -110,7 +112,7 @@ function Set-SingleQuotedAssignment([string]$Text, [string]$Name, [string]$Value
         $Text,
         [Text.RegularExpressions.MatchEvaluator]{
             param($match)
-            return $match.Groups['prefix'].Value + "'" + $Value + "'" + $match.Groups['suffix'].Value
+            return $match.Groups['prefix'].Value + "'" + $Value + "'" + $match.Groups['suffix'].Value + $match.Groups['eol'].Value
         },
         1)
 }
@@ -125,7 +127,7 @@ function Get-ProposedBootstrap([string]$Version, [string]$UpdaterSha256) {
     $text = Set-SingleQuotedAssignment $text 'UpdaterVersion' $Version
     $text = Set-SingleQuotedAssignment $text 'ExpectedUpdaterSha256' $UpdaterSha256.ToUpperInvariant()
 
-    $commentPattern = '(?m)^# SHA-256 of CobbleMusicUpdater\.exe from updater-v[^\r\n]+$'
+    $commentPattern = '(?m)^# SHA-256 of CobbleMusicUpdater\.exe from updater-v[^\r\n]+(?<eol>\r?)$'
     $commentMatches = [regex]::Matches($text, $commentPattern)
     if ($commentMatches.Count -ne 1) {
         throw "Expected exactly one updater checksum comment, found $($commentMatches.Count)."
@@ -133,7 +135,10 @@ function Get-ProposedBootstrap([string]$Version, [string]$UpdaterSha256) {
     $commentExpression = [regex]::new($commentPattern)
     $text = $commentExpression.Replace(
         $text,
-        "# SHA-256 of CobbleMusicUpdater.exe from updater-v$Version.",
+        [Text.RegularExpressions.MatchEvaluator]{
+            param($match)
+            return "# SHA-256 of CobbleMusicUpdater.exe from updater-v$Version." + $match.Groups['eol'].Value
+        },
         1)
 
     if ((Get-SingleQuotedAssignment $text 'UpdaterVersion') -cne $Version) { throw 'Bootstrap version replacement did not verify.' }
@@ -235,6 +240,8 @@ function Assert-ExactRemoteInventory($Release, [hashtable]$ExpectedAssets) {
 
 function Assert-CleanReleaseInputs {
     $paths = @(
+        '.gitattributes',
+        'global.json',
         'updater/CobbleMusicUpdater',
         'updater/CobbleMusicUpdater.Tests',
         'tools/Build-CobbleMusicUpdater.ps1',
@@ -356,7 +363,7 @@ if ($DryRun -and $GitHubMutation) { throw '-DryRun cannot be combined with -Uplo
 if ($ConfirmPublish -and -not $Publish) { throw '-ConfirmPublish is valid only with -Publish.' }
 if ($Publish -and -not $ConfirmPublish) { throw 'Final publication requires both -Publish and -ConfirmPublish.' }
 
-foreach ($required in @($BuildInfoPath, $ProjectPath, $BootstrapPath, $PipelineTest)) {
+foreach ($required in @($BuildInfoPath, $ProjectPath, $BuildScript, $GlobalJsonPath, $BootstrapPath, $PipelineTest)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required release input is missing: $required" }
 }
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw 'dotnet is required on PATH.' }
@@ -369,32 +376,13 @@ try {
     New-Item -ItemType Directory -Path $TemporaryRoot -Force | Out-Null
     $version = Get-BuildVersion
     $tag = "updater-v$version"
-    Write-Host "Building exact BuildInfo version $version as self-contained win-x64."
+    Write-Host "Building exact BuildInfo version $version as reproducible self-contained win-x64."
     $publishOutput = Join-Path $TemporaryRoot 'publish'
     New-Item -ItemType Directory -Path $publishOutput -Force | Out-Null
-    Invoke-Checked 'Restoring locked updater dependencies...' {
-        & dotnet restore $ProjectPath --locked-mode --runtime win-x64
-    }
-    # Excluding SourceRevisionId from the informational version breaks a
-    # checksum cycle: committing the freshly pinned bootstrap must not change
-    # the next build's EXE merely because HEAD changed. The code/version still
-    # has to be committed before any GitHub upload.
-    Invoke-Checked 'Publishing deterministic self-contained win-x64 updater...' {
-        & dotnet publish $ProjectPath `
-            --configuration Release `
-            --runtime win-x64 `
-            --self-contained true `
-            --no-restore `
-            --output $publishOutput `
-            -p:PublishSingleFile=true `
-            -p:IncludeNativeLibrariesForSelfExtract=true `
-            -p:DebugType=embedded `
-            -p:Deterministic=true `
-            -p:ContinuousIntegrationBuild=true `
-            -p:IncludeSourceRevisionInInformationalVersion=false `
-            -p:EnableSourceLink=false `
-            -p:EnableSourceControlManagerQueries=false `
-            -p:EmbedUntrackedSources=false
+    # The standalone builder owns the SDK pin, PathMap, debug policy, and all
+    # determinism flags so local and release builds cannot silently diverge.
+    Invoke-Checked 'Publishing reproducible self-contained win-x64 updater...' {
+        & $BuildScript -Runtime win-x64 -OutputDirectory $publishOutput
     }
     $builtExe = Join-Path $publishOutput 'CobbleMusicUpdater.exe'
     if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) { throw "Updater build output is missing: $builtExe" }
