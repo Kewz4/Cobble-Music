@@ -140,7 +140,10 @@ committed; GitHub upload still requires every input to be committed.
 
 First stage locally. This runs every `tests/Test-*.ps1` plus every updater
 `*.Tests.csproj`, atomically refreshes the tracked bootstrap only after they
-pass, and makes no GitHub change:
+pass, and makes no GitHub change. Console-style test projects are executed
+with `dotnet run` and must print their exact success marker; test-SDK projects
+use `dotnet test`. A project that only builds without proving execution blocks
+the release.
 
 ```powershell
 .\tools\Publish-CobbleMusicUpdater.ps1

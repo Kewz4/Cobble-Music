@@ -424,10 +424,41 @@ try {
         Invoke-Checked "Running $($test.Name)..." { & pwsh -NoProfile -File $test.FullName }
     }
     $dotnetTestProjects = @(Get-ChildItem -LiteralPath (Join-Path $Root 'updater') -Filter '*.Tests.csproj' -File -Recurse | Sort-Object FullName)
+    $consoleTestMarkers = @{
+        'CobbleMusicUpdater.Tests.csproj' = 'Schema-v2 delta, release-chain, exact-baseline adoption, base-integrity, and journal commit-boundary checks passed.'
+    }
     foreach ($testProject in $dotnetTestProjects) {
-        Invoke-Checked "Running $($testProject.Name)..." {
-            & dotnet test $testProject.FullName --configuration Release
+        [xml]$testProjectXml = [IO.File]::ReadAllText($testProject.FullName)
+        $outputTypes = @($testProjectXml.SelectNodes('/Project/PropertyGroup/OutputType') | ForEach-Object { $_.InnerText.Trim() } | Sort-Object -Unique)
+        $isTestProjectValues = @($testProjectXml.SelectNodes('/Project/PropertyGroup/IsTestProject') | ForEach-Object { $_.InnerText.Trim() })
+        $testSdkReferences = @($testProjectXml.SelectNodes('/Project/ItemGroup/PackageReference') | Where-Object { [string]$_.Include -ceq 'Microsoft.NET.Test.Sdk' })
+        $isConsoleHarness = $outputTypes.Count -eq 1 -and $outputTypes[0] -ceq 'Exe' -and $testSdkReferences.Count -eq 0 -and -not ($isTestProjectValues -contains 'true')
+
+        if ($isConsoleHarness) {
+            if (-not $consoleTestMarkers.ContainsKey($testProject.Name)) {
+                throw "Console test harness $($testProject.Name) has no required success marker in the updater publisher."
+            }
+            $expectedMarker = $consoleTestMarkers[$testProject.Name]
+            Write-Host "Executing console test harness $($testProject.Name)..."
+            $testOutput = @(& dotnet run --project $testProject.FullName --configuration Release 2>&1)
+            $testExitCode = $LASTEXITCODE
+            $testOutput | ForEach-Object { Write-Host ([string]$_) }
+            if ($testExitCode -ne 0) { throw "$($testProject.Name) failed with exit code $testExitCode." }
+            $testText = [string]::Join([Environment]::NewLine, $testOutput)
+            if (-not $testText.Contains($expectedMarker, [StringComparison]::Ordinal)) {
+                throw "$($testProject.Name) exited successfully without its required execution marker. The harness may have built without running."
+            }
+            Write-Host "Verified console test execution marker for $($testProject.Name)."
+            continue
         }
+
+        if (($isTestProjectValues -contains 'true') -or $testSdkReferences.Count -gt 0) {
+            Invoke-Checked "Running test-SDK project $($testProject.Name)..." {
+                & dotnet test $testProject.FullName --configuration Release
+            }
+            continue
+        }
+        throw "Cannot prove how to execute test project $($testProject.FullName). Declare OutputType=Exe for a marker-verified console harness, or configure a recognized test SDK."
     }
     Invoke-Checked 'Running updater release metadata/integrity checks...' {
         & pwsh -NoProfile -File $PipelineTest `
