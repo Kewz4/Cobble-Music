@@ -408,6 +408,7 @@ function Assert-CleanReleaseInputs {
         'updater/CobbleMusicUpdater',
         'updater/CobbleMusicUpdater.Tests',
         'tools/Build-CobbleMusicUpdater.ps1',
+        'tools/New-CobbleMusicPrismBootstrapCommand.ps1',
         'tools/Publish-CobbleMusicUpdater.ps1',
         'bootstrap/Bootstrap-CobbleMusicUpdater.ps1',
         'tests',

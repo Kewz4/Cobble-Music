@@ -277,12 +277,48 @@ update is being applied.
 
 ## First-time player setup
 
-A player who has neither the updater EXE nor the Prism command needs one
-one-time setup action—nothing exists on their PC yet that could check GitHub
-when they press Play. The published bootstrap performs that setup safely:
+A player who has neither the updater EXE nor a pre-launch hook needs only one
+setup action: paste the release-generated command into that instance's
+**Settings → Custom Commands → Pre-launch Command** field and enable
+**Override Global Settings**. They can immediately press Play. The permanent
+command is a single `powershell.exe -EncodedCommand ...` invocation so Prism's
+direct process launcher preserves every argument even when the instance path
+contains spaces or apostrophes.
+
+On the first Play, that command creates `minecraft/cobble-music-updater/`,
+downloads the exact release bootstrap, verifies its pinned SHA-256, installs
+the exact updater EXE, and runs the updater before Minecraft starts. Later
+Plays checksum and reuse both cached files, so there is no redundant bootstrap
+or updater download. If either cached file is missing, stale, or corrupt, only
+that component is downloaded again and is not installed until its checksum
+matches.
+
+The permanent command deliberately leaves `instance.cfg` alone while Prism is
+running. The bootstrap's `-PrismPreLaunch` mode writes only its own
+`minecraft/cobble-music-updater/updater.json`, then waits for the updater to
+finish. This avoids racing Prism's in-memory settings while still making the
+very first Play perform the pack update.
+
+Generate the exact friend-facing command only after the updater release
+bootstrap has its final checksum:
+
+```powershell
+.\tools\New-CobbleMusicPrismBootstrapCommand.ps1 `
+  -UpdaterVersion 1.2.4 `
+  -ExpectedBootstrapSha256 '<SHA-256 of the published Bootstrap-CobbleMusicUpdater.ps1>'
+```
+
+Copy the one output line verbatim. Friends do not run this generator and do
+not need a terminal, script download, instance-path substitution, or any
+second setup step; they paste its output directly into Prism's Pre-launch
+Command field.
+
+The separately published bootstrap also retains a manual installer mode for
+an owner who wants to close Prism and replace the field with the short direct
+EXE command. In manual mode it:
 
 1. verifies the selected Prism instance has `instance.cfg` and `minecraft/`;
-2. downloads the exact `updater-v1.2.3` EXE and checks its SHA-256;
+2. downloads the exact `updater-v1.2.4` EXE and checks its SHA-256;
 3. installs it at `minecraft/cobble-music-updater/CobbleMusicUpdater.exe`;
 4. writes only the updater's own `updater.json` (backing up an existing one);
    and
@@ -293,12 +329,12 @@ The bootstrap refuses to replace a different existing Prism pre-launch command
 unless the player deliberately reruns it with `-Force`. It does not touch
 saves, `options.txt`, `servers.dat`, logs, or resource-pack selections.
 
-After the bootstrap asset has been downloaded from
-[updater-v1.2.3](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.3),
+For that optional manual path, after the bootstrap asset has been downloaded from
+[updater-v1.2.4](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.4),
 the player can paste this into PowerShell, replacing the example instance path:
 
 ```powershell
-$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.3/Bootstrap-CobbleMusicUpdater.ps1'
+$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.4/Bootstrap-CobbleMusicUpdater.ps1'
 $path = Join-Path $env:TEMP 'Bootstrap-CobbleMusicUpdater.ps1'
 $expected = 'DDBF43D6627274AE10CA8D999E7B26F912EEC73563C7ACCC30C819762C168BC2'
 Invoke-WebRequest -Uri $uri -OutFile $path
@@ -307,9 +343,8 @@ Unblock-File -LiteralPath $path
 & $path -InstanceDirectory 'C:\Program Files\Prism Launcher\instances\<your instance name>'
 ```
 
-This intentionally is **not** an `irm | iex` command. The script is downloaded,
-verified by a pinned checksum, and only then run. Once it finishes, future
-updates happen automatically when that player presses Prism's Play button.
+This optional manual form intentionally is **not** an `irm | iex` command. The
+script is downloaded, verified by a pinned checksum, and only then run.
 
 ## Publish a pack update
 
@@ -324,7 +359,7 @@ zeroes (for example, `1.0.5`); four-component variants are rejected.
 The modpack publisher never builds or loads the updater from the current C#
 working tree. Signing and verification use only
 `updater\dist\win-x64\CobbleMusicUpdater.exe`, whose version, ProductVersion,
-and SHA-256 must exactly match the committed `updater-v1.2.3` bootstrap pin.
+and SHA-256 must exactly match the committed `updater-v1.2.4` bootstrap pin.
 The EXE is held read-locked from checksum verification through each signer or
 verifier process. Keep the private signing key outside the Minecraft source,
 every managed source root, and `release-output`; the publisher rejects those
@@ -448,7 +483,7 @@ window.
 
 Before any GitHub mutation, the publisher additionally requires the local
 pinned updater EXE to match the exact `uploaded` size and GitHub SHA-256 digest
-on the currently published, non-prerelease `updater-v1.2.3` release. It checks
+on the currently published, non-prerelease `updater-v1.2.4` release. It checks
 that dependency again immediately before making the modpack draft public. For
 a v2 delta it also re-fetches the stable base release at that final boundary
 and requires both base manifest and signature to match the identity captured

@@ -1,8 +1,9 @@
 <#
-One-time setup for a Prism instance without the Kewz's Cobblemon pre-launch
-updater. This script is intentionally a release asset rather than
-a command that runs on every launch. It verifies the exact updater EXE before
-installing it and refuses to replace another custom Prism pre-launch command.
+Installs the checksum-pinned Kewz's Cobblemon updater into one Prism instance.
+Manual setup rewrites the instance-specific command only while Prism is closed.
+PrismPreLaunch mode is used by the permanent one-command bootstrap hook: it
+never edits instance.cfg, reuses an exact installed updater, and runs the
+updater during the same launch.
 #>
 [CmdletBinding()]
 param(
@@ -10,7 +11,9 @@ param(
     [ValidateNotNullOrEmpty()]
     [string]$InstanceDirectory,
 
-    [switch]$Force
+    [switch]$Force,
+
+    [switch]$PrismPreLaunch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,14 +32,30 @@ $targetDirectory = Join-Path $minecraft 'cobble-music-updater'
 $targetExe = Join-Path $targetDirectory 'CobbleMusicUpdater.exe'
 $configPath = Join-Path $targetDirectory 'updater.json'
 $assetUri = "https://github.com/$Repository/releases/download/updater-v$UpdaterVersion/CobbleMusicUpdater.exe"
-$temporaryDownload = Join-Path ([IO.Path]::GetTempPath()) ("CobbleMusicUpdater-" + [Guid]::NewGuid().ToString('N') + '.download')
-$temporaryExe = $null
+
+function Move-FileAtomically([string]$Source, [string]$Destination) {
+    $replacementBackup = $null
+    try {
+        if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+            $replacementBackup = "$Destination.replaced-$([Guid]::NewGuid().ToString('N'))"
+            [IO.File]::Replace($Source, $Destination, $replacementBackup)
+        }
+        else {
+            [IO.File]::Move($Source, $Destination)
+        }
+    }
+    finally {
+        if ($replacementBackup -and (Test-Path -LiteralPath $replacementBackup)) {
+            Remove-Item -LiteralPath $replacementBackup -Force
+        }
+    }
+}
 
 function Write-Utf8Atomically([string]$Path, [string]$Text) {
     $temporary = "$Path.new-$([Guid]::NewGuid().ToString('N'))"
     try {
         [IO.File]::WriteAllText($temporary, $Text, [Text.UTF8Encoding]::new($false))
-        [IO.File]::Move($temporary, $Path, $true)
+        Move-FileAtomically $temporary $Path
     }
     finally {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
@@ -77,6 +96,23 @@ function Assert-PrismLauncherNotRunning {
     }
 }
 
+function Assert-PrismPreLaunchContext([string]$ExpectedInstance, [string]$ExpectedMinecraft) {
+    $prismInstance = [Environment]::GetEnvironmentVariable('INST_DIR')
+    $prismMinecraft = [Environment]::GetEnvironmentVariable('INST_MC_DIR')
+    if ([string]::IsNullOrWhiteSpace($prismInstance) -or [string]::IsNullOrWhiteSpace($prismMinecraft)) {
+        throw 'PrismPreLaunch mode requires Prism Launcher INST_DIR and INST_MC_DIR environment variables.'
+    }
+
+    $actualInstance = [IO.Path]::GetFullPath($prismInstance).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $actualMinecraft = [IO.Path]::GetFullPath($prismMinecraft).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $expectedInstancePath = $ExpectedInstance.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $expectedMinecraftPath = $ExpectedMinecraft.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if (-not $actualInstance.Equals($expectedInstancePath, [StringComparison]::OrdinalIgnoreCase) `
+        -or -not $actualMinecraft.Equals($expectedMinecraftPath, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'PrismPreLaunch paths do not match the instance selected by Prism Launcher.'
+    }
+}
+
 function Assert-WritableDirectory([string]$Path) {
     $probe = Join-Path $Path ('.cobble-music-write-probe-' + [Guid]::NewGuid().ToString('N'))
     try {
@@ -98,15 +134,66 @@ function Test-WindowsExecutable([string]$Path) {
     }
 }
 
-try {
-    foreach ($path in @($instance, $minecraft)) {
-        if (-not (Test-Path -LiteralPath $path -PathType Container)) {
-            throw "Expected Prism instance path is missing: $path"
+function Install-VerifiedUpdater(
+    [string]$AssetUri,
+    [string]$ExpectedSha256,
+    [string]$Destination
+) {
+    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
+        $installedHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
+        if ($installedHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase) `
+            -and (Test-WindowsExecutable $Destination)) {
+            Write-Host 'Using the already verified Kewz''s Cobblemon updater.'
+            return
         }
     }
-    if (-not (Test-Path -LiteralPath $instanceConfig -PathType Leaf)) {
-        throw "Prism instance configuration is missing: $instanceConfig"
+
+    $download = Join-Path ([IO.Path]::GetTempPath()) ("CobbleMusicUpdater-" + [Guid]::NewGuid().ToString('N') + '.download')
+    $temporaryExe = $null
+    try {
+        Write-Host "Downloading the verified Kewz's Cobblemon updater..."
+        Invoke-WebRequest -UseBasicParsing -Uri $AssetUri -OutFile $download
+        $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
+        if (-not $actualHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Updater checksum mismatch. Expected $ExpectedSha256 but downloaded $actualHash. Nothing was installed."
+        }
+        if (-not (Test-WindowsExecutable $download)) {
+            throw 'The verified updater asset is not a Windows executable. Nothing was installed.'
+        }
+
+        $destinationDirectory = Split-Path -Parent $Destination
+        New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
+        Assert-WritableDirectory $destinationDirectory
+        $temporaryExe = "$Destination.new-$([Guid]::NewGuid().ToString('N'))"
+        [IO.File]::Copy($download, $temporaryExe, $true)
+        $copiedHash = (Get-FileHash -LiteralPath $temporaryExe -Algorithm SHA256).Hash
+        if (-not $copiedHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The updater copy failed checksum verification. Nothing was installed.'
+        }
+        Move-FileAtomically $temporaryExe $Destination
+        $temporaryExe = $null
     }
+    finally {
+        if ($temporaryExe -and (Test-Path -LiteralPath $temporaryExe)) { Remove-Item -LiteralPath $temporaryExe -Force }
+        if (Test-Path -LiteralPath $download) { Remove-Item -LiteralPath $download -Force }
+    }
+}
+
+if ($PrismPreLaunch -and $Force) {
+    throw '-Force is not valid in PrismPreLaunch mode because that mode never edits instance.cfg.'
+}
+foreach ($path in @($instance, $minecraft)) {
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+        throw "Expected Prism instance path is missing: $path"
+    }
+}
+if (-not (Test-Path -LiteralPath $instanceConfig -PathType Leaf)) {
+    throw "Prism instance configuration is missing: $instanceConfig"
+}
+if ($PrismPreLaunch) {
+    Assert-PrismPreLaunchContext $instance $minecraft
+}
+else {
     Assert-PrismLauncherNotRunning
     $instanceText = [IO.File]::ReadAllText($instanceConfig)
     $lineEnding = if ($instanceText.Contains("`r`n")) { "`r`n" } else { "`n" }
@@ -116,63 +203,53 @@ try {
     if ($conflictingPreLaunchValues.Count -gt 0 -and -not $Force) {
         throw "This Prism instance already has a different PreLaunchCommand. The bootstrap will not replace it. Review it and rerun with -Force only if replacement is intentional. Existing command: $($conflictingPreLaunchValues[0])"
     }
+}
 
-    Assert-WritableDirectory $minecraft
+Assert-WritableDirectory $minecraft
+Install-VerifiedUpdater $assetUri $ExpectedUpdaterSha256 $targetExe
 
-    Write-Host "Downloading the verified Kewz's Cobblemon updater..."
-    Invoke-WebRequest -Uri $assetUri -OutFile $temporaryDownload
-    $actualHash = (Get-FileHash -LiteralPath $temporaryDownload -Algorithm SHA256).Hash
-    if (-not $actualHash.Equals($ExpectedUpdaterSha256, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Updater checksum mismatch. Expected $ExpectedUpdaterSha256 but downloaded $actualHash. Nothing was installed."
-    }
-    if (-not (Test-WindowsExecutable $temporaryDownload)) {
-        throw 'The verified updater asset is not a Windows executable. Nothing was installed.'
-    }
-
-    New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
-    Assert-WritableDirectory $targetDirectory
-    $temporaryExe = "$targetExe.new-$([Guid]::NewGuid().ToString('N'))"
-    [IO.File]::Copy($temporaryDownload, $temporaryExe, $true)
-    $copiedHash = (Get-FileHash -LiteralPath $temporaryExe -Algorithm SHA256).Hash
-    if (-not $copiedHash.Equals($ExpectedUpdaterSha256, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'The updater copy failed checksum verification. Nothing was installed.'
-    }
-    [IO.File]::Move($temporaryExe, $targetExe, $true)
-    $temporaryExe = $null
-
-    $configuration = [ordered]@{
-        schemaVersion = 1
-        modpackId = 'cobble-music'
-        repository = $Repository
-        channel = 'stable'
-        manifestAsset = 'cobble-music-update.json'
-        signatureAsset = 'cobble-music-update.sig'
-        networkTimeoutSeconds = 30
-        allowOfflineLaunch = $true
-        allowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
-    }
+$configuration = [ordered]@{
+    schemaVersion = 1
+    modpackId = 'cobble-music'
+    repository = $Repository
+    channel = 'stable'
+    manifestAsset = 'cobble-music-update.json'
+    signatureAsset = 'cobble-music-update.sig'
+    networkTimeoutSeconds = 30
+    allowOfflineLaunch = $true
+    allowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
+}
+$configurationText = $configuration | ConvertTo-Json -Depth 8
+$configurationChanged = -not (Test-Path -LiteralPath $configPath -PathType Leaf) `
+    -or [IO.File]::ReadAllText($configPath) -cne $configurationText
+if ($configurationChanged) {
     if (Test-Path -LiteralPath $configPath -PathType Leaf) {
         $configBackup = "$configPath.cobble-music-updater-$(Get-Date -Format 'yyyyMMdd-HHmmss').bak"
         Copy-Item -LiteralPath $configPath -Destination $configBackup
         Write-Host "Backed up existing updater configuration: $configBackup"
     }
-    Write-Utf8Atomically $configPath ($configuration | ConvertTo-Json -Depth 8)
-
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    $instanceBackup = "$instanceConfig.cobble-music-updater-$stamp.bak"
-    Copy-Item -LiteralPath $instanceConfig -Destination $instanceBackup
-    $lines = Set-InstanceSetting $lines 'OverrideCommands' 'true'
-    $lines = Set-InstanceSetting $lines 'PreLaunchCommand' $preLaunch
-    $lines = Set-InstanceSetting $lines 'LogPrePostOutput' 'true'
-    Assert-PrismLauncherNotRunning
-    Write-Utf8Atomically $instanceConfig ($lines -join $lineEnding)
-
-    Write-Host "Installed verified updater: $targetExe"
-    Write-Host "Configured Prism pre-launch update checks for: $(Split-Path -Leaf $instance)"
-    Write-Host "Prism configuration backup: $instanceBackup"
-    Write-Host "Future Prism Play launches now check for signed Kewz's Cobblemon updates before Minecraft starts."
+    Write-Utf8Atomically $configPath $configurationText
 }
-finally {
-    if ($temporaryExe -and (Test-Path -LiteralPath $temporaryExe)) { Remove-Item -LiteralPath $temporaryExe -Force }
-    if (Test-Path -LiteralPath $temporaryDownload) { Remove-Item -LiteralPath $temporaryDownload -Force }
+
+if ($PrismPreLaunch) {
+    Write-Host "Running the verified Kewz's Cobblemon updater for this launch..."
+    & $targetExe '--instance-dir' $instance '--minecraft-dir' $minecraft '--prism-prelaunch'
+    if ($LASTEXITCODE -ne 0) {
+        throw "The Kewz's Cobblemon updater exited with code $LASTEXITCODE."
+    }
+    return
 }
+
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$instanceBackup = "$instanceConfig.cobble-music-updater-$stamp.bak"
+Copy-Item -LiteralPath $instanceConfig -Destination $instanceBackup
+$lines = Set-InstanceSetting $lines 'OverrideCommands' 'true'
+$lines = Set-InstanceSetting $lines 'PreLaunchCommand' $preLaunch
+$lines = Set-InstanceSetting $lines 'LogPrePostOutput' 'true'
+Assert-PrismLauncherNotRunning
+Write-Utf8Atomically $instanceConfig ($lines -join $lineEnding)
+
+Write-Host "Installed verified updater: $targetExe"
+Write-Host "Configured Prism pre-launch update checks for: $(Split-Path -Leaf $instance)"
+Write-Host "Prism configuration backup: $instanceBackup"
+Write-Host "Future Prism Play launches now check for signed Kewz's Cobblemon updates before Minecraft starts."

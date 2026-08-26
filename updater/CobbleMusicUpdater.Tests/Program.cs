@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Drawing;
+using System.IO.Compression;
 using System.Runtime.ExceptionServices;
 using System.Text.Json;
 using System.Windows.Forms;
@@ -25,6 +26,8 @@ internal static class Program
             TestInstanceIdentityNormalization(Path.Combine(tempRoot, "identity"));
             TestOfflineLaunchPolicy();
             TestResumeStagingPreparation(Path.Combine(tempRoot, "staging"));
+            await TestExtractAndVerifyReleasesDestinationHandleAsync(Path.Combine(tempRoot, "extract-lock"));
+            await TestReusableAssembledArchiveAsync(Path.Combine(tempRoot, "assembled-retry"));
             await TestAdversarialAssetDownloadsAsync(Path.Combine(tempRoot, "downloads"));
             await TestPaginatedReleaseAssetsAsync();
             await TestExactBaselineAdoptionAsync(Path.Combine(tempRoot, "adoption"));
@@ -484,6 +487,96 @@ internal static class Program
         Equal(false, File.Exists(Path.Combine(work, "payload.zip")), "stale archive removed");
         Equal(false, Directory.Exists(Path.Combine(work, "extracted")), "stale extraction removed");
         Equal(false, File.Exists(Path.Combine(work, "unexpected-root")), "unexpected staging entry removed");
+    }
+
+    private static async Task TestExtractAndVerifyReleasesDestinationHandleAsync(string root)
+    {
+        Directory.CreateDirectory(root);
+        string archivePath = Path.Combine(root, "payload.zip");
+        string extractDirectory = Path.Combine(root, "extracted");
+        const string relativePath = "config/nested/music.json";
+        byte[] content = System.Text.Encoding.UTF8.GetBytes("{\"track\":\"Lavender Town\"}");
+        using (ZipArchive archive = ZipFile.Open(archivePath, ZipArchiveMode.Create))
+        {
+            ZipArchiveEntry entry = archive.CreateEntry(relativePath, CompressionLevel.NoCompression);
+            await using Stream entryOutput = entry.Open();
+            await entryOutput.WriteAsync(content, NoCancellation);
+        }
+
+        var expected = new ManifestFile
+        {
+            Path = relativePath,
+            Size = content.LongLength,
+            Sha256 = HashBytes(content)
+        };
+        await UpdateEngine.ExtractAndVerifyAsync(
+            archivePath,
+            extractDirectory,
+            [expected],
+            NoCancellation);
+
+        string extractedPath = PathSafety.CombineUnder(extractDirectory, relativePath);
+        Equal(HashBytes(content), await PathSafety.Sha256Async(extractedPath, NoCancellation), "real ZIP extraction verifies written bytes after closing its destination handle");
+        using var exclusive = new FileStream(extractedPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+        Equal(content.LongLength, exclusive.Length, "real ZIP extraction leaves no destination handle open");
+    }
+
+    private static async Task TestReusableAssembledArchiveAsync(string root)
+    {
+        UpdaterPaths paths = Paths(root);
+        Directory.CreateDirectory(paths.MinecraftDirectory);
+        UpdateManifest manifest = DeltaManifest();
+        string manifestHash = HashText("assembled-retry-manifest");
+        string work = Path.Combine(paths.LocalDataDirectory, "staging", manifestHash);
+        Directory.CreateDirectory(work);
+        string archivePath = Path.Combine(work, "payload.zip");
+        using (ZipArchive archive = ZipFile.Open(archivePath, ZipArchiveMode.Create))
+        {
+            ZipArchiveEntry entry = archive.CreateEntry("mods/example.jar", CompressionLevel.NoCompression);
+            await using Stream entryOutput = entry.Open();
+            await entryOutput.WriteAsync("verified payload"u8.ToArray(), NoCancellation);
+        }
+        byte[] archiveBytes = await File.ReadAllBytesAsync(archivePath, NoCancellation);
+        manifest.Payload = new UpdatePayload
+        {
+            ArchiveName = "cobble-music-payload.zip",
+            Size = archiveBytes.LongLength,
+            Sha256 = HashBytes(archiveBytes),
+            Parts =
+            [
+                new PayloadPart
+                {
+                    Name = "payload.part001",
+                    Size = archiveBytes.LongLength,
+                    Sha256 = HashBytes(archiveBytes)
+                }
+            ]
+        };
+
+        var engine = new UpdateEngine(paths, Configuration(), _ => { });
+        StagingPreparation preparation = engine.PrepareStagingAndEnsureSufficientDiskSpace(
+            manifest,
+            manifestHash,
+            new InstalledState());
+        Equal(archiveBytes.LongLength, preparation.ReusableArchiveBytes, "matching-size assembled archive is retained for signed verification");
+        Equal(true, File.Exists(archivePath), "assembled archive survives retry staging cleanup");
+        Equal(
+            true,
+            await UpdateEngine.TryReuseVerifiedArchiveAsync(archivePath, manifest.Payload, NoCancellation),
+            "exact signed assembled archive is reusable without downloading parts again");
+
+        byte[] corruptBytes = new byte[archiveBytes.Length];
+        await File.WriteAllBytesAsync(archivePath, corruptBytes, NoCancellation);
+        preparation = engine.PrepareStagingAndEnsureSufficientDiskSpace(
+            manifest,
+            manifestHash,
+            new InstalledState());
+        Equal(archiveBytes.LongLength, preparation.ReusableArchiveBytes, "same-size archive remains only as an untrusted verification candidate");
+        Equal(
+            false,
+            await UpdateEngine.TryReuseVerifiedArchiveAsync(archivePath, manifest.Payload, NoCancellation),
+            "wrong-hash assembled archive is rejected");
+        Equal(false, File.Exists(archivePath), "wrong-hash assembled archive is deleted before part download");
     }
 
     private static async Task TestAdversarialAssetDownloadsAsync(string root)

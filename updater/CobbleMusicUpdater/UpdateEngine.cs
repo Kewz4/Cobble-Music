@@ -271,26 +271,48 @@ internal sealed class UpdateEngine
         if (manifest.Payload is not null)
         {
             Directory.CreateDirectory(partsDirectory);
-            using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(_configuration.NetworkTimeoutSeconds));
-            foreach (PayloadPart part in manifest.Payload.Parts)
+            if (File.Exists(archivePath))
             {
-                string partPath = Path.Combine(partsDirectory, part.Name);
-                _log($"Downloading {part.Name}...");
-                Report(UpdatePhase.Downloading, "Downloading update", downloadProgress.CompletedBytes, downloadProgress.TotalBytes, networkBytes: downloadProgress.NetworkBytes);
-                long partNetworkBytes = await DownloadVerifiedPartAsync(
-                    releaseClient,
-                    assetUrls[part.Name],
-                    part,
-                    partPath,
-                    partProgress => Report(downloadProgress.ForPart(partProgress)),
-                    cancellationToken);
-                downloadProgress.CompletePart(part.Size, partNetworkBytes);
+                _log("Checking the previously assembled update payload...");
+                Report(UpdatePhase.Validating, "Checking cached update…");
             }
+            bool reusedArchive = await TryReuseVerifiedArchiveAsync(
+                archivePath,
+                manifest.Payload,
+                cancellationToken);
+            if (reusedArchive)
+            {
+                downloadProgress.ExcludeSkippedPayload(CalculatePayloadDownloadBytes(manifest));
+                _log("Reusing the previously assembled and verified update payload...");
+                // Preparation has already established that this is an
+                // updater-owned, non-reparse directory. Reclaim every cached
+                // part before extraction; failing closed keeps the disk-space
+                // calculation valid instead of silently retaining gigabytes.
+                Directory.Delete(partsDirectory, recursive: true);
+            }
+            else
+            {
+                using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(_configuration.NetworkTimeoutSeconds));
+                foreach (PayloadPart part in manifest.Payload.Parts)
+                {
+                    string partPath = Path.Combine(partsDirectory, part.Name);
+                    _log($"Downloading {part.Name}...");
+                    Report(UpdatePhase.Downloading, "Downloading update", downloadProgress.CompletedBytes, downloadProgress.TotalBytes, networkBytes: downloadProgress.NetworkBytes);
+                    long partNetworkBytes = await DownloadVerifiedPartAsync(
+                        releaseClient,
+                        assetUrls[part.Name],
+                        part,
+                        partPath,
+                        partProgress => Report(downloadProgress.ForPart(partProgress)),
+                        cancellationToken);
+                    downloadProgress.CompletePart(part.Size, partNetworkBytes);
+                }
 
-            _log("Reassembling verified update payload...");
-            Report(UpdatePhase.Reassembling, "Reassembling verified update…");
-            await CombinePartsAndDeleteAsync(manifest.Payload.Parts, partsDirectory, archivePath, cancellationToken);
-            await VerifyFileAsync(archivePath, manifest.Payload.Size, manifest.Payload.Sha256, "update payload", cancellationToken);
+                _log("Reassembling verified update payload...");
+                Report(UpdatePhase.Reassembling, "Reassembling verified update…");
+                await CombinePartsAndDeleteAsync(manifest.Payload.Parts, partsDirectory, archivePath, cancellationToken);
+                await VerifyFileAsync(archivePath, manifest.Payload.Size, manifest.Payload.Sha256, "update payload", cancellationToken);
+            }
 
             _log("Validating update archive...");
             Report(UpdatePhase.Validating, "Validating update files…");
@@ -416,7 +438,7 @@ internal sealed class UpdateEngine
         }
     }
 
-    private static async Task ExtractAndVerifyAsync(
+    internal static async Task ExtractAndVerifyAsync(
         string archivePath,
         string extractDirectory,
         IReadOnlyCollection<ManifestFile> expectedFiles,
@@ -449,10 +471,12 @@ internal sealed class UpdateEngine
 
             string destination = PathSafety.CombineUnder(extractDirectory, relativePath);
             Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
-            await using Stream input = entry.Open();
-            await using var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, useAsync: true);
-            await input.CopyToAsync(output, 1024 * 1024, cancellationToken);
-            await output.FlushAsync(cancellationToken);
+            await using (Stream input = entry.Open())
+            await using (var output = new FileStream(destination, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, useAsync: true))
+            {
+                await input.CopyToAsync(output, 1024 * 1024, cancellationToken);
+                await output.FlushAsync(cancellationToken);
+            }
             await VerifyFileAsync(destination, expectedFile.Size, expectedFile.Sha256, relativePath, cancellationToken);
         }
 
@@ -792,7 +816,7 @@ internal sealed class UpdateEngine
     {
         try
         {
-            long reusablePartBytes = PrepareReusableStaging(manifest, manifestHash);
+            ReusableStaging reusable = PrepareReusableStaging(manifest, manifestHash);
             long extractedBytes = checked(ManifestParser.PayloadContents(manifest).Sum(file => file.Size));
             var backupPaths = ManifestParser.PayloadContents(manifest)
                 .Select(file => file.Path)
@@ -828,7 +852,9 @@ internal sealed class UpdateEngine
                 + extractedBytes
                 + rollbackBytes
                 + DiskReserveBytes);
-            long additionalLocalRequired = Math.Max(0L, totalLocalRequired - reusablePartBytes);
+            long additionalLocalRequired = Math.Max(
+                0L,
+                totalLocalRequired - checked(reusable.PartBytes + reusable.ArchiveBytes));
             AssertAvailableSpace(_paths.LocalDataDirectory, additionalLocalRequired, "update staging and rollback");
 
             string localRoot = Path.GetPathRoot(Path.GetFullPath(_paths.LocalDataDirectory))!;
@@ -839,7 +865,12 @@ internal sealed class UpdateEngine
                 minecraftRequired = checked(extractedBytes + DiskReserveBytes);
                 AssertAvailableSpace(_paths.MinecraftDirectory, minecraftRequired, "Minecraft installation");
             }
-            return new StagingPreparation(reusablePartBytes, totalLocalRequired, additionalLocalRequired, minecraftRequired);
+            return new StagingPreparation(
+                reusable.PartBytes,
+                reusable.ArchiveBytes,
+                totalLocalRequired,
+                additionalLocalRequired,
+                minecraftRequired);
         }
         catch (OverflowException)
         {
@@ -847,7 +878,7 @@ internal sealed class UpdateEngine
         }
     }
 
-    private long PrepareReusableStaging(UpdateManifest manifest, string manifestHash)
+    private ReusableStaging PrepareReusableStaging(UpdateManifest manifest, string manifestHash)
     {
         ManifestParser.ValidateHash(manifestHash, "staging manifest identity");
         Directory.CreateDirectory(_paths.LocalDataDirectory);
@@ -885,11 +916,21 @@ internal sealed class UpdateEngine
         }
 
         string partsDirectory = Path.Combine(workDirectory, "parts");
+        long reusableArchiveBytes = 0L;
         foreach (FileSystemInfo entry in new DirectoryInfo(workDirectory).EnumerateFileSystemInfos())
         {
             if (string.Equals(entry.Name, "parts", StringComparison.OrdinalIgnoreCase)
                 && entry is DirectoryInfo)
             {
+                continue;
+            }
+            if (manifest.Payload is not null
+                && string.Equals(entry.Name, "payload.zip", StringComparison.OrdinalIgnoreCase)
+                && entry is FileInfo archive
+                && archive.Length == manifest.Payload.Size)
+            {
+                AssertNotReparsePoint(archive.FullName);
+                reusableArchiveBytes = archive.Length;
                 continue;
             }
             DeleteUpdaterOwnedEntry(entry);
@@ -917,7 +958,33 @@ internal sealed class UpdateEngine
             AssertNotReparsePoint(file.FullName);
             reusableBytes = checked(reusableBytes + file.Length);
         }
-        return reusableBytes;
+        return new ReusableStaging(reusableBytes, reusableArchiveBytes);
+    }
+
+    internal static async Task<bool> TryReuseVerifiedArchiveAsync(
+        string archivePath,
+        UpdatePayload payload,
+        CancellationToken cancellationToken)
+    {
+        if (!File.Exists(archivePath))
+        {
+            return false;
+        }
+        try
+        {
+            await VerifyFileAsync(
+                archivePath,
+                payload.Size,
+                payload.Sha256,
+                "cached update payload",
+                cancellationToken);
+            return true;
+        }
+        catch (InvalidDataException)
+        {
+            File.Delete(archivePath);
+            return false;
+        }
     }
 
     private static void DeleteUpdaterOwnedEntry(FileSystemInfo entry)
@@ -996,6 +1063,11 @@ internal sealed class UpdateEngine
 
 internal sealed record StagingPreparation(
     long ReusablePartBytes,
+    long ReusableArchiveBytes,
     long TotalLocalRequiredBytes,
     long AdditionalLocalRequiredBytes,
     long MinecraftRequiredBytes);
+
+internal readonly record struct ReusableStaging(
+    long PartBytes,
+    long ArchiveBytes);

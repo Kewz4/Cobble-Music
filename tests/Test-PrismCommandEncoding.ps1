@@ -43,7 +43,7 @@ foreach ($relativePath in @(
         'Copy-Item -LiteralPath $SourceExe -Destination $TargetExe -Force'
     }
     else {
-        'Invoke-WebRequest -Uri $assetUri -OutFile $temporaryDownload'
+        'Install-VerifiedUpdater $assetUri $ExpectedUpdaterSha256 $targetExe'
     }
     $instanceWriteNeedle = if ($relativePath.StartsWith('tools', [StringComparison]::Ordinal)) {
         'Write-Utf8 $InstanceConfig'
@@ -140,4 +140,4 @@ if ($script:probes -ne 1) { throw "Prism guard did not perform exactly one mocke
     }
 }
 
-Write-Host 'Prism command encoding, duplicate-key canonicalization, and running-launcher guard checks passed without touching a live instance or process.'
+Write-Host 'Prism direct-command encoding, duplicate-key canonicalization, and manual running-launcher guard checks passed without touching a live instance or process.'
