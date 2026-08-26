@@ -134,9 +134,9 @@ separate from signed `modpack-v*` payload releases. The updater publisher
 derives the release version from the single `BuildInfo.Version` constant,
 requires the project version to match it, builds self-contained `win-x64`,
 computes the EXE's SHA-256, and tests a proposed bootstrap containing that
-exact version/hash. Its deterministic build excludes Git's changing commit
-suffix from assembly metadata, avoiding a checksum cycle when that bootstrap
-pin is committed; GitHub upload still requires every input to be committed.
+exact version/hash. Its deterministic build excludes Git's changing revision
+and Source Link metadata, avoiding a checksum cycle when that bootstrap pin is
+committed; GitHub upload still requires every input to be committed.
 
 First stage locally. This runs every `tests/Test-*.ps1` plus every updater
 `*.Tests.csproj`, atomically refreshes the tracked bootstrap only after they
@@ -229,7 +229,7 @@ the player can paste this into PowerShell, replacing the example instance path:
 ```powershell
 $uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.0/Bootstrap-CobbleMusicUpdater.ps1'
 $path = Join-Path $env:TEMP 'Bootstrap-CobbleMusicUpdater.ps1'
-$expected = '4F12B9BA8FE1A5193C99D290649943499C4E7A8D99B1D75412985293B0142A62'
+$expected = 'C5FA0140A5F64A68EAC790EBECA2436EF420B44867E4A15B1EBBBDBC37AA5A14'
 Invoke-WebRequest -Uri $uri -OutFile $path
 if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $expected) { throw 'Bootstrap checksum mismatch.' }
 Unblock-File -LiteralPath $path

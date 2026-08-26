@@ -391,7 +391,10 @@ try {
             -p:DebugType=embedded `
             -p:Deterministic=true `
             -p:ContinuousIntegrationBuild=true `
-            -p:IncludeSourceRevisionInInformationalVersion=false
+            -p:IncludeSourceRevisionInInformationalVersion=false `
+            -p:EnableSourceLink=false `
+            -p:EnableSourceControlManagerQueries=false `
+            -p:EmbedUntrackedSources=false
     }
     $builtExe = Join-Path $publishOutput 'CobbleMusicUpdater.exe'
     if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) { throw "Updater build output is missing: $builtExe" }
