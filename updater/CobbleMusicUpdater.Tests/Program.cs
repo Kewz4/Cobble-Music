@@ -1,4 +1,6 @@
 using System.Security.Cryptography;
+using System.Net;
+using System.Net.Http.Headers;
 using CobbleMusicUpdater;
 
 internal static class Program
@@ -13,8 +15,13 @@ internal static class Program
             Directory.CreateDirectory(tempRoot);
             TestManifestSchemaTwoValidation();
             TestSequentialReleaseChain();
+            TestInstanceIdentityNormalization(Path.Combine(tempRoot, "identity"));
+            TestOfflineLaunchPolicy();
+            TestResumeStagingPreparation(Path.Combine(tempRoot, "staging"));
+            await TestAdversarialAssetDownloadsAsync(Path.Combine(tempRoot, "downloads"));
             await TestExactBaselineAdoptionAsync(Path.Combine(tempRoot, "adoption"));
             await TestExactDeltaBaseValidationAsync(Path.Combine(tempRoot, "delta"));
+            await TestDeltaApplyTimeValidationAsync(Path.Combine(tempRoot, "delta-toctou"));
             await TestJournalCommitBoundaryAsync(Path.Combine(tempRoot, "journal"));
             Console.WriteLine("Schema-v2 delta, release-chain, exact-baseline adoption, base-integrity, and journal commit-boundary checks passed.");
             return 0;
@@ -61,6 +68,30 @@ internal static class Program
             deletionOnly,
             configuration,
             new Dictionary<string, Uri> { ["empty.part001"] = new Uri("https://example.invalid/empty.part001") }));
+
+        UpdateManifest leadingZeroRelease = DeltaManifest();
+        leadingZeroRelease.Version = "01.0.5";
+        leadingZeroRelease.ReleaseTag = "modpack-v01.0.5";
+        Throws<InvalidDataException>(() => ManifestParser.Validate(leadingZeroRelease, configuration, AssetUrls()));
+
+        UpdateManifest fourPartRelease = DeltaManifest();
+        fourPartRelease.Version = "1.0.5.0";
+        fourPartRelease.ReleaseTag = "modpack-v1.0.5.0";
+        Throws<InvalidDataException>(() => ManifestParser.Validate(fourPartRelease, configuration, AssetUrls()));
+
+        UpdateManifest leadingZeroBase = DeltaManifest();
+        leadingZeroBase.Base!.Version = "1.00.4";
+        Throws<InvalidDataException>(() => ManifestParser.Validate(leadingZeroBase, configuration, AssetUrls()));
+
+        UpdateManifest leadingZeroMinimum = DeltaManifest();
+        leadingZeroMinimum.MinimumUpdaterVersion = "1.02.0";
+        Throws<InvalidDataException>(() => ManifestParser.Validate(leadingZeroMinimum, configuration, AssetUrls()));
+
+        Equal(true, VersionPolicy.TryParseCanonical("0.0.0", out Version? zeroVersion), "canonical zero version");
+        Equal(new Version(0, 0, 0), zeroVersion, "canonical zero parse result");
+        Equal(false, VersionPolicy.TryParseCanonical("1.2", out _), "two-component version rejected");
+        Equal(false, VersionPolicy.TryParseCanonical("1.2.3.4", out _), "four-component version rejected");
+        Equal(false, VersionPolicy.TryParseCanonical("1.02.3", out _), "leading zero version rejected");
     }
 
     private static void TestSequentialReleaseChain()
@@ -87,6 +118,197 @@ internal static class Program
 
         IReadOnlyList<RemoteRelease> noBaseline = ReleaseClient.BuildSequentialChain([delta105, delta106], new InstalledState());
         Equal(0, noBaseline.Count, "v2-only fresh install must not jump into a delta");
+    }
+
+    private static void TestInstanceIdentityNormalization(string root)
+    {
+        string instance = Path.Combine(root, "MixedCaseInstance");
+        string minecraft = Path.Combine(instance, "minecraft");
+        Directory.CreateDirectory(minecraft);
+        UpdaterPaths canonical = LocalStateStore.ResolvePaths(instance, minecraft);
+        UpdaterPaths caseAndSeparatorVariant = LocalStateStore.ResolvePaths(
+            instance.ToUpperInvariant() + Path.DirectorySeparatorChar,
+            minecraft.ToUpperInvariant() + Path.DirectorySeparatorChar);
+        Equal(canonical.LocalDataDirectory, caseAndSeparatorVariant.LocalDataDirectory, "case-insensitive instance identity");
+        Equal(
+            Path.TrimEndingDirectorySeparator(canonical.InstanceDirectory),
+            canonical.InstanceDirectory,
+            "resolved instance path must not retain a trailing separator");
+    }
+
+    private static void TestOfflineLaunchPolicy()
+    {
+        var configuration = Configuration();
+        configuration.AllowOfflineLaunch = true;
+        Equal(0, CobbleMusicUpdater.Program.NetworkFailureExitCode(configuration, new HttpRequestException("offline")), "allowed offline launch");
+        configuration.AllowOfflineLaunch = false;
+        Equal(1, CobbleMusicUpdater.Program.NetworkFailureExitCode(configuration, new TimeoutException("offline")), "blocked offline launch");
+        Throws<ArgumentException>(() => CobbleMusicUpdater.Program.NetworkFailureExitCode(configuration, new InvalidDataException("not network")));
+    }
+
+    private static void TestResumeStagingPreparation(string root)
+    {
+        UpdaterPaths paths = Paths(root);
+        Directory.CreateDirectory(paths.MinecraftDirectory);
+        UpdateManifest manifest = DeltaManifest();
+        manifest.Payload = new UpdatePayload
+        {
+            ArchiveName = "resume.zip",
+            Size = 19,
+            Sha256 = HashText("resume-payload"),
+            Parts =
+            [
+                new PayloadPart { Name = "keep.part001", Size = 10, Sha256 = HashText("keep") },
+                new PayloadPart { Name = "full.part002", Size = 5, Sha256 = HashText("full") },
+                new PayloadPart { Name = "oversized.part003", Size = 4, Sha256 = HashText("oversized") }
+            ]
+        };
+        string manifestHash = HashText("resume-manifest");
+        string work = Path.Combine(paths.LocalDataDirectory, "staging", manifestHash);
+        string parts = Path.Combine(work, "parts");
+        Directory.CreateDirectory(parts);
+        File.WriteAllText(Path.Combine(parts, "keep.part001"), "abc");
+        File.WriteAllText(Path.Combine(parts, "full.part002"), "12345");
+        File.WriteAllText(Path.Combine(parts, "oversized.part003"), "12345");
+        File.WriteAllText(Path.Combine(parts, "unexpected.part"), "junk");
+        Directory.CreateDirectory(Path.Combine(parts, "unexpected-dir"));
+        File.WriteAllText(Path.Combine(parts, "unexpected-dir", "junk"), "junk");
+        File.WriteAllText(Path.Combine(work, "payload.zip"), "stale archive");
+        Directory.CreateDirectory(Path.Combine(work, "extracted"));
+        File.WriteAllText(Path.Combine(work, "extracted", "stale"), "stale");
+        File.WriteAllText(Path.Combine(work, "unexpected-root"), "stale");
+
+        var engine = new UpdateEngine(paths, Configuration(), _ => { });
+        StagingPreparation preparation = engine.PrepareStagingAndEnsureSufficientDiskSpace(
+            manifest,
+            manifestHash,
+            new InstalledState());
+        Equal(8L, preparation.ReusablePartBytes, "retained partial/full resume bytes");
+        Equal(
+            preparation.TotalLocalRequiredBytes - preparation.ReusablePartBytes,
+            preparation.AdditionalLocalRequiredBytes,
+            "resume bytes must reduce additional disk requirement");
+        Equal(true, File.Exists(Path.Combine(parts, "keep.part001")), "partial expected part retained");
+        Equal(true, File.Exists(Path.Combine(parts, "full.part002")), "full expected part retained");
+        Equal(false, File.Exists(Path.Combine(parts, "oversized.part003")), "oversized expected part removed");
+        Equal(false, File.Exists(Path.Combine(parts, "unexpected.part")), "unexpected part removed");
+        Equal(false, Directory.Exists(Path.Combine(parts, "unexpected-dir")), "unexpected part directory removed");
+        Equal(false, File.Exists(Path.Combine(work, "payload.zip")), "stale archive removed");
+        Equal(false, Directory.Exists(Path.Combine(work, "extracted")), "stale extraction removed");
+        Equal(false, File.Exists(Path.Combine(work, "unexpected-root")), "unexpected staging entry removed");
+    }
+
+    private static async Task TestAdversarialAssetDownloadsAsync(string root)
+    {
+        Directory.CreateDirectory(root);
+        string destination = Path.Combine(root, "asset.part");
+        var overflowHandler = new StubHttpHandler(request =>
+        {
+            Equal("identity", request.Headers.AcceptEncoding.Single().Value, "raw asset Accept-Encoding");
+            var content = new StreamContent(new MemoryStream("abcdef"u8.ToArray()));
+            content.Headers.ContentLength = null;
+            return new HttpResponseMessage(HttpStatusCode.OK) { Content = content };
+        });
+        using (var client = new ReleaseClient(overflowHandler, TimeSpan.FromSeconds(5)))
+        {
+            await ThrowsAsync<InvalidDataException>(() => client.DownloadFileAsync(
+                new Uri("https://example.invalid/asset"), destination, 4, null, NoCancellation));
+        }
+        Equal(false, File.Exists(destination), "oversized chunked response partial must be deleted");
+
+        await File.WriteAllTextAsync(destination, "abc");
+        var badRangeHandler = new StubHttpHandler(request =>
+        {
+            Equal(3L, request.Headers.Range!.Ranges.Single().From!.Value, "resume request offset");
+            var response = new HttpResponseMessage(HttpStatusCode.PartialContent)
+            {
+                Content = new ByteArrayContent("def"u8.ToArray())
+            };
+            response.Content.Headers.ContentRange = new ContentRangeHeaderValue(2, 5, 6);
+            return response;
+        });
+        using (var client = new ReleaseClient(badRangeHandler, TimeSpan.FromSeconds(5)))
+        {
+            await ThrowsAsync<InvalidDataException>(() => client.DownloadFileAsync(
+                new Uri("https://example.invalid/asset"), destination, 6, null, NoCancellation));
+        }
+        Equal(false, File.Exists(destination), "invalid Content-Range partial must be deleted");
+
+        await File.WriteAllTextAsync(destination, "abc");
+        var validRangeHandler = new StubHttpHandler(_ =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.PartialContent)
+            {
+                Content = new ByteArrayContent("def"u8.ToArray())
+            };
+            response.Content.Headers.ContentRange = new ContentRangeHeaderValue(3, 5, 6);
+            return response;
+        });
+        using (var client = new ReleaseClient(validRangeHandler, TimeSpan.FromSeconds(5)))
+        {
+            await client.DownloadFileAsync(new Uri("https://example.invalid/asset"), destination, 6, null, NoCancellation);
+        }
+        Equal("abcdef", await File.ReadAllTextAsync(destination), "valid ranged resume");
+
+        await File.WriteAllTextAsync(destination, "abc");
+        var restartHandler = new StubHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new ByteArrayContent("ABCDEF"u8.ToArray())
+        });
+        using (var client = new ReleaseClient(restartHandler, TimeSpan.FromSeconds(5)))
+        {
+            await client.DownloadFileAsync(new Uri("https://example.invalid/asset"), destination, 6, null, NoCancellation);
+        }
+        Equal("ABCDEF", await File.ReadAllTextAsync(destination), "200 response restarts an ignored resume range");
+
+        File.Delete(destination);
+        var unsolicitedRangeHandler = new StubHttpHandler(_ =>
+        {
+            var response = new HttpResponseMessage(HttpStatusCode.PartialContent)
+            {
+                Content = new ByteArrayContent("abcdef"u8.ToArray())
+            };
+            response.Content.Headers.ContentRange = new ContentRangeHeaderValue(0, 5, 6);
+            return response;
+        });
+        using (var client = new ReleaseClient(unsolicitedRangeHandler, TimeSpan.FromSeconds(5)))
+        {
+            await ThrowsAsync<InvalidDataException>(() => client.DownloadFileAsync(
+                new Uri("https://example.invalid/asset"), destination, 6, null, NoCancellation));
+        }
+        Equal(false, File.Exists(destination), "unsolicited partial response rejected");
+
+        var wrongLengthHandler = new StubHttpHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new ByteArrayContent("short"u8.ToArray())
+        });
+        using (var client = new ReleaseClient(wrongLengthHandler, TimeSpan.FromSeconds(5)))
+        {
+            await ThrowsAsync<InvalidDataException>(() => client.DownloadFileAsync(
+                new Uri("https://example.invalid/asset"), destination, 6, null, NoCancellation));
+        }
+        Equal(false, File.Exists(destination), "wrong full Content-Length rejected");
+
+        UpdateManifest signedManifest = DeltaManifest();
+        PayloadPart signedPart = signedManifest.Payload!.Parts[0];
+        var wrongAssets = new Dictionary<string, GitHubAsset>(StringComparer.OrdinalIgnoreCase)
+        {
+            [signedPart.Name] = new GitHubAsset
+            {
+                Name = signedPart.Name,
+                Size = signedPart.Size + 1,
+                BrowserDownloadUrl = "https://example.invalid/part"
+            }
+        };
+        Throws<InvalidDataException>(() => ReleaseClient.BindSignedPartAssets(signedManifest, wrongAssets));
+        wrongAssets[signedPart.Name].Size = signedPart.Size;
+        Equal(1, ReleaseClient.BindSignedPartAssets(signedManifest, wrongAssets).Count, "exact signed part asset binding");
+        var metadataAsset = new GitHubAsset { Name = "manifest", Size = 0 };
+        Throws<InvalidDataException>(() => ReleaseClient.ValidateBoundedAssetMetadata(metadataAsset, 8, "manifest"));
+        metadataAsset.Size = 9;
+        Throws<InvalidDataException>(() => ReleaseClient.ValidateBoundedAssetMetadata(metadataAsset, 8, "signature"));
+        metadataAsset.Size = 8;
+        ReleaseClient.ValidateBoundedAssetMetadata(metadataAsset, 8, "manifest");
     }
 
     private static async Task TestExactDeltaBaseValidationAsync(string root)
@@ -122,6 +344,94 @@ internal static class Program
         redundant.PayloadFiles.Add(Copy(signedBase.Files.Single(file => file.Path == "mods/unchanged.jar")));
         await ThrowsAsync<InvalidDataException>(() => DeltaValidator.ValidateBaseAsync(
             redundant, signedBase, baseHash, state, paths, Configuration(), NoCancellation));
+    }
+
+    private static async Task TestDeltaApplyTimeValidationAsync(string root)
+    {
+        await TestChangedTargetMutationBeforeApplyAsync(Path.Combine(root, "changed"));
+        await TestUnchangedTargetMutationBeforeCommitAsync(Path.Combine(root, "unchanged"));
+    }
+
+    private static async Task TestChangedTargetMutationBeforeApplyAsync(string root)
+    {
+        (UpdaterPaths paths, UpdateManifest signedBase, UpdateManifest delta, InstalledState state, string extract) =
+            await PrepareDeltaApplyFixtureAsync(root);
+        string changed = PathSafety.CombineUnder(paths.MinecraftDirectory, "mods/changed.jar");
+        await File.WriteAllTextAsync(changed, "OLD-CHANGED"); // exact length, wrong base hash
+        var engine = new UpdateEngine(paths, Configuration(), _ => { });
+        await ThrowsAsync<InvalidDataException>(() => engine.ApplyTransactionAsync(
+            delta,
+            HashText("delta-manifest"),
+            extract,
+            state,
+            signedBase,
+            NoCancellation));
+        Equal("OLD-CHANGED", await File.ReadAllTextAsync(changed), "concurrent changed-target edit preserved");
+        Equal(state.Version, LocalStateStore.LoadState(paths).Version, "pre-mutation mismatch keeps old state");
+        Equal(false, File.Exists(TransactionStore.JournalPath(paths)), "pre-mutation mismatch rolls journal back");
+    }
+
+    private static async Task TestUnchangedTargetMutationBeforeCommitAsync(string root)
+    {
+        (UpdaterPaths paths, UpdateManifest signedBase, UpdateManifest delta, InstalledState state, string extract) =
+            await PrepareDeltaApplyFixtureAsync(root);
+        string unchanged = PathSafety.CombineUnder(paths.MinecraftDirectory, "mods/unchanged.jar");
+        await File.WriteAllTextAsync(unchanged, "UNCHANGED"); // exact length, concurrent edit
+        var engine = new UpdateEngine(paths, Configuration(), _ => { });
+        await ThrowsAsync<InvalidDataException>(() => engine.ApplyTransactionAsync(
+            delta,
+            HashText("delta-manifest"),
+            extract,
+            state,
+            signedBase,
+            NoCancellation));
+        Equal("UNCHANGED", await File.ReadAllTextAsync(unchanged), "concurrent unchanged edit preserved");
+        Equal(
+            "old-changed",
+            await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, "mods/changed.jar")),
+            "changed payload rolled back after final base validation failure");
+        Equal(
+            "delete-me",
+            await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, "mods/deleted.jar")),
+            "deleted base file rolled back after final validation failure");
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, "mods/added.jar")), "new payload rolled back");
+        Equal(state.Version, LocalStateStore.LoadState(paths).Version, "final mismatch keeps old state");
+    }
+
+    private static async Task<(UpdaterPaths Paths, UpdateManifest SignedBase, UpdateManifest Delta, InstalledState State, string Extract)>
+        PrepareDeltaApplyFixtureAsync(string root)
+    {
+        UpdaterPaths paths = Paths(root);
+        Directory.CreateDirectory(paths.MinecraftDirectory);
+        var contents = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["mods/unchanged.jar"] = "unchanged",
+            ["mods/changed.jar"] = "old-changed",
+            ["mods/deleted.jar"] = "delete-me"
+        };
+        foreach ((string relative, string content) in contents)
+        {
+            string target = PathSafety.CombineUnder(paths.MinecraftDirectory, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            await File.WriteAllTextAsync(target, content);
+        }
+        UpdateManifest signedBase = BaselineManifest(contents);
+        string baseHash = HashText("signed-base-manifest");
+        InstalledState state = StateFrom(signedBase, baseHash);
+        await LocalStateStore.SaveStateAsync(paths, state, NoCancellation);
+        UpdateManifest delta = DeltaFromBase(signedBase, baseHash);
+        string extract = Path.Combine(root, "extract");
+        foreach ((string relative, string content) in new Dictionary<string, string>
+        {
+            ["mods/changed.jar"] = "new-changed",
+            ["mods/added.jar"] = "new-file"
+        })
+        {
+            string source = PathSafety.CombineUnder(extract, relative);
+            Directory.CreateDirectory(Path.GetDirectoryName(source)!);
+            await File.WriteAllTextAsync(source, content);
+        }
+        return (paths, signedBase, delta, state, extract);
     }
 
     private static async Task TestExactBaselineAdoptionAsync(string root)
@@ -210,6 +520,28 @@ internal static class Program
         await TransactionStore.RecoverIfNeededAsync(committedPaths, BuildInfo.SupportedRoots, _ => { });
         Equal("new", await File.ReadAllTextAsync(target), "new state is the durable commit point");
         Equal(false, File.Exists(TransactionStore.JournalPath(committedPaths)), "committed journal cleanup");
+
+        UpdaterPaths mismatchedCommitPaths = Paths(Path.Combine(root, "committed-mismatch"));
+        Directory.CreateDirectory(mismatchedCommitPaths.MinecraftDirectory);
+        Directory.CreateDirectory(mismatchedCommitPaths.InstallationDirectory);
+        target = PathSafety.CombineUnder(mismatchedCommitPaths.MinecraftDirectory, "mods/example.jar");
+        backup = Path.Combine(mismatchedCommitPaths.LocalDataDirectory, "rollback", "tx", "files", "mods", "example.jar");
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+        await File.WriteAllTextAsync(target, "BAD"); // same size as next state, wrong hash
+        await File.WriteAllTextAsync(backup, "old");
+        await LocalStateStore.SaveStateAsync(mismatchedCommitPaths, next, NoCancellation);
+        await TransactionStore.SaveAsync(
+            mismatchedCommitPaths,
+            Journal(target, backup, previous, next, "filesApplied"),
+            NoCancellation);
+        await ThrowsAsync<TransactionRecoveryException>(() => TransactionStore.RecoverIfNeededAsync(
+            mismatchedCommitPaths,
+            BuildInfo.SupportedRoots,
+            _ => { }));
+        Equal("BAD", await File.ReadAllTextAsync(target), "forward recovery mismatch must not guess or overwrite target");
+        Equal(true, File.Exists(backup), "forward recovery mismatch must retain rollback backup");
+        Equal(true, File.Exists(TransactionStore.JournalPath(mismatchedCommitPaths)), "forward recovery mismatch must retain journal");
 
         UpdaterPaths plannedPaths = Paths(Path.Combine(root, "planned"));
         Directory.CreateDirectory(plannedPaths.MinecraftDirectory);
@@ -430,5 +762,19 @@ internal static class Program
             return;
         }
         throw new InvalidOperationException($"Expected {typeof(TException).Name}.");
+    }
+
+    private sealed class StubHttpHandler : HttpMessageHandler
+    {
+        private readonly Func<HttpRequestMessage, HttpResponseMessage> _response;
+
+        public StubHttpHandler(Func<HttpRequestMessage, HttpResponseMessage> response)
+        {
+            _response = response;
+        }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken) => Task.FromResult(_response(request));
     }
 }

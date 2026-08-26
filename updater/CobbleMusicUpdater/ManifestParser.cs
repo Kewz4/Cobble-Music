@@ -42,11 +42,11 @@ internal static class ManifestParser
             throw new InvalidDataException("Signed release manifest does not match this updater or has an unsupported schema.");
         }
 
-        if (!Version.TryParse(manifest.Version, out Version? releaseVersion))
+        if (!VersionPolicy.TryParseCanonical(manifest.Version, out Version? releaseVersion))
         {
             throw new InvalidDataException("Signed release manifest has an invalid version.");
         }
-        if (!Version.TryParse(manifest.MinimumUpdaterVersion, out Version? requiredUpdater))
+        if (!VersionPolicy.TryParseCanonical(manifest.MinimumUpdaterVersion, out Version? requiredUpdater))
         {
             throw new InvalidDataException("Signed release manifest has an invalid minimum updater version.");
         }
@@ -72,7 +72,7 @@ internal static class ManifestParser
         }
         else
         {
-            ValidateSchemaTwo(manifest, configuration, files, releaseVersion, assetUrls);
+            ValidateSchemaTwo(manifest, configuration, files, releaseVersion!, assetUrls);
         }
     }
 
@@ -188,7 +188,7 @@ internal static class ManifestParser
         IReadOnlyDictionary<string, Uri> assetUrls)
     {
         if (manifest.Base is null
-            || !Version.TryParse(manifest.Base.Version, out Version? baseVersion)
+            || !VersionPolicy.TryParseCanonical(manifest.Base.Version, out Version? baseVersion)
             || baseVersion >= releaseVersion)
         {
             throw new InvalidDataException("Schema 2 release has an invalid or non-older base version.");

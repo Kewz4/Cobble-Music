@@ -117,12 +117,13 @@ internal sealed class UpdateEngine
                     cancellationToken);
             }
 
-            EnsureSufficientDiskSpace(manifest, state);
+            PrepareStagingAndEnsureSufficientDiskSpace(manifest, release.ManifestSha256, state);
             await DownloadVerifyAndApplyAsync(
                 manifest,
                 release.ManifestSha256,
                 release.AssetUrls,
                 state,
+                manifest.SchemaVersion == 2 ? trustedBase : null,
                 cancellationToken);
             state = LocalStateStore.LoadState(_paths);
             trustedBase = manifest;
@@ -242,7 +243,8 @@ internal sealed class UpdateEngine
 
     private static bool IsDowngradeOrMutation(InstalledState state, UpdateManifest manifest, string manifestHash)
     {
-        if (!Version.TryParse(state.Version, out Version? current) || !Version.TryParse(manifest.Version, out Version? remote))
+        if (!VersionPolicy.TryParseCanonical(state.Version, out Version? current)
+            || !VersionPolicy.TryParseCanonical(manifest.Version, out Version? remote))
         {
             return false;
         }
@@ -254,6 +256,7 @@ internal sealed class UpdateEngine
         string manifestHash,
         IReadOnlyDictionary<string, Uri> assetUrls,
         InstalledState previousState,
+        UpdateManifest? signedBase,
         CancellationToken cancellationToken)
     {
         string workDirectory = Path.Combine(_paths.LocalDataDirectory, "staging", manifestHash);
@@ -309,7 +312,7 @@ internal sealed class UpdateEngine
         _log("Applying verified update...");
         IReadOnlyCollection<ManifestFile> payloadFiles = ManifestParser.PayloadContents(manifest);
         Report(UpdatePhase.Applying, "Installing verified files", 0, 0, 0, payloadFiles.Count);
-        await ApplyTransactionAsync(manifest, manifestHash, extractDirectory, previousState, cancellationToken);
+        await ApplyTransactionAsync(manifest, manifestHash, extractDirectory, previousState, signedBase, cancellationToken);
         TryDeleteDirectory(workDirectory);
     }
 
@@ -420,13 +423,18 @@ internal sealed class UpdateEngine
         }
     }
 
-    private async Task ApplyTransactionAsync(
+    internal async Task ApplyTransactionAsync(
         UpdateManifest manifest,
         string manifestHash,
         string extractDirectory,
         InstalledState previousState,
+        UpdateManifest? signedBase,
         CancellationToken cancellationToken)
     {
+        if (manifest.SchemaVersion == 2 && signedBase is null)
+        {
+            throw new InvalidDataException("Delta transaction is missing its signed base manifest.");
+        }
         string transactionId = DateTimeOffset.UtcNow.ToString("yyyyMMddHHmmss") + "-" + Guid.NewGuid().ToString("N");
         string backupDirectory = Path.Combine(_paths.LocalDataDirectory, "rollback", transactionId, "files");
         var newState = new InstalledState
@@ -451,6 +459,9 @@ internal sealed class UpdateEngine
         try
         {
             IReadOnlyCollection<ManifestFile> payloadFiles = ManifestParser.PayloadContents(manifest);
+            Dictionary<string, ManifestFile>? signedBaseFiles = signedBase?.Files.ToDictionary(
+                file => file.Path,
+                StringComparer.OrdinalIgnoreCase);
             int appliedFiles = 0;
             int totalFiles = payloadFiles.Count + manifest.DeletedFiles.Count;
             foreach (ManifestFile file in payloadFiles)
@@ -462,17 +473,35 @@ internal sealed class UpdateEngine
                 PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
 
+                if (signedBase is not null)
+                {
+                    await ValidateDeltaMutationTargetAsync(file.Path, signedBase, cancellationToken);
+                }
+
                 if (File.Exists(target))
                 {
-                    await BackupForOperationAsync("replace", target, backup, journal, cancellationToken);
+                    ManifestFile? expectedOriginal = null;
+                    signedBaseFiles?.TryGetValue(file.Path, out expectedOriginal);
+                    if (signedBaseFiles is not null && expectedOriginal is null)
+                    {
+                        throw new InvalidDataException($"New delta target appeared immediately before mutation: {file.Path}");
+                    }
+                    await BackupForOperationAsync("replace", target, backup, journal, cancellationToken, expectedOriginal);
                 }
                 else
                 {
+                    if (Directory.Exists(target))
+                    {
+                        throw new InvalidDataException($"Delta file target became a directory immediately before mutation: {file.Path}");
+                    }
                     journal.Operations.Add(new TransactionOperation { Kind = "create", TargetPath = target });
                     await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
                 }
 
-                TransactionStore.MoveOrCopy(source, target);
+                // The target was either moved into the journaled rollback
+                // area or proved absent. Never overwrite a file that appears
+                // in the remaining race window.
+                TransactionStore.MoveOrCopyNew(source, target);
                 await VerifyFileAsync(target, file.Size, file.Sha256, file.Path, cancellationToken);
                 appliedFiles++;
                 Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
@@ -487,20 +516,24 @@ internal sealed class UpdateEngine
                 foreach (ManifestFile deletedFile in manifest.DeletedFiles)
                 {
                     string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, deletedFile.Path);
-                    if (!File.Exists(target)
-                        || new FileInfo(target).Length != deletedFile.Size
-                        || !PathSafety.IsExpectedHash(await PathSafety.Sha256Async(target, cancellationToken), deletedFile.Sha256))
+                    if (signedBase is null)
                     {
-                        throw new InvalidDataException($"Delta deletion target changed after base validation: {deletedFile.Path}");
+                        throw new InvalidDataException("Delta transaction is missing its signed base manifest.");
                     }
+                    await ValidateDeltaMutationTargetAsync(deletedFile.Path, signedBase, cancellationToken);
                     string backup = PathSafety.CombineUnder(backupDirectory, deletedFile.Path);
                     PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
-                    await BackupForOperationAsync("delete", target, backup, journal, cancellationToken);
+                    await BackupForOperationAsync("delete", target, backup, journal, cancellationToken, deletedFile);
                     appliedFiles++;
                     Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
                 }
             }
             await ApplyLegacyCleanupAsync(manifest.LegacyCleanup, backupDirectory, journal, cancellationToken);
+
+            if (signedBase is not null)
+            {
+                await ValidateDeltaPostStateBeforeCommitAsync(manifest, signedBase, cancellationToken);
+            }
 
             journal.Phase = "filesApplied";
             await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
@@ -547,6 +580,82 @@ internal sealed class UpdateEngine
 
     }
 
+    internal async Task ValidateDeltaMutationTargetAsync(
+        string relativePath,
+        UpdateManifest signedBase,
+        CancellationToken cancellationToken)
+    {
+        string normalized = PathSafety.NormalizeRelativePath(relativePath);
+        string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, normalized);
+        PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+        ManifestFile? expectedBase = signedBase.Files.FirstOrDefault(
+            file => string.Equals(file.Path, normalized, StringComparison.OrdinalIgnoreCase));
+        if (expectedBase is null)
+        {
+            if (File.Exists(target) || Directory.Exists(target))
+            {
+                throw new InvalidDataException($"New delta target appeared after base validation: {normalized}");
+            }
+            return;
+        }
+        await ValidateExactTargetAsync(target, expectedBase, "Delta target changed after base validation", cancellationToken);
+    }
+
+    internal async Task ValidateDeltaPostStateBeforeCommitAsync(
+        UpdateManifest delta,
+        UpdateManifest signedBase,
+        CancellationToken cancellationToken)
+    {
+        var postFiles = delta.Files.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
+        foreach (ManifestFile baseFile in signedBase.Files)
+        {
+            if (!postFiles.TryGetValue(baseFile.Path, out ManifestFile? postFile))
+            {
+                string deletedTarget = PathSafety.CombineUnder(_paths.MinecraftDirectory, baseFile.Path);
+                PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, deletedTarget);
+                if (File.Exists(deletedTarget) || Directory.Exists(deletedTarget))
+                {
+                    throw new InvalidDataException($"Deleted delta target reappeared before commit: {baseFile.Path}");
+                }
+                continue;
+            }
+
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, postFile.Path);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            await ValidateExactTargetAsync(
+                target,
+                postFile,
+                ManifestParser.SameFile(baseFile, postFile)
+                    ? "Unchanged base file changed before delta commit"
+                    : "Installed delta file changed before commit",
+                cancellationToken);
+        }
+
+        // New files have no base entry, so validate them separately.
+        var basePaths = signedBase.Files.Select(file => file.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (ManifestFile newFile in delta.Files.Where(file => !basePaths.Contains(file.Path)))
+        {
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, newFile.Path);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            await ValidateExactTargetAsync(target, newFile, "Installed delta file changed before commit", cancellationToken);
+        }
+    }
+
+    private static async Task ValidateExactTargetAsync(
+        string target,
+        ManifestFile expected,
+        string context,
+        CancellationToken cancellationToken)
+    {
+        if (!File.Exists(target)
+            || Directory.Exists(target)
+            || new FileInfo(target).Length != expected.Size
+            || !PathSafety.IsExpectedHash(await PathSafety.Sha256Async(target, cancellationToken), expected.Sha256))
+        {
+            throw new InvalidDataException($"{context}: {expected.Path}");
+        }
+    }
+
     private async Task ApplyLegacyCleanupAsync(
         IReadOnlyCollection<LegacyCleanupFile> legacyCleanup,
         string backupDirectory,
@@ -568,7 +677,13 @@ internal sealed class UpdateEngine
                 continue;
             }
             string backup = PathSafety.CombineUnder(backupDirectory, legacyFile.Path);
-            await BackupForOperationAsync("delete", target, backup, journal, cancellationToken);
+            await BackupForOperationAsync(
+                "delete",
+                target,
+                backup,
+                journal,
+                cancellationToken,
+                new ManifestFile { Path = legacyFile.Path, Size = legacyFile.Size, Sha256 = legacyFile.Sha256 });
             _log($"Removed verified legacy file: {legacyFile.Path}");
         }
     }
@@ -578,27 +693,45 @@ internal sealed class UpdateEngine
         string target,
         string backup,
         TransactionJournal journal,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ManifestFile? expectedOriginal = null)
     {
         var operation = new TransactionOperation
         {
             Kind = kind,
             TargetPath = target,
             BackupPath = backup,
-            OriginalSize = new FileInfo(target).Length,
-            OriginalSha256 = await PathSafety.Sha256Async(target, cancellationToken)
+            OriginalSize = expectedOriginal?.Size ?? new FileInfo(target).Length,
+            OriginalSha256 = expectedOriginal?.Sha256 ?? await PathSafety.Sha256Async(target, cancellationToken)
         };
         journal.Operations.Add(operation);
         await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
+
+        // For signed delta/legacy entries the journal can be persisted from
+        // signed metadata first, allowing this hash to happen immediately
+        // before the target is moved. A concurrent replacement is preserved
+        // and recovery blocks instead of guessing which bytes to delete.
+        if (expectedOriginal is not null)
+        {
+            await ValidateExactTargetAsync(
+                target,
+                expectedOriginal,
+                "Target changed immediately before updater mutation",
+                cancellationToken);
+        }
         Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
-        TransactionStore.MoveOrCopy(target, backup);
+        TransactionStore.MoveOrCopyNew(target, backup);
         await VerifyFileAsync(backup, operation.OriginalSize, operation.OriginalSha256, "rollback backup", cancellationToken);
     }
 
-    private void EnsureSufficientDiskSpace(UpdateManifest manifest, InstalledState previousState)
+    internal StagingPreparation PrepareStagingAndEnsureSufficientDiskSpace(
+        UpdateManifest manifest,
+        string manifestHash,
+        InstalledState previousState)
     {
         try
         {
+            long reusablePartBytes = PrepareReusableStaging(manifest, manifestHash);
             long extractedBytes = checked(ManifestParser.PayloadContents(manifest).Sum(file => file.Size));
             var backupPaths = ManifestParser.PayloadContents(manifest)
                 .Select(file => file.Path)
@@ -628,25 +761,135 @@ internal sealed class UpdateEngine
             long largestPart = manifest.Payload?.Parts.Count > 0
                 ? manifest.Payload.Parts.Max(part => part.Size)
                 : 0L;
-            long localRequired = checked(
+            long totalLocalRequired = checked(
                 (manifest.Payload?.Size ?? 0L)
                 + largestPart
                 + extractedBytes
                 + rollbackBytes
                 + DiskReserveBytes);
-            AssertAvailableSpace(_paths.LocalDataDirectory, localRequired, "update staging and rollback");
+            long additionalLocalRequired = Math.Max(0L, totalLocalRequired - reusablePartBytes);
+            AssertAvailableSpace(_paths.LocalDataDirectory, additionalLocalRequired, "update staging and rollback");
 
             string localRoot = Path.GetPathRoot(Path.GetFullPath(_paths.LocalDataDirectory))!;
             string minecraftRoot = Path.GetPathRoot(Path.GetFullPath(_paths.MinecraftDirectory))!;
+            long minecraftRequired = 0L;
             if (!string.Equals(localRoot, minecraftRoot, StringComparison.OrdinalIgnoreCase))
             {
-                long minecraftRequired = checked(extractedBytes + DiskReserveBytes);
+                minecraftRequired = checked(extractedBytes + DiskReserveBytes);
                 AssertAvailableSpace(_paths.MinecraftDirectory, minecraftRequired, "Minecraft installation");
             }
+            return new StagingPreparation(reusablePartBytes, totalLocalRequired, additionalLocalRequired, minecraftRequired);
         }
         catch (OverflowException)
         {
             throw new InvalidDataException("Signed update sizes overflow the updater's disk-space calculation.");
+        }
+    }
+
+    private long PrepareReusableStaging(UpdateManifest manifest, string manifestHash)
+    {
+        ManifestParser.ValidateHash(manifestHash, "staging manifest identity");
+        Directory.CreateDirectory(_paths.LocalDataDirectory);
+        AssertSafeDirectory(_paths.LocalDataDirectory);
+        string stagingRoot = Path.Combine(_paths.LocalDataDirectory, "staging");
+        if (Directory.Exists(stagingRoot))
+        {
+            AssertSafeDirectory(stagingRoot);
+        }
+        else if (File.Exists(stagingRoot))
+        {
+            AssertNotReparsePoint(stagingRoot);
+            File.Delete(stagingRoot);
+            Directory.CreateDirectory(stagingRoot);
+        }
+        else
+        {
+            Directory.CreateDirectory(stagingRoot);
+        }
+        string workDirectory = PathSafety.CombineUnder(stagingRoot, manifestHash);
+        AssertSafeDirectory(stagingRoot);
+        if (Directory.Exists(workDirectory))
+        {
+            AssertSafeDirectory(workDirectory);
+        }
+        else if (File.Exists(workDirectory))
+        {
+            AssertNotReparsePoint(workDirectory);
+            File.Delete(workDirectory);
+            Directory.CreateDirectory(workDirectory);
+        }
+        else
+        {
+            Directory.CreateDirectory(workDirectory);
+        }
+
+        string partsDirectory = Path.Combine(workDirectory, "parts");
+        foreach (FileSystemInfo entry in new DirectoryInfo(workDirectory).EnumerateFileSystemInfos())
+        {
+            if (string.Equals(entry.Name, "parts", StringComparison.OrdinalIgnoreCase)
+                && entry is DirectoryInfo)
+            {
+                continue;
+            }
+            DeleteUpdaterOwnedEntry(entry);
+        }
+        if (File.Exists(partsDirectory))
+        {
+            AssertNotReparsePoint(partsDirectory);
+            File.Delete(partsDirectory);
+        }
+        Directory.CreateDirectory(partsDirectory);
+        AssertSafeDirectory(partsDirectory);
+
+        Dictionary<string, PayloadPart> expectedParts = (manifest.Payload?.Parts ?? [])
+            .ToDictionary(part => part.Name, StringComparer.OrdinalIgnoreCase);
+        long reusableBytes = 0L;
+        foreach (FileSystemInfo entry in new DirectoryInfo(partsDirectory).EnumerateFileSystemInfos())
+        {
+            if (entry is not FileInfo file
+                || !expectedParts.TryGetValue(entry.Name, out PayloadPart? expected)
+                || file.Length > expected.Size)
+            {
+                DeleteUpdaterOwnedEntry(entry);
+                continue;
+            }
+            AssertNotReparsePoint(file.FullName);
+            reusableBytes = checked(reusableBytes + file.Length);
+        }
+        return reusableBytes;
+    }
+
+    private static void DeleteUpdaterOwnedEntry(FileSystemInfo entry)
+    {
+        AssertNotReparsePoint(entry.FullName);
+        if (entry is DirectoryInfo directory)
+        {
+            foreach (FileSystemInfo child in directory.EnumerateFileSystemInfos())
+            {
+                DeleteUpdaterOwnedEntry(child);
+            }
+            directory.Delete();
+        }
+        else
+        {
+            entry.Delete();
+        }
+    }
+
+    private static void AssertSafeDirectory(string path)
+    {
+        if (!Directory.Exists(path))
+        {
+            throw new DirectoryNotFoundException($"Updater staging directory disappeared: {path}");
+        }
+        AssertNotReparsePoint(path);
+    }
+
+    private static void AssertNotReparsePoint(string path)
+    {
+        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new InvalidDataException($"Refusing to follow a junction or symbolic link in updater staging: {path}");
         }
     }
 
@@ -686,3 +929,9 @@ internal sealed class UpdateEngine
         int totalItems = 0) =>
         _progress?.Report(new UpdateProgress(phase, message, completedBytes, totalBytes, currentItem, totalItems));
 }
+
+internal sealed record StagingPreparation(
+    long ReusablePartBytes,
+    long TotalLocalRequiredBytes,
+    long AdditionalLocalRequiredBytes,
+    long MinecraftRequiredBytes);

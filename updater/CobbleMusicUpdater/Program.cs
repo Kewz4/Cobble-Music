@@ -78,6 +78,15 @@ internal static class Program
                 Report(progress, UpdatePhase.Fallback, "Couldn’t check for updates — starting Minecraft.");
                 return 0;
             }
+            catch (Exception exception) when (IsExpectedNetworkFailure(exception))
+            {
+                // This explicit non-zero return must happen inside the release
+                // check. Letting it escape would reach the generic Prism
+                // fallback below and accidentally defeat AllowOfflineLaunch.
+                Log($"GitHub is unavailable ({exception.GetType().Name}) and offline launch is disabled.");
+                Report(progress, UpdatePhase.Blocked, "Couldn’t verify updates — launch is blocked by updater policy.");
+                return NetworkFailureExitCode(configuration, exception);
+            }
 
             var engine = new UpdateEngine(paths, configuration, Log, progress);
             try
@@ -88,6 +97,12 @@ internal static class Program
             catch (TransactionRecoveryException)
             {
                 throw;
+            }
+            catch (Exception exception) when (!configuration.AllowOfflineLaunch && IsExpectedNetworkFailure(exception))
+            {
+                Log($"Update download failed ({exception.GetType().Name}) and offline launch is disabled.");
+                Report(progress, UpdatePhase.Blocked, "Couldn’t verify the update — launch is blocked by updater policy.");
+                return NetworkFailureExitCode(configuration, exception);
             }
             catch (Exception exception) when (options.PrismPrelaunch)
             {
@@ -124,8 +139,17 @@ internal static class Program
         }
     }
 
-    private static bool IsExpectedNetworkFailure(Exception exception) =>
+    internal static bool IsExpectedNetworkFailure(Exception exception) =>
         exception is HttpRequestException or TaskCanceledException or TimeoutException;
+
+    internal static int NetworkFailureExitCode(UpdaterConfiguration configuration, Exception exception)
+    {
+        if (!IsExpectedNetworkFailure(exception))
+        {
+            throw new ArgumentException("Failure is not an expected network outage.", nameof(exception));
+        }
+        return configuration.AllowOfflineLaunch ? 0 : 1;
+    }
 
     private static void Report(
         IProgress<UpdateProgress>? progress,

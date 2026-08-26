@@ -93,7 +93,9 @@ internal static class TransactionStore
                 if (StateEquivalent(actualState, journal.NextState!))
                 {
                     // state.json is the durable commit point. A crash after its
-                    // atomic replacement completes forward by retaining files.
+                    // atomic replacement may complete forward only if every
+                    // transaction-affected outcome is still exact.
+                    await ValidateCommittedOutcomesAsync(paths, journal, CancellationToken.None);
                     rollback = false;
                 }
                 else if (StateEquivalent(actualState, journal.PreviousState!))
@@ -112,7 +114,7 @@ internal static class TransactionStore
                 log("Recovering an interrupted local update transaction...");
                 foreach (TransactionOperation operation in journal.Operations.AsEnumerable().Reverse())
                 {
-                    Restore(paths, operation, journal.SchemaVersion, log);
+                    Restore(paths, operation, journal, log);
                 }
                 if (journal.SchemaVersion == 2)
                 {
@@ -129,6 +131,51 @@ internal static class TransactionStore
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or CryptographicException or JsonException)
         {
             throw new TransactionRecoveryException("The updater could not safely recover its last transaction. Prism will not launch to avoid a partial modpack.", exception);
+        }
+    }
+
+    private static async Task ValidateCommittedOutcomesAsync(
+        UpdaterPaths paths,
+        TransactionJournal journal,
+        CancellationToken cancellationToken)
+    {
+        var nextFiles = journal.NextState!.ManagedFiles.ToDictionary(
+            file => file.Path,
+            StringComparer.OrdinalIgnoreCase);
+        string rollbackRoot = Path.Combine(paths.LocalDataDirectory, "rollback");
+        foreach (TransactionOperation operation in journal.Operations)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            PathSafety.AssertNoReparsePointsOnTargetPath(paths.MinecraftDirectory, operation.TargetPath);
+            if (!string.IsNullOrWhiteSpace(operation.BackupPath) && Directory.Exists(operation.BackupPath))
+            {
+                throw new TransactionRecoveryException($"Committed rollback backup path became a directory: {operation.BackupPath}");
+            }
+            if (!string.IsNullOrWhiteSpace(operation.BackupPath) && File.Exists(operation.BackupPath))
+            {
+                PathSafety.AssertNoReparsePointsOnTargetPath(rollbackRoot, operation.BackupPath);
+            }
+
+            if (operation.Kind == "delete")
+            {
+                if (File.Exists(operation.TargetPath) || Directory.Exists(operation.TargetPath))
+                {
+                    throw new TransactionRecoveryException($"Committed deletion outcome is no longer absent: {operation.TargetPath}");
+                }
+                continue;
+            }
+
+            if (!PathSafety.TryGetRelativePathUnder(paths.MinecraftDirectory, operation.TargetPath, out string relative)
+                || !nextFiles.TryGetValue(relative, out ManagedFileState? expected)
+                || !File.Exists(operation.TargetPath)
+                || Directory.Exists(operation.TargetPath)
+                || new FileInfo(operation.TargetPath).Length != expected.Size
+                || !PathSafety.IsExpectedHash(
+                    await PathSafety.Sha256Async(operation.TargetPath, cancellationToken),
+                    expected.Sha256))
+            {
+                throw new TransactionRecoveryException($"Committed file outcome does not match next state: {operation.TargetPath}");
+            }
         }
     }
 
@@ -223,7 +270,7 @@ internal static class TransactionStore
             && string.Equals(file.Sha256, expected.Sha256, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static void Restore(UpdaterPaths paths, TransactionOperation operation, int journalSchema, Action<string> log)
+    private static void Restore(UpdaterPaths paths, TransactionOperation operation, TransactionJournal journal, Action<string> log)
     {
         PathSafety.AssertNoReparsePointsOnTargetPath(paths.MinecraftDirectory, operation.TargetPath);
         if ((operation.Kind is "replace" or "delete") && File.Exists(operation.BackupPath))
@@ -233,16 +280,20 @@ internal static class TransactionStore
         switch (operation.Kind)
         {
             case "create":
-                if (File.Exists(operation.TargetPath))
+                if (journal.SchemaVersion == 2)
+                {
+                    RestoreSchemaTwoCreate(paths, operation, journal);
+                }
+                else if (File.Exists(operation.TargetPath))
                 {
                     File.Delete(operation.TargetPath);
                 }
                 break;
             case "replace":
             case "delete":
-                if (journalSchema == 2)
+                if (journal.SchemaVersion == 2)
                 {
-                    RestoreSchemaTwoBackup(operation);
+                    RestoreSchemaTwoBackup(paths, operation, journal);
                 }
                 else
                 {
@@ -264,9 +315,34 @@ internal static class TransactionStore
         log($"Recovered {Path.GetFileName(operation.TargetPath)}.");
     }
 
-    private static void RestoreSchemaTwoBackup(TransactionOperation operation)
+    private static void RestoreSchemaTwoCreate(
+        UpdaterPaths paths,
+        TransactionOperation operation,
+        TransactionJournal journal)
+    {
+        if (!File.Exists(operation.TargetPath) && !Directory.Exists(operation.TargetPath))
+        {
+            return;
+        }
+        if (!TryGetNextFile(paths, operation, journal, out ManagedFileState? next)
+            || !File.Exists(operation.TargetPath)
+            || !MatchesExpected(operation.TargetPath, next!))
+        {
+            throw new TransactionRecoveryException($"Created target has an unknown concurrent outcome: {operation.TargetPath}");
+        }
+        File.Delete(operation.TargetPath);
+    }
+
+    private static void RestoreSchemaTwoBackup(
+        UpdaterPaths paths,
+        TransactionOperation operation,
+        TransactionJournal journal)
     {
         bool targetExists = File.Exists(operation.TargetPath);
+        if (!targetExists && Directory.Exists(operation.TargetPath))
+        {
+            throw new TransactionRecoveryException($"Rollback target became a directory: {operation.TargetPath}");
+        }
         bool backupExists = File.Exists(operation.BackupPath);
         if (targetExists && MatchesOriginal(operation.TargetPath, operation))
         {
@@ -278,6 +354,16 @@ internal static class TransactionStore
             }
             return;
         }
+        if (targetExists)
+        {
+            bool isUpdaterReplacement = operation.Kind == "replace"
+                && TryGetNextFile(paths, operation, journal, out ManagedFileState? next)
+                && MatchesExpected(operation.TargetPath, next!);
+            if (!isUpdaterReplacement)
+            {
+                throw new TransactionRecoveryException($"Rollback target has an unknown concurrent outcome: {operation.TargetPath}");
+            }
+        }
         if (!backupExists || !MatchesOriginal(operation.BackupPath, operation))
         {
             throw new TransactionRecoveryException($"A complete rollback backup is missing for {operation.TargetPath}.");
@@ -288,6 +374,33 @@ internal static class TransactionStore
         }
         Directory.CreateDirectory(Path.GetDirectoryName(operation.TargetPath)!);
         MoveOrCopy(operation.BackupPath, operation.TargetPath);
+    }
+
+    private static bool TryGetNextFile(
+        UpdaterPaths paths,
+        TransactionOperation operation,
+        TransactionJournal journal,
+        out ManagedFileState? expected)
+    {
+        expected = null;
+        if (!PathSafety.TryGetRelativePathUnder(paths.MinecraftDirectory, operation.TargetPath, out string relative))
+        {
+            return false;
+        }
+        expected = journal.NextState!.ManagedFiles.FirstOrDefault(
+            file => string.Equals(file.Path, relative, StringComparison.OrdinalIgnoreCase));
+        return expected is not null;
+    }
+
+    private static bool MatchesExpected(string path, ManagedFileState expected)
+    {
+        if (new FileInfo(path).Length != expected.Size)
+        {
+            return false;
+        }
+        using FileStream input = new(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        string hash = Convert.ToHexString(SHA256.HashData(input)).ToLowerInvariant();
+        return string.Equals(hash, expected.Sha256, StringComparison.OrdinalIgnoreCase);
     }
 
     private static bool MatchesOriginal(string path, TransactionOperation operation)
@@ -337,6 +450,17 @@ internal static class TransactionStore
             File.Copy(source, destination, overwrite: true);
             File.Delete(source);
         }
+    }
+
+    public static void MoveOrCopyNew(string source, string destination)
+    {
+        if (string.Equals(Path.GetPathRoot(source), Path.GetPathRoot(destination), StringComparison.OrdinalIgnoreCase))
+        {
+            File.Move(source, destination);
+            return;
+        }
+        File.Copy(source, destination, overwrite: false);
+        File.Delete(source);
     }
 
     private static async Task DurableWriteAsync(string path, byte[] content, CancellationToken cancellationToken)

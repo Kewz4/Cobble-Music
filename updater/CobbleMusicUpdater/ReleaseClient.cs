@@ -21,20 +21,30 @@ internal sealed class ReleaseClient : IDisposable
     };
 
     public ReleaseClient(TimeSpan timeout)
+        : this(CreateDefaultHandler(), timeout)
     {
-        var handler = new HttpClientHandler
-        {
-            AutomaticDecompression = DecompressionMethods.All,
-            AllowAutoRedirect = true
-        };
+    }
+
+    internal ReleaseClient(HttpMessageHandler handler, TimeSpan timeout)
+    {
         _http = new HttpClient(handler)
         {
             Timeout = timeout
         };
         _http.DefaultRequestHeaders.UserAgent.Add(ProductInfoHeaderValue.Parse(BuildInfo.UserAgent));
         _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
+        _http.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("identity"));
         _http.DefaultRequestHeaders.Add("X-GitHub-Api-Version", "2022-11-28");
     }
+
+    private static HttpMessageHandler CreateDefaultHandler() => new HttpClientHandler
+    {
+        // Release assets are signed and hashed as raw bytes. Transparent
+        // decompression would make Content-Length/Range describe different
+        // bytes than the updater writes and verifies.
+        AutomaticDecompression = DecompressionMethods.None,
+        AllowAutoRedirect = true
+    };
 
     public async Task<IReadOnlyList<RemoteRelease>> GetUpdateChainAsync(
         UpdaterConfiguration configuration,
@@ -79,7 +89,7 @@ internal sealed class ReleaseClient : IDisposable
             throw new InvalidDataException("Published modpack releases contain duplicate semantic versions.");
         }
 
-        bool hasInstalledVersion = Version.TryParse(installedState.Version, out Version? installedVersion);
+        bool hasInstalledVersion = VersionPolicy.TryParseCanonical(installedState.Version, out Version? installedVersion);
         var candidates = new List<List<RemoteRelease>>();
 
         // An installed delta base is usable only when its exact signed manifest
@@ -172,59 +182,117 @@ internal sealed class ReleaseClient : IDisposable
             return;
         }
 
-        using var request = new HttpRequestMessage(HttpMethod.Get, source);
-        if (existingSize > 0)
-        {
-            request.Headers.Range = new RangeHeaderValue(existingSize, null);
-        }
-        using HttpResponseMessage response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        bool append = existingSize > 0 && response.StatusCode == HttpStatusCode.PartialContent;
-        if (!append)
-        {
-            existingSize = 0L;
-        }
-
-        reportDownloadedBytes?.Invoke(existingSize);
-
-        await using Stream input = await response.Content.ReadAsStreamAsync(cancellationToken);
-        await using var output = new FileStream(
-            destination,
-            append ? FileMode.Append : FileMode.Create,
-            FileAccess.Write,
-            FileShare.None,
-            1024 * 1024,
-            useAsync: true);
-        byte[] buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
         try
         {
-            long downloaded = existingSize;
-            var reportTimer = Stopwatch.StartNew();
-            int read;
-            while ((read = await input.ReadAsync(buffer.AsMemory(), cancellationToken)) > 0)
+            using var request = new HttpRequestMessage(HttpMethod.Get, source);
+            if (existingSize > 0)
             {
-                await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
-                downloaded = checked(downloaded + read);
-                if (reportTimer.ElapsedMilliseconds >= 250)
-                {
-                    reportDownloadedBytes?.Invoke(downloaded);
-                    reportTimer.Restart();
-                }
+                request.Headers.Range = new RangeHeaderValue(existingSize, null);
             }
-            reportDownloadedBytes?.Invoke(downloaded);
-        }
-        finally
-        {
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
-        await output.FlushAsync(cancellationToken);
+            using HttpResponseMessage response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            response.EnsureSuccessStatusCode();
 
-        long finalSize = new FileInfo(destination).Length;
-        if (finalSize != expectedSize)
-        {
-            throw new InvalidDataException($"Downloaded size mismatch for {Path.GetFileName(destination)}. Expected {expectedSize:N0}, got {finalSize:N0} bytes.");
+            bool append = ValidateDownloadResponse(response, existingSize, expectedSize);
+            if (!append)
+            {
+                existingSize = 0L;
+            }
+            reportDownloadedBytes?.Invoke(existingSize);
+
+            await using Stream input = await response.Content.ReadAsStreamAsync(cancellationToken);
+            await using var output = new FileStream(
+                destination,
+                append ? FileMode.Append : FileMode.Create,
+                FileAccess.Write,
+                FileShare.None,
+                1024 * 1024,
+                useAsync: true);
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
+            try
+            {
+                long downloaded = existingSize;
+                var reportTimer = Stopwatch.StartNew();
+                int read;
+                while ((read = await input.ReadAsync(buffer.AsMemory(), cancellationToken)) > 0)
+                {
+                    if (downloaded > expectedSize - read)
+                    {
+                        throw new AssetProtocolException("Asset stream exceeded its signed size.");
+                    }
+                    await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                    downloaded += read;
+                    if (reportTimer.ElapsedMilliseconds >= 250)
+                    {
+                        reportDownloadedBytes?.Invoke(downloaded);
+                        reportTimer.Restart();
+                    }
+                }
+                reportDownloadedBytes?.Invoke(downloaded);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+            await output.FlushAsync(cancellationToken);
+
+            long finalSize = new FileInfo(destination).Length;
+            if (finalSize != expectedSize)
+            {
+                throw new InvalidDataException($"Downloaded size mismatch for {Path.GetFileName(destination)}. Expected {expectedSize:N0}, got {finalSize:N0} bytes.");
+            }
         }
+        catch (AssetProtocolException exception)
+        {
+            TryDeletePartial(destination);
+            throw new InvalidDataException($"Rejected invalid asset response for {Path.GetFileName(destination)}: {exception.Message}", exception);
+        }
+    }
+
+    private static bool ValidateDownloadResponse(HttpResponseMessage response, long existingSize, long expectedSize)
+    {
+        if (response.StatusCode == HttpStatusCode.PartialContent)
+        {
+            if (existingSize == 0)
+            {
+                throw new AssetProtocolException("Server sent an unsolicited partial response.");
+            }
+            ContentRangeHeaderValue? range = response.Content.Headers.ContentRange;
+            long expectedRemaining = expectedSize - existingSize;
+            if (range is null
+                || !string.Equals(range.Unit, "bytes", StringComparison.OrdinalIgnoreCase)
+                || range.From != existingSize
+                || range.To != expectedSize - 1
+                || range.Length != expectedSize
+                || (response.Content.Headers.ContentLength is long partialLength && partialLength != expectedRemaining))
+            {
+                throw new AssetProtocolException("Resume Content-Range does not match the signed asset size and local offset.");
+            }
+            return true;
+        }
+        if (response.StatusCode != HttpStatusCode.OK)
+        {
+            throw new AssetProtocolException($"Unexpected successful HTTP status {(int)response.StatusCode}.");
+        }
+        if (response.Content.Headers.ContentLength is long fullLength && fullLength != expectedSize)
+        {
+            throw new AssetProtocolException("Full-response Content-Length does not match the signed asset size.");
+        }
+        // A server may ignore Range and return 200; FileMode.Create safely
+        // truncates the old partial and restarts from byte zero.
+        return false;
+    }
+
+    private static void TryDeletePartial(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
     }
 
     public void Dispose() => _http.Dispose();
@@ -253,7 +321,7 @@ internal sealed class ReleaseClient : IDisposable
             result.AddRange(pageReleases.Where(candidate => !candidate.Draft
                 && !candidate.Prerelease
                 && candidate.TagName.StartsWith("modpack-v", StringComparison.OrdinalIgnoreCase)
-                && Version.TryParse(candidate.TagName["modpack-v".Length..], out _)
+                && VersionPolicy.TryParseCanonical(candidate.TagName["modpack-v".Length..], out _)
                 && candidate.Assets.Any(asset => string.Equals(asset.Name, configuration.ManifestAsset, StringComparison.Ordinal))
                 && candidate.Assets.Any(asset => string.Equals(asset.Name, configuration.SignatureAsset, StringComparison.Ordinal))));
             if (pageReleases.Count < 100)
@@ -284,10 +352,20 @@ internal sealed class ReleaseClient : IDisposable
             throw new InvalidDataException($"GitHub release {release.TagName} is missing signed manifest assets.");
         }
 
-        byte[] manifestBytes = await DownloadBytesAsync(ValidatedAssetUri(manifestAsset), MaxManifestBytes, cancellationToken);
-        byte[] signatureBytes = await DownloadBytesAsync(ValidatedAssetUri(signatureAsset), MaxSignatureBytes, cancellationToken);
-        var urls = assets.ToDictionary(pair => pair.Key, pair => ValidatedAssetUri(pair.Value), StringComparer.OrdinalIgnoreCase);
+        ValidateBoundedAssetMetadata(manifestAsset, MaxManifestBytes, "manifest");
+        ValidateBoundedAssetMetadata(signatureAsset, MaxSignatureBytes, "signature");
+        byte[] manifestBytes = await DownloadBytesAsync(
+            ValidatedAssetUri(manifestAsset),
+            MaxManifestBytes,
+            manifestAsset.Size,
+            cancellationToken);
+        byte[] signatureBytes = await DownloadBytesAsync(
+            ValidatedAssetUri(signatureAsset),
+            MaxSignatureBytes,
+            signatureAsset.Size,
+            cancellationToken);
         UpdateManifest manifest = ManifestParser.VerifyAndParse(manifestBytes, signatureBytes);
+        IReadOnlyDictionary<string, Uri> urls = BindSignedPartAssets(manifest, assets);
         ManifestParser.Validate(manifest, configuration, urls);
         if (!string.Equals(manifest.ReleaseTag, release.TagName, StringComparison.Ordinal))
         {
@@ -295,6 +373,35 @@ internal sealed class ReleaseClient : IDisposable
         }
         string manifestHash = Convert.ToHexString(SHA256.HashData(manifestBytes)).ToLowerInvariant();
         return new RemoteRelease(release, manifestBytes, signatureBytes, urls, manifest, manifestHash);
+    }
+
+    internal static IReadOnlyDictionary<string, Uri> BindSignedPartAssets(
+        UpdateManifest manifest,
+        IReadOnlyDictionary<string, GitHubAsset> assets)
+    {
+        var urls = new Dictionary<string, Uri>(StringComparer.OrdinalIgnoreCase);
+        foreach (PayloadPart part in manifest.Payload?.Parts ?? [])
+        {
+            if (part is null)
+            {
+                throw new InvalidDataException("Signed payload contains an empty part entry.");
+            }
+            if (!assets.TryGetValue(part.Name, out GitHubAsset? asset)
+                || asset.Size != part.Size)
+            {
+                throw new InvalidDataException($"GitHub asset metadata does not match signed payload part {part.Name}.");
+            }
+            urls.Add(part.Name, ValidatedAssetUri(asset));
+        }
+        return urls;
+    }
+
+    internal static void ValidateBoundedAssetMetadata(GitHubAsset asset, int maximumBytes, string kind)
+    {
+        if (asset.Size <= 0 || asset.Size > maximumBytes)
+        {
+            throw new InvalidDataException($"GitHub {kind} asset has an invalid declared size.");
+        }
     }
 
     private static Uri ValidatedAssetUri(GitHubAsset asset)
@@ -308,11 +415,20 @@ internal sealed class ReleaseClient : IDisposable
         return uri;
     }
 
-    private async Task<byte[]> DownloadBytesAsync(Uri source, int maximumBytes, CancellationToken cancellationToken)
+    private async Task<byte[]> DownloadBytesAsync(
+        Uri source,
+        int maximumBytes,
+        long expectedBytes,
+        CancellationToken cancellationToken)
     {
         using HttpResponseMessage response = await _http.GetAsync(source, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         response.EnsureSuccessStatusCode();
-        return await ReadBoundedBytesAsync(response.Content, maximumBytes, cancellationToken);
+        byte[] bytes = await ReadBoundedBytesAsync(response.Content, maximumBytes, cancellationToken);
+        if (bytes.LongLength != expectedBytes)
+        {
+            throw new InvalidDataException($"GitHub asset size differs from its release metadata. Expected {expectedBytes:N0}, got {bytes.LongLength:N0} bytes.");
+        }
+        return bytes;
     }
 
     private static async Task<byte[]> ReadBoundedBytesAsync(HttpContent content, int maximumBytes, CancellationToken cancellationToken)
@@ -335,5 +451,10 @@ internal sealed class ReleaseClient : IDisposable
             output.Write(buffer, 0, read);
         }
         return output.ToArray();
+    }
+
+    private sealed class AssetProtocolException : IOException
+    {
+        public AssetProtocolException(string message) : base(message) { }
     }
 }
