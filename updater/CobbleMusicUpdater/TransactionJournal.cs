@@ -126,7 +126,7 @@ internal static class TransactionStore
         {
             throw;
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or CryptographicException)
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or InvalidDataException or CryptographicException or JsonException)
         {
             throw new TransactionRecoveryException("The updater could not safely recover its last transaction. Prism will not launch to avoid a partial modpack.", exception);
         }

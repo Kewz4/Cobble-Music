@@ -222,6 +222,22 @@ internal static class Program
         await TransactionStore.SaveAsync(plannedPaths, Journal(target, backup, previous, next, "applying"), NoCancellation);
         await TransactionStore.RecoverIfNeededAsync(plannedPaths, BuildInfo.SupportedRoots, _ => { });
         Equal("old", await File.ReadAllTextAsync(target), "planned operation without backup must retain original");
+
+        UpdaterPaths corruptStatePaths = Paths(Path.Combine(root, "corrupt-state"));
+        Directory.CreateDirectory(corruptStatePaths.MinecraftDirectory);
+        Directory.CreateDirectory(corruptStatePaths.InstallationDirectory);
+        target = PathSafety.CombineUnder(corruptStatePaths.MinecraftDirectory, "mods/example.jar");
+        backup = Path.Combine(corruptStatePaths.LocalDataDirectory, "rollback", "tx", "files", "mods", "example.jar");
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+        await File.WriteAllTextAsync(target, "new");
+        await File.WriteAllTextAsync(backup, "old");
+        await TransactionStore.SaveAsync(corruptStatePaths, Journal(target, backup, previous, next, "filesApplied"), NoCancellation);
+        await File.WriteAllTextAsync(corruptStatePaths.StatePath, "{not valid json");
+        await ThrowsAsync<TransactionRecoveryException>(() =>
+            TransactionStore.RecoverIfNeededAsync(corruptStatePaths, BuildInfo.SupportedRoots, _ => { }));
+        Equal(true, File.Exists(TransactionStore.JournalPath(corruptStatePaths)), "corrupt state must retain journal and block launch");
+        Equal("new", await File.ReadAllTextAsync(target), "corrupt state must not guess rollback or commit");
     }
 
     private static TransactionJournal Journal(
