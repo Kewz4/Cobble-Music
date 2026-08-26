@@ -317,13 +317,10 @@ function Assert-CobbleDeltaManifest {
     return $true
 }
 
-function Assert-CobbleRemoteAssetInventory {
+function New-CobbleExpectedAssetIndex {
     param(
         [AllowEmptyCollection()]
-        [Parameter(Mandatory)][object[]]$ExpectedAssets,
-        [AllowEmptyCollection()]
-        [Parameter(Mandatory)][object[]]$RemoteAssets,
-        [switch]$RequireComplete
+        [Parameter(Mandatory)][object[]]$ExpectedAssets
     )
 
     $expected = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -337,6 +334,62 @@ function Assert-CobbleRemoteAssetInventory {
         if ($size -lt 0 -or $sha256 -cnotmatch $script:Sha256Pattern) { throw "Expected release asset metadata is invalid: $name" }
         $expected.Add($name, [pscustomobject]@{ name = $name; size = $size; sha256 = $sha256 })
     }
+    return [pscustomobject]@{ ByName = $expected }
+}
+
+function Get-CobbleRepairableStarterAssets {
+    param(
+        [AllowEmptyCollection()]
+        [Parameter(Mandatory)][object[]]$ExpectedAssets,
+        [AllowEmptyCollection()]
+        [Parameter(Mandatory)][object[]]$RemoteAssets
+    )
+
+    $expected = (New-CobbleExpectedAssetIndex $ExpectedAssets).ByName
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $repairable = [Collections.Generic.List[object]]::new()
+    foreach ($remote in $RemoteAssets) {
+        $name = [string]$remote.name
+        if (-not $seen.Add($name)) { throw "GitHub draft contains duplicate asset names: $name" }
+        if (-not $expected.ContainsKey($name)) { throw "GitHub draft contains an unexpected asset: $name" }
+
+        $wanted = $expected[$name]
+        if ($name -cne $wanted.name) { throw "GitHub asset name casing does not exactly match signed staging: $name" }
+        $state = [string]$remote.state
+        if ($state -ceq 'uploaded') {
+            $digest = [string]$remote.digest
+            if ([int64]$remote.size -ne $wanted.size -or $digest -cne "sha256:$($wanted.sha256)") {
+                throw "GitHub uploaded asset size/digest does not match local signed staging: $name"
+            }
+            continue
+        }
+        if ($state -cne 'starter') { throw "GitHub asset has an unsupported state and cannot be repaired automatically: $name ($state)" }
+
+        [int64]$assetId = 0
+        $idProperty = $remote.PSObject.Properties['id']
+        $idValue = if ($null -eq $idProperty) { $null } else { $idProperty.Value }
+        if ($null -eq $idValue -or -not [int64]::TryParse(
+            [Convert]::ToString($idValue, [Globalization.CultureInfo]::InvariantCulture),
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$assetId) -or $assetId -le 0) {
+            throw "GitHub starter asset has no safe API identifier: $name"
+        }
+        $repairable.Add([pscustomobject]@{ id = $assetId; name = $name })
+    }
+    return @($repairable)
+}
+
+function Assert-CobbleRemoteAssetInventory {
+    param(
+        [AllowEmptyCollection()]
+        [Parameter(Mandatory)][object[]]$ExpectedAssets,
+        [AllowEmptyCollection()]
+        [Parameter(Mandatory)][object[]]$RemoteAssets,
+        [switch]$RequireComplete
+    )
+
+    $expected = (New-CobbleExpectedAssetIndex $ExpectedAssets).ByName
 
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($remote in $RemoteAssets) {
@@ -367,5 +420,6 @@ Export-ModuleMember -Function @(
     'Assert-CobbleV1Manifest',
     'New-CobbleDeltaPlan',
     'Assert-CobbleDeltaManifest',
+    'Get-CobbleRepairableStarterAssets',
     'Assert-CobbleRemoteAssetInventory'
 )

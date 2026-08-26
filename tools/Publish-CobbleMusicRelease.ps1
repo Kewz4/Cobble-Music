@@ -35,6 +35,7 @@ param(
     [int]$ChunkSizeMiB = 256,
     [switch]$Publish,
     [switch]$ResumePublish,
+    [switch]$RepairStaleUploads,
     [switch]$ConfirmDistributionRights
 )
 
@@ -333,6 +334,22 @@ function Publish-StagedRelease([object]$Manifest, [string]$ManifestPath, [string
         return
     }
 
+    if ($RepairStaleUploads) {
+        # The explicit switch means the operator has confirmed that no gh
+        # uploader is still active. The pure validator inspects the complete
+        # draft first: any unexpected, uploaded-mismatched, duplicate, or
+        # unknown-state asset prevents every deletion.
+        $staleAssets = @(Get-CobbleRepairableStarterAssets -ExpectedAssets $expected -RemoteAssets $assets)
+        if ($staleAssets.Count -gt 0) {
+            Write-Host "Removing $($staleAssets.Count) explicitly approved stale starter asset(s) from draft $tag."
+            foreach ($stale in $staleAssets) {
+                Invoke-NativeText -Command 'gh' -Arguments @('api', '--method', 'DELETE', "repos/$Repository/releases/assets/$($stale.id)") | Out-Null
+                Write-Host "Removed stale starter asset: $($stale.name)"
+            }
+            $assets = @(Get-GitHubReleaseAssets ([int64]$release.id))
+        }
+    }
+
     $missing = @(Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets $assets)
     if ($missing.Count -gt 0) {
         $expectedByName = @{}
@@ -397,6 +414,7 @@ if ($ChunkSizeMiB -lt 1 -or $ChunkSizeMiB -gt 1536) {
     throw 'ChunkSizeMiB must be between 1 and 1536, safely under the GitHub Releases 2 GiB per-asset limit.'
 }
 if ($Publish -and $ResumePublish) { throw 'Use either -Publish for a fresh staging build or -ResumePublish for existing signed staging, not both.' }
+if ($RepairStaleUploads -and -not $ResumePublish) { throw '-RepairStaleUploads is allowed only with -ResumePublish for an existing persistent draft.' }
 if (($Publish -or $ResumePublish) -and -not $ConfirmDistributionRights) {
     throw 'Publishing is blocked until you explicitly pass -ConfirmDistributionRights. Confirm that every payload file may be distributed through this public GitHub Release.'
 }

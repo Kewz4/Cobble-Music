@@ -184,11 +184,22 @@ Assert-Throws { Assert-CobbleRemoteAssetInventory -ExpectedAssets $expectedAsset
 
 $starter = @($remoteAssets | ForEach-Object { $_.PSObject.Copy() })
 $starter[2].state = 'starter'
+$starter[2] | Add-Member -NotePropertyName id -NotePropertyValue 12345
 Assert-Throws { Assert-CobbleRemoteAssetInventory -ExpectedAssets $expectedAssets -RemoteAssets $starter | Out-Null } 'Unfinalized GitHub starter asset was accepted.'
+$repairable = @(Get-CobbleRepairableStarterAssets -ExpectedAssets $expectedAssets -RemoteAssets $starter)
+Assert-True ($repairable.Count -eq 1 -and $repairable[0].id -eq 12345 -and $repairable[0].name -ceq 'cobble-music-payload.part001') 'Explicit repair did not select only the expected-name starter asset.'
+
+$starterWithoutId = @($remoteAssets | ForEach-Object { $_.PSObject.Copy() })
+$starterWithoutId[2].state = 'starter'
+Assert-Throws { Get-CobbleRepairableStarterAssets -ExpectedAssets $expectedAssets -RemoteAssets $starterWithoutId | Out-Null } 'Starter asset without a safe API id was repairable.'
 
 $wrongDigest = @($remoteAssets | ForEach-Object { $_.PSObject.Copy() })
 $wrongDigest[2].digest = "sha256:$(New-Hash 'd')"
 Assert-Throws { Assert-CobbleRemoteAssetInventory -ExpectedAssets $expectedAssets -RemoteAssets $wrongDigest | Out-Null } 'Wrong GitHub asset digest was accepted.'
+
+$starterWithMismatch = @($starter | ForEach-Object { $_.PSObject.Copy() })
+$starterWithMismatch[0].digest = "sha256:$(New-Hash 'd')"
+Assert-Throws { Get-CobbleRepairableStarterAssets -ExpectedAssets $expectedAssets -RemoteAssets $starterWithMismatch | Out-Null } 'Starter repair proceeded beside an uploaded mismatched asset.'
 
 $unexpected = @($remoteAssets) + @([pscustomobject]@{ name = 'extra.bin'; size = 0; digest = "sha256:$(New-Hash '0')"; state = 'uploaded' })
 Assert-Throws { Assert-CobbleRemoteAssetInventory -ExpectedAssets $expectedAssets -RemoteAssets $unexpected | Out-Null } 'Unexpected draft asset was accepted.'
@@ -199,5 +210,8 @@ $ast = [Management.Automation.Language.Parser]::ParseFile($Publisher, [ref]$toke
 Assert-True ($parseErrors.Count -eq 0) 'Publisher script has PowerShell parse errors.'
 $chunkParameter = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'ChunkSizeMiB' }
 Assert-True ($null -ne $chunkParameter -and $chunkParameter.DefaultValue.Extent.Text -eq '256') 'Future release chunk default is not 256 MiB.'
+
+$modeGateOutput = @(& pwsh -NoProfile -File $Publisher -Version 98.0.0 -FullBaseline -RepairStaleUploads 2>&1)
+Assert-True ($LASTEXITCODE -ne 0 -and ($modeGateOutput -join "`n") -like '*allowed only with -ResumePublish*') '-RepairStaleUploads did not fail closed outside resume mode.'
 
 Write-Host 'Delta publisher validation, deletion-only, collision, version, and remote-inventory checks passed.'

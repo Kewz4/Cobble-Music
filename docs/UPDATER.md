@@ -296,6 +296,22 @@ mismatched assets stop the run; the release becomes public only after the
 remote inventory matches exactly. `-Publish -ConfirmDistributionRights` may
 instead stage and start that same draft workflow in one run.
 
+If an interrupted GitHub CLI process has definitely stopped but left an asset
+in GitHub's incomplete `starter` state, recovery requires an additional,
+explicit switch:
+
+```powershell
+.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.5 `
+  -ResumePublish -RepairStaleUploads -ConfirmDistributionRights
+```
+
+Before deleting anything, that mode validates the complete draft. It deletes
+only exact expected-name assets whose API state is still `starter`, then
+uploads those now-missing parts normally. It never deletes an `uploaded`
+asset; any uploaded size/digest mismatch, unexpected or case-colliding name,
+duplicate, unknown state, or missing asset ID blocks the entire repair. Never
+use the switch while another `gh` upload process is active.
+
 Only publish after confirming permission to redistribute **every** third-party
 mod, music track, sound asset, and configuration in the payload. The tool
 publishes only the signed manifest, detached signature, and chunks; it never
