@@ -23,6 +23,7 @@ $payload = @'
 $ErrorActionPreference='Stop'
 $i=[Environment]::GetEnvironmentVariable('INST_DIR')
 $m=[Environment]::GetEnvironmentVariable('INST_MC_DIR')
+$downloadTimeoutSeconds=30
 if([string]::IsNullOrWhiteSpace($i)-or[string]::IsNullOrWhiteSpace($m)){throw 'Prism did not provide INST_DIR and INST_MC_DIR.'}
 $i=[IO.Path]::GetFullPath($i)
 $m=[IO.Path]::GetFullPath($m)
@@ -35,11 +36,11 @@ New-Item -ItemType Directory -Path $d -Force|Out-Null
 $ok=(Test-Path -LiteralPath $b -PathType Leaf)-and((Get-FileHash -LiteralPath $b -Algorithm SHA256).Hash -ceq $h)
 if(-not $ok){
  $t="$b.download-$([Guid]::NewGuid().ToString('N'))"
- try{
-  [Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol-bor[Net.SecurityProtocolType]::Tls12
-  Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $t
-  $a=(Get-FileHash -LiteralPath $t -Algorithm SHA256).Hash
-  if($a -cne $h){throw "Bootstrap checksum mismatch. Expected $h but downloaded $a."}
+try{
+ [Net.ServicePointManager]::SecurityProtocol=[Net.ServicePointManager]::SecurityProtocol-bor[Net.SecurityProtocolType]::Tls12
+ Invoke-WebRequest -UseBasicParsing -Uri $u -OutFile $t -TimeoutSec $downloadTimeoutSeconds
+ $a=(Get-FileHash -LiteralPath $t -Algorithm SHA256).Hash
+ if($a -cne $h){throw "Bootstrap checksum mismatch. Expected $h but downloaded $a."}
   if(Test-Path -LiteralPath $b -PathType Leaf){$q="$b.replaced-$([Guid]::NewGuid().ToString('N'))";try{[IO.File]::Replace($t,$b,$q);Remove-Item -LiteralPath $q -Force;$q=$null}finally{if($q-and(Test-Path -LiteralPath $q)){Remove-Item -LiteralPath $q -Force}}}else{[IO.File]::Move($t,$b)}
   $t=$null
  }finally{if($t-and(Test-Path -LiteralPath $t)){Remove-Item -LiteralPath $t -Force}}

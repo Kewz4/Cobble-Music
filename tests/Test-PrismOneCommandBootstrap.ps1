@@ -125,16 +125,15 @@ param([string]$InstanceDirectory, [switch]$PrismPreLaunch)
     [IO.File]::WriteAllBytes($fakeUpdater, [byte[]](0x4d, 0x5a, 0x01, 0x02, 0x03, 0x04))
     $fakeUpdaterHash = Get-Sha256 $fakeUpdater
     $bootstrap = Set-SingleQuotedAssignment $bootstrap 'ExpectedUpdaterSha256' $fakeUpdaterHash
-    $downloadNeedle = '        Invoke-WebRequest -UseBasicParsing -Uri $AssetUri -OutFile $download'
+    $downloadNeedle = '        Invoke-WebRequest -UseBasicParsing -Uri $AssetUri -OutFile $download -TimeoutSec $DownloadTimeoutSeconds'
     $downloadReplacement = "        throw 'NETWORK_CALLED_DURING_EXACT_UPDATER_REUSE'"
     Assert-True ([regex]::Matches($bootstrap, [regex]::Escape($downloadNeedle)).Count -eq 1) 'Bootstrap download call fixture was not unique.'
     $bootstrap = $bootstrap.Replace($downloadNeedle, $downloadReplacement)
-    $invokeNeedle = "    & `$targetExe '--instance-dir' `$instance '--minecraft-dir' `$minecraft '--prism-prelaunch'"
+    $invokeNeedle = "    `$updaterProcess = Start-Process -FilePath `$targetExe -ArgumentList `$updaterArguments -PassThru -Wait"
     $invokeReplacement = @'
     [IO.File]::WriteAllLines(
         [Environment]::GetEnvironmentVariable('COBBLE_MUSIC_TEST_BOOTSTRAP_LOG'),
         [string[]]@($instance, $minecraft, '--prism-prelaunch'))
-    $LASTEXITCODE = 0
 '@
     Assert-True ([regex]::Matches($bootstrap, [regex]::Escape($invokeNeedle)).Count -eq 1) 'Bootstrap updater invocation fixture was not unique.'
     $bootstrap = $bootstrap.Replace($invokeNeedle, $invokeReplacement.TrimEnd("`r", "`n"))

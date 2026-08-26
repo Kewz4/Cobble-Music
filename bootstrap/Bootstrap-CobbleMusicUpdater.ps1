@@ -21,6 +21,8 @@ $Repository = 'Kewz4/Cobble-Music'
 $UpdaterVersion = '1.2.4'
 # SHA-256 of CobbleMusicUpdater.exe from updater-v1.2.4.
 $ExpectedUpdaterSha256 = '874D592A9880CB755779E7EF04B9D0E45F8D08A0DDE8C00CC486B322AAC9F64F'
+# Keep first-time bootstrap and updater install quick and non-hanging on bad networks.
+$DownloadTimeoutSeconds = 30
 # Prism's QSettings INI parser requires escaped quotes in the physical
 # instance.cfg value. Without the backslashes it will later rewrite the command
 # and concatenate quoted arguments (notably paths under Program Files).
@@ -152,7 +154,7 @@ function Install-VerifiedUpdater(
     $temporaryExe = $null
     try {
         Write-Host "Downloading the verified Kewz's Cobblemon updater..."
-        Invoke-WebRequest -UseBasicParsing -Uri $AssetUri -OutFile $download
+        Invoke-WebRequest -UseBasicParsing -Uri $AssetUri -OutFile $download -TimeoutSec $DownloadTimeoutSeconds
         $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
         if (-not $actualHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
             throw "Updater checksum mismatch. Expected $ExpectedSha256 but downloaded $actualHash. Nothing was installed."
@@ -205,40 +207,56 @@ else {
     }
 }
 
-Assert-WritableDirectory $minecraft
-Install-VerifiedUpdater $assetUri $ExpectedUpdaterSha256 $targetExe
-
-$configuration = [ordered]@{
-    schemaVersion = 1
-    modpackId = 'cobble-music'
-    repository = $Repository
-    channel = 'stable'
-    manifestAsset = 'cobble-music-update.json'
-    signatureAsset = 'cobble-music-update.sig'
-    networkTimeoutSeconds = 30
-    allowOfflineLaunch = $true
-    allowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
-}
-$configurationText = $configuration | ConvertTo-Json -Depth 8
-$configurationChanged = -not (Test-Path -LiteralPath $configPath -PathType Leaf) `
-    -or [IO.File]::ReadAllText($configPath) -cne $configurationText
-if ($configurationChanged) {
-    if (Test-Path -LiteralPath $configPath -PathType Leaf) {
-        $configBackup = "$configPath.cobble-music-updater-$(Get-Date -Format 'yyyyMMdd-HHmmss').bak"
-        Copy-Item -LiteralPath $configPath -Destination $configBackup
-        Write-Host "Backed up existing updater configuration: $configBackup"
+function Ensure-UpdaterConfiguration {
+    $configuration = [ordered]@{
+        schemaVersion = 1
+        modpackId = 'cobble-music'
+        repository = $Repository
+        channel = 'stable'
+        manifestAsset = 'cobble-music-update.json'
+        signatureAsset = 'cobble-music-update.sig'
+        networkTimeoutSeconds = 30
+        allowOfflineLaunch = $true
+        allowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
     }
-    Write-Utf8Atomically $configPath $configurationText
+    $configurationText = $configuration | ConvertTo-Json -Depth 8
+    $configurationChanged = -not (Test-Path -LiteralPath $configPath -PathType Leaf) `
+        -or [IO.File]::ReadAllText($configPath) -cne $configurationText
+    if ($configurationChanged) {
+        if (Test-Path -LiteralPath $configPath -PathType Leaf) {
+            $configBackup = "$configPath.cobble-music-updater-$(Get-Date -Format 'yyyyMMdd-HHmmss').bak"
+            Copy-Item -LiteralPath $configPath -Destination $configBackup
+            Write-Host "Backed up existing updater configuration: $configBackup"
+        }
+        Write-Utf8Atomically $configPath $configurationText
+    }
 }
 
 if ($PrismPreLaunch) {
     Write-Host "Running the verified Kewz's Cobblemon updater for this launch..."
-    & $targetExe '--instance-dir' $instance '--minecraft-dir' $minecraft '--prism-prelaunch'
-    if ($LASTEXITCODE -ne 0) {
-        throw "The Kewz's Cobblemon updater exited with code $LASTEXITCODE."
+    try {
+        Assert-WritableDirectory $minecraft
+        Install-VerifiedUpdater $assetUri $ExpectedUpdaterSha256 $targetExe
+        Ensure-UpdaterConfiguration
+        $quotedInstance = $instance.Replace('"', '""')
+        $quotedMinecraft = $minecraft.Replace('"', '""')
+        $updaterArguments = '--instance-dir "{0}" --minecraft-dir "{1}" --prism-prelaunch' -f $quotedInstance, $quotedMinecraft
+        $updaterProcess = Start-Process -FilePath $targetExe -ArgumentList $updaterArguments -PassThru -Wait
+        if ($updaterProcess.ExitCode -ne 0) {
+            Write-Host "The Kewz's Cobblemon updater returned code $($updaterProcess.ExitCode)."
+            Write-Host "Continuing launch and letting Minecraft start with current pack contents."
+        }
+    }
+    catch {
+        Write-Host "Skipping updater launch and continuing launch: $($_.Exception.Message)"
+        return
     }
     return
 }
+
+Assert-WritableDirectory $minecraft
+Install-VerifiedUpdater $assetUri $ExpectedUpdaterSha256 $targetExe
+Ensure-UpdaterConfiguration
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $instanceBackup = "$instanceConfig.cobble-music-updater-$stamp.bak"
