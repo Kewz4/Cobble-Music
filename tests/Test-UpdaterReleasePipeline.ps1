@@ -31,6 +31,15 @@ function Get-SingleQuotedAssignment([string]$Text, [string]$Name) {
     return $matches[0].Groups['value'].Value
 }
 
+function Assert-CanonicalVersion([string]$Version, [string]$Context) {
+    if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        throw "$Context must be a canonical three-part numeric version with no leading zeroes: $Version"
+    }
+    try { $parsed = [Version]::new($Version) }
+    catch { throw "$Context is outside the supported numeric version range: $Version" }
+    if ($parsed.ToString(3) -cne $Version) { throw "$Context is not canonical: $Version" }
+}
+
 foreach ($path in @($BuildInfoPath, $ProjectPath, $UpdaterExePath, $BootstrapPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Updater release test input is missing: $path" }
 }
@@ -42,7 +51,9 @@ $versionMatches = [regex]::Matches(
 if ($versionMatches.Count -ne 1) { throw "Expected one BuildInfo.Version, found $($versionMatches.Count)." }
 $sourceVersion = $versionMatches[0].Groups['version'].Value
 if ([string]::IsNullOrWhiteSpace($ExpectedVersion)) { $ExpectedVersion = $sourceVersion }
-if ($ExpectedVersion -notmatch '^\d+\.\d+\.\d+$' -or $sourceVersion -cne $ExpectedVersion) {
+Assert-CanonicalVersion $sourceVersion 'BuildInfo.Version'
+Assert-CanonicalVersion $ExpectedVersion 'ExpectedVersion'
+if ($sourceVersion -cne $ExpectedVersion) {
     throw "Updater source version mismatch. BuildInfo=$sourceVersion expected=$ExpectedVersion"
 }
 

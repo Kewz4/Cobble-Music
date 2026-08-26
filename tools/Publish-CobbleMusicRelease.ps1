@@ -46,8 +46,9 @@ $Root = Split-Path -Parent $PSScriptRoot
 $OutputRoot = Join-Path $Root "release-output\$Version"
 $ReleaseOutputRoot = Join-Path $Root 'release-output'
 $CoreModule = Join-Path $PSScriptRoot 'CobbleMusicRelease.Core.psm1'
-$UpdaterProject = Join-Path $Root 'updater\CobbleMusicUpdater\CobbleMusicUpdater.csproj'
-$UpdaterDll = Join-Path $Root 'updater\CobbleMusicUpdater\bin\Release\net10.0-windows\win-x64\CobbleMusicUpdater.dll'
+$UpdaterBootstrap = Join-Path $Root 'bootstrap\Bootstrap-CobbleMusicUpdater.ps1'
+$PinnedUpdaterExe = Join-Path $Root 'updater\dist\win-x64\CobbleMusicUpdater.exe'
+$RequiredPinnedUpdaterVersion = '1.2.0'
 $AllowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 
 Import-Module $CoreModule -Force
@@ -102,16 +103,118 @@ function Invoke-GhJson {
     catch { throw "GitHub CLI returned invalid JSON for: gh $($Arguments -join ' ')" }
 }
 
-function Build-UpdaterSigningTool {
-    & dotnet restore $UpdaterProject --locked-mode | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "Updater restore failed with exit code $LASTEXITCODE" }
-    & dotnet build $UpdaterProject --configuration Release --no-restore | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "Updater build failed with exit code $LASTEXITCODE" }
+function Get-SingleQuotedBootstrapAssignment([string]$Text, [string]$Name) {
+    $pattern = '(?m)^\s*\${0}\s*=\s*''(?<value>[^''\r\n]+)''\s*$' -f [regex]::Escape($Name)
+    $matches = [regex]::Matches($Text, $pattern)
+    if ($matches.Count -ne 1) { throw "Bootstrap must contain exactly one canonical `$${Name} assignment." }
+    return $matches[0].Groups['value'].Value
+}
+
+function Get-PinnedUpdaterPin {
+    if (-not (Test-Path -LiteralPath $UpdaterBootstrap -PathType Leaf)) { throw "Pinned updater bootstrap was not found: $UpdaterBootstrap" }
+    $text = [IO.File]::ReadAllText($UpdaterBootstrap)
+    $version = Get-SingleQuotedBootstrapAssignment $text 'UpdaterVersion'
+    $sha256 = Get-SingleQuotedBootstrapAssignment $text 'ExpectedUpdaterSha256'
+    if ($version -cne $RequiredPinnedUpdaterVersion -or
+        $version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        throw "Bootstrap must pin the supported distributed updater version $RequiredPinnedUpdaterVersion."
+    }
+    if ($sha256 -cnotmatch '^[0-9A-F]{64}$') { throw 'Bootstrap updater SHA-256 must be canonical uppercase hexadecimal.' }
+    return [pscustomobject]@{ Version = $version; Sha256 = $sha256.ToLowerInvariant() }
+}
+
+function Assert-PinnedUpdaterStream([IO.FileStream]$Stream) {
+    $pin = Get-PinnedUpdaterPin
+    $Stream.Position = 0
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $actualHash = [Convert]::ToHexString($hasher.ComputeHash($Stream)).ToLowerInvariant() }
+    finally { $hasher.Dispose() }
+    if ($actualHash -cne $pin.Sha256) {
+        throw "Pinned updater artifact does not match bootstrap SHA-256: $PinnedUpdaterExe"
+    }
+    $productVersion = (Get-Item -LiteralPath $PinnedUpdaterExe).VersionInfo.ProductVersion
+    if ([string]$productVersion -cne $pin.Version) {
+        throw "Pinned updater artifact ProductVersion does not match bootstrap version: $productVersion / $($pin.Version)"
+    }
+    return [pscustomobject]@{
+        version = $pin.Version
+        name = 'CobbleMusicUpdater.exe'
+        path = $PinnedUpdaterExe
+        size = [int64]$Stream.Length
+        sha256 = $actualHash
+    }
+}
+
+function Get-PinnedUpdaterIdentity {
+    if (-not (Test-Path -LiteralPath $PinnedUpdaterExe -PathType Leaf)) {
+        throw "Checksum-pinned distributed updater artifact was not found: $PinnedUpdaterExe"
+    }
+    $stream = [IO.File]::Open($PinnedUpdaterExe, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try { return Assert-PinnedUpdaterStream $stream }
+    finally { $stream.Dispose() }
+}
+
+function Invoke-PinnedUpdater([string[]]$Arguments) {
+    if (-not (Test-Path -LiteralPath $PinnedUpdaterExe -PathType Leaf)) {
+        throw "Checksum-pinned distributed updater artifact was not found: $PinnedUpdaterExe"
+    }
+    # The read-only, read-shared handle stays open through process exit, so the
+    # artifact cannot be replaced or modified after its checksum is verified.
+    $stream = [IO.File]::Open($PinnedUpdaterExe, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        Assert-PinnedUpdaterStream $stream | Out-Null
+        & $PinnedUpdaterExe @Arguments | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "Pinned updater failed with exit code $LASTEXITCODE." }
+    }
+    finally { $stream.Dispose() }
 }
 
 function Test-SignedManifest([string]$ManifestPath, [string]$SignaturePath) {
-    & dotnet $UpdaterDll --verify-manifest $ManifestPath --signature-file $SignaturePath | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "Manifest signature verification failed: $ManifestPath" }
+    try { Invoke-PinnedUpdater -Arguments @('--verify-manifest', $ManifestPath, '--signature-file', $SignaturePath) }
+    catch { throw "Manifest signature verification failed: $ManifestPath`n$($_.Exception.Message)" }
+}
+
+function Open-ManifestSignatureIdentity([string]$ManifestPath, [string]$SignaturePath) {
+    $manifestSnapshot = $null
+    $signatureSnapshot = $null
+    try {
+        $manifestSnapshot = Open-CobbleLockedFileSnapshot -Path $ManifestPath
+        $signatureSnapshot = Open-CobbleLockedFileSnapshot -Path $SignaturePath
+        return [pscustomobject]@{
+            Manifest = $manifestSnapshot
+            Signature = $signatureSnapshot
+            Assets = @(
+                [pscustomobject]@{ name = 'cobble-music-update.json'; path = $manifestSnapshot.path; size = $manifestSnapshot.size; sha256 = $manifestSnapshot.sha256 },
+                [pscustomobject]@{ name = 'cobble-music-update.sig'; path = $signatureSnapshot.path; size = $signatureSnapshot.size; sha256 = $signatureSnapshot.sha256 }
+            )
+        }
+    }
+    catch {
+        Close-CobbleLockedFileSnapshot $signatureSnapshot
+        Close-CobbleLockedFileSnapshot $manifestSnapshot
+        throw
+    }
+}
+
+function Close-ManifestSignatureIdentity([AllowNull()]$Identity) {
+    if ($null -eq $Identity) { return }
+    Close-CobbleLockedFileSnapshot $Identity.Signature
+    Close-CobbleLockedFileSnapshot $Identity.Manifest
+}
+
+function Assert-ManifestSignatureIdentity([object]$Identity) {
+    Assert-CobbleLockedFileSnapshot $Identity.Manifest | Out-Null
+    Assert-CobbleLockedFileSnapshot $Identity.Signature | Out-Null
+    Test-SignedManifest $Identity.Manifest.path $Identity.Signature.path
+    return $true
+}
+
+function Read-JsonSnapshot([object]$Snapshot, [string]$Description) {
+    try {
+        $encoding = [Text.UTF8Encoding]::new($false, $true)
+        return $encoding.GetString([byte[]]$Snapshot.bytes) | ConvertFrom-Json
+    }
+    catch { throw "$Description locked bytes are not valid UTF-8 JSON: $($Snapshot.path)" }
 }
 
 function Read-JsonFile([string]$Path, [string]$Description) {
@@ -218,27 +321,65 @@ function New-PayloadParts([object[]]$PayloadFiles) {
 
 function Get-GitHubReleaseByTag([string]$Tag) {
     $matches = [Collections.Generic.List[object]]::new()
-    for ($page = 1; $page -le 10; $page++) {
+    for ($page = 1; ; $page++) {
         $result = @(Invoke-GhJson -Arguments @('api', "repos/$Repository/releases?per_page=100&page=$page"))
         foreach ($release in $result) {
             if ([string]$release.tag_name -ceq $Tag) { $matches.Add($release) }
         }
-        if ($result.Count -lt 100) { break }
+        if (-not (Test-CobblePaginationHasNextPage -Page $page -ResultCount $result.Count -MaximumPages 10 -Context 'GitHub release index')) { break }
     }
     if ($matches.Count -gt 1) { throw "GitHub contains multiple releases for reserved tag $Tag." }
     if ($matches.Count -eq 0) { return $null }
     return $matches[0]
 }
 
+function Get-GitHubReleaseById([int64]$ReleaseId) {
+    return Invoke-GhJson -Arguments @('api', "repos/$Repository/releases/$ReleaseId")
+}
+
 function Get-GitHubReleaseAssets([int64]$ReleaseId) {
     $assets = [Collections.Generic.List[object]]::new()
     for ($page = 1; ; $page++) {
-        if ($page -gt 100) { throw "GitHub release $ReleaseId has more than 10,000 assets; refusing a truncated identity check." }
         $result = @(Invoke-GhJson -Arguments @('api', "repos/$Repository/releases/$ReleaseId/assets?per_page=100&page=$page"))
         foreach ($asset in $result) { $assets.Add($asset) }
-        if ($result.Count -lt 100) { break }
+        if (-not (Test-CobblePaginationHasNextPage -Page $page -ResultCount $result.Count -MaximumPages 100 -Context "GitHub assets for release $ReleaseId")) { break }
     }
     return @($assets)
+}
+
+function Get-ExactReleaseSnapshotById([int64]$ReleaseId, [string]$Tag, [ValidateSet('draft', 'public')][string]$State) {
+    $release = Get-GitHubReleaseById $ReleaseId
+    Assert-CobbleReleaseIdentityState -Release $release -ExpectedId $ReleaseId -ExpectedTag $Tag -ExpectedState $State | Out-Null
+    return [pscustomobject]@{
+        Release = $release
+        Assets = @(Get-GitHubReleaseAssets $ReleaseId)
+    }
+}
+
+function Get-PublishedStableReleaseSnapshot([string]$Tag, [string]$Description) {
+    $release = Get-GitHubReleaseByTag $Tag
+    $publishedAt = if ($null -eq $release) { $null } else { $release.PSObject.Properties['published_at'] }
+    if ($null -eq $release -or [bool]$release.draft -or [bool]$release.prerelease -or
+        $null -eq $publishedAt -or [string]::IsNullOrWhiteSpace([string]$publishedAt.Value)) {
+        throw "$Description is not a currently published stable release: $Tag"
+    }
+    return [pscustomobject]@{
+        Release = $release
+        Assets = @(Get-GitHubReleaseAssets ([int64]$release.id))
+    }
+}
+
+function Assert-PublishedPinnedUpdater {
+    $identity = Get-PinnedUpdaterIdentity
+    $snapshot = Get-PublishedStableReleaseSnapshot -Tag "updater-v$($identity.version)" -Description 'Pinned distributed updater'
+    Assert-CobblePublishedUpdaterAsset -LocalAsset $identity -RemoteAssets @($snapshot.Assets) | Out-Null
+    return $identity
+}
+
+function Assert-PublishedBaseReleaseIdentity([string]$BaseVersion, [object[]]$ExpectedAssets) {
+    $snapshot = Get-PublishedStableReleaseSnapshot -Tag "modpack-v$BaseVersion" -Description 'Signed base'
+    Assert-CobblePublishedBaseAssets -LocalAssets $ExpectedAssets -RemoteAssets @($snapshot.Assets) | Out-Null
+    return $true
 }
 
 function Resolve-BaseArtifacts([string]$RequestedVersion, [string]$ManifestPath, [string]$SignaturePath) {
@@ -248,27 +389,35 @@ function Resolve-BaseArtifacts([string]$RequestedVersion, [string]$ManifestPath,
     if ($hasManifest -xor $hasSignature) { throw 'Specify both -BaseManifestPath and -BaseSignaturePath, or neither.' }
 
     $tag = "modpack-v$RequestedVersion"
-    $release = Get-GitHubReleaseByTag $tag
-    if ($null -eq $release -or [bool]$release.draft -or [bool]$release.prerelease) {
-        throw "Published stable signed base release was not found: $tag"
-    }
-    $publishedAssets = @(Get-GitHubReleaseAssets ([int64]$release.id))
+    $snapshot = Get-PublishedStableReleaseSnapshot -Tag $tag -Description 'Signed base'
+    $publishedAssets = @($snapshot.Assets)
 
     if ($hasManifest) {
         if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) { throw "Base manifest was not found: $ManifestPath" }
         if (-not (Test-Path -LiteralPath $SignaturePath -PathType Leaf)) { throw "Base signature was not found: $SignaturePath" }
         $resolvedManifest = (Resolve-Path -LiteralPath $ManifestPath).Path
         $resolvedSignature = (Resolve-Path -LiteralPath $SignaturePath).Path
-        $localAssets = @(
-            [pscustomobject]@{ name = 'cobble-music-update.json'; size = (Get-Item -LiteralPath $resolvedManifest).Length; sha256 = (Get-Sha256 $resolvedManifest) },
-            [pscustomobject]@{ name = 'cobble-music-update.sig'; size = (Get-Item -LiteralPath $resolvedSignature).Length; sha256 = (Get-Sha256 $resolvedSignature) }
-        )
-        Assert-CobblePublishedBaseAssets -LocalAssets $localAssets -RemoteAssets $publishedAssets | Out-Null
-        return [pscustomobject]@{ ManifestPath = $resolvedManifest; SignaturePath = $resolvedSignature; TempRoot = $null }
+        $identity = $null
+        try {
+            $identity = Open-ManifestSignatureIdentity $resolvedManifest $resolvedSignature
+            Assert-CobblePublishedBaseAssets -LocalAssets @($identity.Assets) -RemoteAssets $publishedAssets | Out-Null
+            return [pscustomobject]@{
+                ManifestPath = $resolvedManifest
+                SignaturePath = $resolvedSignature
+                TempRoot = $null
+                Identity = $identity
+                IdentityAssets = @($identity.Assets)
+            }
+        }
+        catch {
+            Close-ManifestSignatureIdentity $identity
+            throw
+        }
     }
 
     $tempRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-music-base-$([Guid]::NewGuid().ToString('N'))"
     New-Item -ItemType Directory -Path $tempRoot | Out-Null
+    $identity = $null
     try {
         Invoke-NativeText -Command 'gh' -Arguments @(
             'release', 'download', $tag, '--repo', $Repository,
@@ -280,14 +429,18 @@ function Resolve-BaseArtifacts([string]$RequestedVersion, [string]$ManifestPath,
         if (-not (Test-Path -LiteralPath $downloadedManifest -PathType Leaf) -or -not (Test-Path -LiteralPath $downloadedSignature -PathType Leaf)) {
             throw "Base release $tag is missing the signed manifest assets."
         }
-        $downloadedAssets = @(
-            [pscustomobject]@{ name = 'cobble-music-update.json'; size = (Get-Item -LiteralPath $downloadedManifest).Length; sha256 = (Get-Sha256 $downloadedManifest) },
-            [pscustomobject]@{ name = 'cobble-music-update.sig'; size = (Get-Item -LiteralPath $downloadedSignature).Length; sha256 = (Get-Sha256 $downloadedSignature) }
-        )
-        Assert-CobblePublishedBaseAssets -LocalAssets $downloadedAssets -RemoteAssets $publishedAssets | Out-Null
-        return [pscustomobject]@{ ManifestPath = $downloadedManifest; SignaturePath = $downloadedSignature; TempRoot = $tempRoot }
+        $identity = Open-ManifestSignatureIdentity $downloadedManifest $downloadedSignature
+        Assert-CobblePublishedBaseAssets -LocalAssets @($identity.Assets) -RemoteAssets $publishedAssets | Out-Null
+        return [pscustomobject]@{
+            ManifestPath = $downloadedManifest
+            SignaturePath = $downloadedSignature
+            TempRoot = $tempRoot
+            Identity = $identity
+            IdentityAssets = @($identity.Assets)
+        }
     }
     catch {
+        if ($null -ne $identity) { Close-ManifestSignatureIdentity $identity }
         Assert-Under $tempRoot ([IO.Path]::GetTempPath())
         Remove-Item -LiteralPath $tempRoot -Recurse -Force
         throw
@@ -295,104 +448,114 @@ function Resolve-BaseArtifacts([string]$RequestedVersion, [string]$ManifestPath,
 }
 
 function Remove-BaseTemp([object]$BaseArtifacts) {
+    if ($null -ne $BaseArtifacts) { Close-ManifestSignatureIdentity $BaseArtifacts.Identity }
     if ($null -ne $BaseArtifacts -and -not [string]::IsNullOrWhiteSpace([string]$BaseArtifacts.TempRoot) -and (Test-Path -LiteralPath $BaseArtifacts.TempRoot)) {
         Assert-Under $BaseArtifacts.TempRoot ([IO.Path]::GetTempPath())
         Remove-Item -LiteralPath $BaseArtifacts.TempRoot -Recurse -Force
     }
 }
 
-function Get-ExpectedStagedAssets([object]$Manifest, [string]$ManifestPath, [string]$SignaturePath) {
+function Get-ExpectedStagedAssets([object]$Manifest, [object]$StagedIdentity) {
     $expected = [Collections.Generic.List[object]]::new()
-    foreach ($path in @($ManifestPath, $SignaturePath)) {
-        $item = Get-Item -LiteralPath $path
-        $expected.Add([pscustomobject]@{ name = $item.Name; path = $item.FullName; size = $item.Length; sha256 = (Get-Sha256 $item.FullName) })
+    Assert-CobbleLockedFileSnapshot $StagedIdentity.Manifest | Out-Null
+    Assert-CobbleLockedFileSnapshot $StagedIdentity.Signature | Out-Null
+    foreach ($asset in @($StagedIdentity.Assets)) {
+        $expected.Add([pscustomobject]@{ name = $asset.name; path = $asset.path; size = $asset.size; sha256 = $asset.sha256 })
     }
 
-    $parts = if ($null -eq $Manifest.payload) { @() } else { @($Manifest.payload.parts) }
-    $partNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    [int64]$totalSize = 0
-    foreach ($part in $parts) {
-        $name = [string]$part.name
-        if ($name -cnotmatch '^cobble-music-payload\.part\d{3,}$' -or -not $partNames.Add($name)) {
-            throw "Manifest payload part is unsafe or duplicate: $name"
-        }
-        $partPath = Join-Path $OutputRoot $name
-        Assert-Under $partPath $OutputRoot
-        if (-not (Test-Path -LiteralPath $partPath -PathType Leaf)) { throw "Staged payload part is missing: $name" }
-        $item = Get-Item -LiteralPath $partPath
-        $hash = Get-Sha256 $partPath
-        if ($item.Length -ne [int64]$part.size -or $hash -cne [string]$part.sha256) {
-            throw "Staged payload part does not match its signed manifest: $name"
-        }
-        $totalSize += $item.Length
-        $expected.Add([pscustomobject]@{ name = $name; path = $item.FullName; size = $item.Length; sha256 = $hash })
-    }
-
-    if ($null -ne $Manifest.payload) {
-        if ($parts.Count -eq 0 -or $totalSize -ne [int64]$Manifest.payload.size -or [string]$Manifest.payload.sha256 -cnotmatch '^[0-9a-f]{64}$') {
-            throw 'Signed payload metadata and staged part sizes are inconsistent.'
-        }
+    foreach ($partIdentity in @(Assert-CobbleStagedPayloadParts -Payload $Manifest.payload -StagingRoot $OutputRoot)) {
+        $expected.Add($partIdentity)
     }
     return @($expected)
 }
 
-function Publish-StagedRelease([object]$Manifest, [string]$ManifestPath, [string]$SignaturePath, [string]$NotesPath) {
+function Publish-StagedRelease(
+    [object]$Manifest,
+    [object]$StagedIdentity,
+    [string]$NotesPath,
+    [AllowEmptyCollection()][object[]]$BaseIdentityAssets = @()
+) {
+    Assert-PublishedPinnedUpdater | Out-Null
     $tag = "modpack-v$Version"
-    $expected = @(Get-ExpectedStagedAssets $Manifest $ManifestPath $SignaturePath)
+    Assert-ManifestSignatureIdentity $StagedIdentity | Out-Null
+    $expected = @(Get-ExpectedStagedAssets $Manifest $StagedIdentity)
     $release = Get-GitHubReleaseByTag $tag
     if ($null -eq $release) {
         Write-Host "Creating persistent draft $tag (no assets uploaded yet)."
+        Assert-ManifestSignatureIdentity $StagedIdentity | Out-Null
         Invoke-NativeText -Command 'gh' -Arguments @(
             'release', 'create', $tag, '--repo', $Repository,
             '--title', "Cobble Music $Version", '--notes-file', $NotesPath, '--draft'
         ) | Out-Host
         $release = Get-GitHubReleaseByTag $tag
-        if ($null -eq $release -or -not [bool]$release.draft) { throw "GitHub did not create the expected draft release: $tag" }
+        if ($null -eq $release) { throw "GitHub did not create the expected draft release: $tag" }
     }
 
-    if ([bool]$release.prerelease) { throw "Reserved release $tag is unexpectedly marked prerelease." }
-    $assets = @(Get-GitHubReleaseAssets ([int64]$release.id))
-    if (-not [bool]$release.draft) {
-        Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets $assets -RequireComplete | Out-Null
+    [int64]$releaseId = [int64]$release.id
+    $initialState = if ([bool]$release.draft) { 'draft' } else { 'public' }
+    $snapshot = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State $initialState
+    if ($initialState -ceq 'public') {
+        Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($snapshot.Assets) -RequireComplete | Out-Null
         Write-Host "Release $tag is already public and exactly matches signed staging."
         return
     }
 
+    $assets = @($snapshot.Assets)
     if ($RepairStaleUploads) {
-        # The explicit switch means the operator has confirmed that no gh
-        # uploader is still active. The pure validator inspects the complete
-        # draft first: any unexpected, uploaded-mismatched, duplicate, or
-        # unknown-state asset prevents every deletion.
         $staleAssets = @(Get-CobbleRepairableStarterAssets -ExpectedAssets $expected -RemoteAssets $assets)
         if ($staleAssets.Count -gt 0) {
             Write-Host "Removing $($staleAssets.Count) explicitly approved stale starter asset(s) from draft $tag."
             foreach ($stale in $staleAssets) {
-                Invoke-NativeText -Command 'gh' -Arguments @('api', '--method', 'DELETE', "repos/$Repository/releases/assets/$($stale.id)") | Out-Null
-                Write-Host "Removed stale starter asset: $($stale.name)"
+                # Reverify local signed bytes, then refetch the exact draft and
+                # its complete assets immediately before each destructive call.
+                Assert-ManifestSignatureIdentity $StagedIdentity | Out-Null
+                $current = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'draft'
+                $stillStale = Get-CobbleStarterAssetForDeletion -Candidate $stale -ExpectedAssets $expected -RemoteAssets @($current.Assets)
+                if ($null -eq $stillStale) {
+                    Write-Host "Skipped stale repair because asset state changed safely: $($stale.name)"
+                    continue
+                }
+                Invoke-NativeText -Command 'gh' -Arguments @('api', '--method', 'DELETE', "repos/$Repository/releases/assets/$($stillStale.id)") | Out-Null
+                Write-Host "Removed revalidated stale starter asset: $($stillStale.name)"
             }
-            $assets = @(Get-GitHubReleaseAssets ([int64]$release.id))
         }
     }
 
-    $missing = @(Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets $assets)
+    $current = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'draft'
+    $missing = @(Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($current.Assets))
     if ($missing.Count -gt 0) {
         $expectedByName = @{}
         foreach ($asset in $expected) { $expectedByName[$asset.name] = $asset }
-        $uploadPaths = @($missing | ForEach-Object { $expectedByName[$_].path })
-        Write-Host "Uploading $($uploadPaths.Count) missing asset(s) to persistent draft $tag. Completed matching assets will be reused on -ResumePublish."
-        try { Invoke-NativeHost -Command 'gh' -Arguments (@('release', 'upload', $tag, '--repo', $Repository) + $uploadPaths) }
-        catch { throw "$($_.Exception.Message)`nThe draft was preserved. After any active GitHub upload settles, rerun this version with -ResumePublish -ConfirmDistributionRights." }
+        Assert-ManifestSignatureIdentity $StagedIdentity | Out-Null
+        $current = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'draft'
+        $missing = @(Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($current.Assets))
+        if ($missing.Count -gt 0) {
+            $uploadPaths = @($missing | ForEach-Object { $expectedByName[$_].path })
+            Write-Host "Uploading $($uploadPaths.Count) missing asset(s) to persistent draft $tag. Completed matching assets will be reused on -ResumePublish."
+            try { Invoke-NativeHost -Command 'gh' -Arguments (@('release', 'upload', $tag, '--repo', $Repository) + $uploadPaths) }
+            catch { throw "$($_.Exception.Message)`nThe draft was preserved. After any active GitHub upload settles, rerun this version with -ResumePublish -ConfirmDistributionRights." }
+        }
     }
 
-    $assets = @(Get-GitHubReleaseAssets ([int64]$release.id))
-    Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets $assets -RequireComplete | Out-Null
+    $current = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'draft'
+    Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($current.Assets) -RequireComplete | Out-Null
     Write-Host 'Remote asset names, states, sizes, and GitHub SHA-256 digests exactly match signed staging.'
 
-    Invoke-GhJson -Arguments @('api', '--method', 'PATCH', "repos/$Repository/releases/$($release.id)", '-F', 'draft=false') | Out-Null
-    $published = Get-GitHubReleaseByTag $tag
-    if ($null -eq $published -or [bool]$published.draft) { throw "GitHub did not publish expected release $tag." }
-    $publishedAssets = @(Get-GitHubReleaseAssets ([int64]$published.id))
-    Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets $publishedAssets -RequireComplete | Out-Null
+    Assert-PublishedPinnedUpdater | Out-Null
+    if ([int]$Manifest.schemaVersion -eq 2) {
+        if ($BaseIdentityAssets.Count -ne 2) { throw 'Delta publication is missing its verified signed-base identity snapshot.' }
+        Assert-PublishedBaseReleaseIdentity -BaseVersion ([string]$Manifest.base.version) -ExpectedAssets $BaseIdentityAssets | Out-Null
+    }
+
+    # The final local signature check happens before the final exact-by-ID
+    # draft/asset snapshot; no stale tag lookup is used for publication.
+    Assert-ManifestSignatureIdentity $StagedIdentity | Out-Null
+    $finalDraft = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'draft'
+    Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($finalDraft.Assets) -RequireComplete | Out-Null
+    Invoke-GhJson -Arguments @('api', '--method', 'PATCH', "repos/$Repository/releases/$releaseId", '-F', 'draft=false') | Out-Null
+
+    $published = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'public'
+    Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($published.Assets) -RequireComplete | Out-Null
     Write-Host "Published signed GitHub Release $tag to $Repository"
 }
 
@@ -404,34 +567,49 @@ function Read-And-ValidateStagedManifest {
         Assert-Under $path $OutputRoot
         if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Resume staging file is missing: $path" }
     }
-    Test-SignedManifest $manifestPath $signaturePath
-    $manifest = Read-JsonFile $manifestPath 'Staged signed manifest'
-    if ([string]$manifest.version -cne $Version -or [string]$manifest.releaseTag -cne "modpack-v$Version") {
-        throw 'Staged signed manifest does not match the requested release version.'
-    }
-    ConvertTo-CobbleFileRecordSet -Entries @($manifest.files) -Context 'staged authoritative files' | Out-Null
-
-    $baseArtifacts = $null
+    $stagedIdentity = $null
     try {
-        if ([int]$manifest.schemaVersion -eq 2) {
-            $baseArtifacts = Resolve-BaseArtifacts -RequestedVersion ([string]$manifest.base.version) -ManifestPath $BaseManifestPath -SignaturePath $BaseSignaturePath
-            Test-SignedManifest $baseArtifacts.ManifestPath $baseArtifacts.SignaturePath
-            $baseHash = Get-Sha256 $baseArtifacts.ManifestPath
-            $baseManifest = Read-JsonFile $baseArtifacts.ManifestPath 'Signed base manifest'
-            Assert-CobbleBaseManifest -Manifest $baseManifest -ExpectedVersion ([string]$manifest.base.version) -TargetVersion $Version | Out-Null
-            Assert-CobbleDeltaManifest -Manifest $manifest -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash | Out-Null
+        $stagedIdentity = Open-ManifestSignatureIdentity $manifestPath $signaturePath
+        Assert-ManifestSignatureIdentity $stagedIdentity | Out-Null
+        $manifest = Read-JsonSnapshot $stagedIdentity.Manifest 'Staged signed manifest'
+        if ([string]$manifest.version -cne $Version -or [string]$manifest.releaseTag -cne "modpack-v$Version") {
+            throw 'Staged signed manifest does not match the requested release version.'
         }
-        elseif ([int]$manifest.schemaVersion -eq 1) {
-            Assert-CobbleV1Manifest -Manifest $manifest | Out-Null
+        ConvertTo-CobbleFileRecordSet -Entries @($manifest.files) -Context 'staged authoritative files' | Out-Null
+
+        $baseArtifacts = $null
+        $baseIdentityAssets = @()
+        try {
+            if ([int]$manifest.schemaVersion -eq 2) {
+                $baseArtifacts = Resolve-BaseArtifacts -RequestedVersion ([string]$manifest.base.version) -ManifestPath $BaseManifestPath -SignaturePath $BaseSignaturePath
+                $baseIdentityAssets = @($baseArtifacts.IdentityAssets)
+                Assert-ManifestSignatureIdentity $baseArtifacts.Identity | Out-Null
+                $baseHash = [string]$baseArtifacts.Identity.Manifest.sha256
+                $baseManifest = Read-JsonSnapshot $baseArtifacts.Identity.Manifest 'Signed base manifest'
+                Assert-CobbleBaseManifest -Manifest $baseManifest -ExpectedVersion ([string]$manifest.base.version) -TargetVersion $Version | Out-Null
+                Assert-CobbleDeltaManifest -Manifest $manifest -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash | Out-Null
+            }
+            elseif ([int]$manifest.schemaVersion -eq 1) {
+                Assert-CobbleV1Manifest -Manifest $manifest | Out-Null
+            }
+            else {
+                throw "Unsupported staged manifest schema: $($manifest.schemaVersion)"
+            }
         }
-        else {
-            throw "Unsupported staged manifest schema: $($manifest.schemaVersion)"
+        finally { Remove-BaseTemp $baseArtifacts }
+
+        Get-ExpectedStagedAssets $manifest $stagedIdentity | Out-Null
+        return [pscustomobject]@{
+            Manifest = $manifest
+            StagedIdentity = $stagedIdentity
+            NotesPath = $notesPath
+            BaseIdentityAssets = $baseIdentityAssets
         }
     }
-    finally { Remove-BaseTemp $baseArtifacts }
-
-    Get-ExpectedStagedAssets $manifest $manifestPath $signaturePath | Out-Null
-    return [pscustomobject]@{ Manifest = $manifest; ManifestPath = $manifestPath; SignaturePath = $signaturePath; NotesPath = $notesPath }
+    catch {
+        Close-ManifestSignatureIdentity $stagedIdentity
+        throw
+    }
 }
 
 if ($ChunkSizeMiB -lt 1 -or $ChunkSizeMiB -gt 1536) {
@@ -446,9 +624,10 @@ if (($Publish -or $ResumePublish) -and -not $ConfirmDistributionRights) {
 if ($ResumePublish) {
     if (-not (Test-Path -LiteralPath $OutputRoot -PathType Container)) { throw "Release staging output does not exist: $OutputRoot" }
     Assert-Under $OutputRoot $ReleaseOutputRoot
-    Build-UpdaterSigningTool
+    Get-PinnedUpdaterIdentity | Out-Null
     $staged = Read-And-ValidateStagedManifest
-    Publish-StagedRelease $staged.Manifest $staged.ManifestPath $staged.SignaturePath $staged.NotesPath
+    try { Publish-StagedRelease $staged.Manifest $staged.StagedIdentity $staged.NotesPath $staged.BaseIdentityAssets }
+    finally { Close-ManifestSignatureIdentity $staged.StagedIdentity }
     exit 0
 }
 
@@ -463,18 +642,29 @@ if (-not (Test-Path -LiteralPath $SourceMinecraftDir -PathType Container)) { thr
 if (-not (Test-Path -LiteralPath $PrivateKeyPath -PathType Leaf)) { throw "Private signing key not found: $PrivateKeyPath" }
 if (Test-Path -LiteralPath $OutputRoot) { throw "Refusing to overwrite existing release staging output: $OutputRoot" }
 
-Build-UpdaterSigningTool
+$SourceMinecraftDir = (Resolve-Path -LiteralPath $SourceMinecraftDir).Path
+$PrivateKeyPath = (Resolve-Path -LiteralPath $PrivateKeyPath).Path
+$managedRootPaths = [Collections.Generic.List[string]]::new()
+foreach ($rootName in $IncludeRoots | Sort-Object -Unique) {
+    if ($AllowedRoots -cnotcontains $rootName) { throw "Include root is outside the updater allowlist: $rootName" }
+    $managedRootPaths.Add((Join-Path $SourceMinecraftDir $rootName))
+}
+Assert-CobblePrivateKeyIsolation -PrivateKeyPath $PrivateKeyPath -SourceMinecraftDir $SourceMinecraftDir `
+    -ReleaseOutputRoot $ReleaseOutputRoot -ManagedRoots @($managedRootPaths) | Out-Null
+
+Get-PinnedUpdaterIdentity | Out-Null
 
 $baseArtifacts = $null
+$stagedIdentity = $null
 try {
     $baseManifest = $null
     $baseHash = $null
     $baseFiles = @()
     if (-not $FullBaseline) {
         $baseArtifacts = Resolve-BaseArtifacts -RequestedVersion $BaseVersion -ManifestPath $BaseManifestPath -SignaturePath $BaseSignaturePath
-        Test-SignedManifest $baseArtifacts.ManifestPath $baseArtifacts.SignaturePath
-        $baseHash = Get-Sha256 $baseArtifacts.ManifestPath
-        $baseManifest = Read-JsonFile $baseArtifacts.ManifestPath 'Signed base manifest'
+        Assert-ManifestSignatureIdentity $baseArtifacts.Identity | Out-Null
+        $baseHash = [string]$baseArtifacts.Identity.Manifest.sha256
+        $baseManifest = Read-JsonSnapshot $baseArtifacts.Identity.Manifest 'Signed base manifest'
         $baseSet = Assert-CobbleBaseManifest -Manifest $baseManifest -ExpectedVersion $BaseVersion -TargetVersion $Version
         $baseFiles = @($baseSet.Entries)
         Write-Host "Verified signed base $BaseVersion ($baseHash)."
@@ -576,9 +766,17 @@ try {
     $manifestPath = Join-Path $OutputRoot 'cobble-music-update.json'
     Write-Utf8 $manifestPath ($manifest | ConvertTo-Json -Depth 12)
     $signaturePath = Join-Path $OutputRoot 'cobble-music-update.sig'
-    & dotnet $UpdaterDll --sign-manifest $manifestPath --private-key-file $PrivateKeyPath --signature-output $signaturePath | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "Manifest signing failed with exit code $LASTEXITCODE" }
-    Test-SignedManifest $manifestPath $signaturePath
+    try { Invoke-PinnedUpdater -Arguments @('--sign-manifest', $manifestPath, '--private-key-file', $PrivateKeyPath, '--signature-output', $signaturePath) }
+    catch { throw "Manifest signing failed.`n$($_.Exception.Message)" }
+    $stagedIdentity = Open-ManifestSignatureIdentity $manifestPath $signaturePath
+    Assert-ManifestSignatureIdentity $stagedIdentity | Out-Null
+    $signedManifest = Read-JsonSnapshot $stagedIdentity.Manifest 'Newly signed manifest'
+    if ($FullBaseline) {
+        Assert-CobbleV1Manifest -Manifest $signedManifest | Out-Null
+    }
+    else {
+        Assert-CobbleDeltaManifest -Manifest $signedManifest -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash | Out-Null
+    }
 
     $notesPath = Join-Path $OutputRoot 'RELEASE_NOTES.md'
     $modeDescription = if ($FullBaseline) { 'Full schema-v1 baseline' } else { "Schema-v2 delta from signed $BaseVersion" }
@@ -596,7 +794,7 @@ This release is a signed update payload for the Kewz's Cobblemon Prism updater.
 - Source: canonical live client directory supplied to this command
 "@
 
-    Get-ExpectedStagedAssets ([pscustomobject]$manifest) $manifestPath $signaturePath | Out-Null
+    Get-ExpectedStagedAssets $signedManifest $stagedIdentity | Out-Null
     Write-Host "Staged signed release at $OutputRoot"
     Write-Host "Authoritative files: $($authoritativeFiles.Count); payload files: $($payloadFiles.Count); chunks: $($payloadResult.Parts.Count)"
     if (-not $Publish) {
@@ -604,8 +802,10 @@ This release is a signed update payload for the Kewz's Cobblemon Prism updater.
         exit 0
     }
 
-    Publish-StagedRelease ([pscustomobject]$manifest) $manifestPath $signaturePath $notesPath
+    $baseIdentityAssets = if ($null -eq $baseArtifacts) { @() } else { @($baseArtifacts.IdentityAssets) }
+    Publish-StagedRelease $signedManifest $stagedIdentity $notesPath $baseIdentityAssets
 }
 finally {
+    Close-ManifestSignatureIdentity $stagedIdentity
     Remove-BaseTemp $baseArtifacts
 }

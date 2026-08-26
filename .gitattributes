@@ -1,6 +1,8 @@
 # Build and release inputs have a repository-stable byte representation.
 .gitattributes text eol=lf
+.gitignore text eol=lf
 global.json text eol=lf
+NuGet.Config text eol=lf
 *.cs text eol=lf
 *.csproj text eol=lf
 *.json text eol=lf

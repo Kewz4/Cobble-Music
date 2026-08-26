@@ -3,6 +3,56 @@ Set-StrictMode -Version Latest
 $script:AllowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $script:Sha256Pattern = '^[0-9a-f]{64}$'
 $script:VersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+$script:PinnedUpdaterVersion = '1.2.0'
+
+function Get-CobbleOptionalPropertyValue {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Get-CobbleRuntimeCollectionState {
+    param(
+        [Parameter(Mandatory)]$Object,
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    $property = $Object.PSObject.Properties[$Name]
+    if ($null -eq $property) {
+        # System.Text.Json preserves the C# model's initialized empty list when
+        # a property is absent. An explicit JSON null instead overwrites that
+        # default and is rejected by ManifestParser.
+        return [pscustomobject]@{ WasPresent = $false; Entries = @() }
+    }
+    if ($null -eq $property.Value) { throw "$Context must not be explicit JSON null." }
+    return [pscustomobject]@{ WasPresent = $true; Entries = @($property.Value) }
+}
+
+function Assert-CobbleSupportedMinimumUpdaterVersion {
+    param(
+        [AllowNull()][string]$MinimumUpdaterVersion,
+        [string]$MaximumUpdaterVersion = $script:PinnedUpdaterVersion
+    )
+
+    [Version]$minimum = $null
+    [Version]$maximum = $null
+    if ($MinimumUpdaterVersion -cnotmatch $script:VersionPattern -or
+        $MaximumUpdaterVersion -cnotmatch $script:VersionPattern -or
+        -not [Version]::TryParse($MinimumUpdaterVersion, [ref]$minimum) -or
+        -not [Version]::TryParse($MaximumUpdaterVersion, [ref]$maximum)) {
+        throw 'Manifest minimum updater version or pinned updater version is not canonical major.minor.patch.'
+    }
+    if ($minimum -gt $maximum) {
+        throw "Manifest requires updater $MinimumUpdaterVersion, newer than pinned distributed updater $MaximumUpdaterVersion."
+    }
+    return $true
+}
 
 function Get-CobblePathKey {
     param([Parameter(Mandatory)][string]$Path)
@@ -41,6 +91,106 @@ function Assert-CobbleManagedPath {
     }
 
     return $Path
+}
+
+function Test-CobblePathAtOrUnder {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Base
+    )
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $fullBase = [IO.Path]::GetFullPath($Base)
+    $baseRoot = [IO.Path]::GetPathRoot($fullBase)
+    if ($fullBase.Length -gt $baseRoot.Length) {
+        $fullBase = $fullBase.TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    }
+    if ($fullPath.Equals($fullBase, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $prefix = $fullBase
+    if (-not $prefix.EndsWith([IO.Path]::DirectorySeparatorChar) -and -not $prefix.EndsWith([IO.Path]::AltDirectorySeparatorChar)) {
+        $prefix += [IO.Path]::DirectorySeparatorChar
+    }
+    return $fullPath.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-CobblePrivateKeyIsolation {
+    param(
+        [Parameter(Mandatory)][string]$PrivateKeyPath,
+        [Parameter(Mandatory)][string]$SourceMinecraftDir,
+        [Parameter(Mandatory)][string]$ReleaseOutputRoot,
+        [AllowEmptyCollection()][string[]]$ManagedRoots = @()
+    )
+
+    $forbidden = @(
+        [pscustomobject]@{ Path = $SourceMinecraftDir; Description = 'Minecraft source directory' },
+        [pscustomobject]@{ Path = $ReleaseOutputRoot; Description = 'release staging directory' }
+    ) + @($ManagedRoots | ForEach-Object {
+        [pscustomobject]@{ Path = $_; Description = 'inventoried managed root' }
+    })
+    foreach ($location in $forbidden) {
+        if (Test-CobblePathAtOrUnder -Path $PrivateKeyPath -Base $location.Path) {
+            throw "Private signing key must not be inside the $($location.Description): $PrivateKeyPath"
+        }
+    }
+    return $true
+}
+
+function Open-CobbleLockedFileSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int64]$MaximumBytes = 16MB
+    )
+
+    if ($MaximumBytes -lt 1 -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Snapshot source is missing or has an invalid size limit: $Path"
+    }
+    $resolved = (Resolve-Path -LiteralPath $Path).Path
+    $stream = [IO.File]::Open($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -gt $MaximumBytes -or $stream.Length -gt [int]::MaxValue) {
+            throw "Snapshot source exceeds the safe in-memory limit: $resolved"
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        [int]$offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) { throw "Snapshot source ended before its locked length: $resolved" }
+            $offset += $read
+        }
+        $sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+        return [pscustomobject]@{
+            name = [IO.Path]::GetFileName($resolved)
+            path = $resolved
+            size = [int64]$bytes.Length
+            sha256 = $sha256
+            bytes = $bytes
+            stream = $stream
+        }
+    }
+    catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Assert-CobbleLockedFileSnapshot {
+    param([Parameter(Mandatory)]$Snapshot)
+
+    if ($null -eq $Snapshot.stream -or -not $Snapshot.stream.CanRead) { throw "Locked snapshot is closed: $($Snapshot.path)" }
+    $Snapshot.stream.Position = 0
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try { $actualHash = [Convert]::ToHexString($hasher.ComputeHash($Snapshot.stream)).ToLowerInvariant() }
+    finally { $hasher.Dispose() }
+    if ([int64]$Snapshot.stream.Length -ne [int64]$Snapshot.size -or $actualHash -cne [string]$Snapshot.sha256) {
+        throw "Locked snapshot no longer matches its captured bytes: $($Snapshot.path)"
+    }
+    return $true
+}
+
+function Close-CobbleLockedFileSnapshot {
+    param([AllowNull()]$Snapshot)
+
+    if ($null -ne $Snapshot -and $null -ne $Snapshot.stream) { $Snapshot.stream.Dispose() }
 }
 
 function ConvertTo-CobbleFileRecordSet {
@@ -123,6 +273,63 @@ function Assert-CobblePayloadMetadata {
     if ($total -ne [int64]$Payload.size) { throw 'Payload part sizes do not equal the signed payload size.' }
 }
 
+function Assert-CobbleStagedPayloadParts {
+    param(
+        [AllowNull()]$Payload,
+        [Parameter(Mandatory)][string]$StagingRoot
+    )
+
+    if ($null -eq $Payload) { return @() }
+    Assert-CobblePayloadMetadata $Payload
+
+    $root = [IO.Path]::GetFullPath($StagingRoot)
+    $identities = [Collections.Generic.List[object]]::new()
+    $aggregate = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+    $buffer = [byte[]]::new(4MB)
+    [int64]$total = 0
+    try {
+        foreach ($part in @($Payload.parts)) {
+            $name = [string]$part.name
+            $path = [IO.Path]::GetFullPath((Join-Path $root $name))
+            if (-not (Test-CobblePathAtOrUnder -Path $path -Base $root) -or
+                -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw "Staged payload part is missing or outside staging: $name"
+            }
+
+            $partHash = [Security.Cryptography.IncrementalHash]::CreateHash([Security.Cryptography.HashAlgorithmName]::SHA256)
+            $stream = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+            try {
+                if ($stream.Length -ne [int64]$part.size) {
+                    throw "Staged payload part size does not match its signed manifest: $name"
+                }
+                while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    $partHash.AppendData($buffer, 0, $read)
+                    $aggregate.AppendData($buffer, 0, $read)
+                    if ($total -gt [int64]::MaxValue - $read) { throw 'Staged payload size overflows Int64.' }
+                    $total += $read
+                }
+                $actualPartHash = [Convert]::ToHexString($partHash.GetHashAndReset()).ToLowerInvariant()
+            }
+            finally {
+                $stream.Dispose()
+                $partHash.Dispose()
+            }
+            if ($actualPartHash -cne [string]$part.sha256) {
+                throw "Staged payload part SHA-256 does not match its signed manifest: $name"
+            }
+            $identities.Add([pscustomobject]@{ name = $name; path = $path; size = [int64]$part.size; sha256 = $actualPartHash })
+        }
+
+        $actualPayloadHash = [Convert]::ToHexString($aggregate.GetHashAndReset()).ToLowerInvariant()
+    }
+    finally { $aggregate.Dispose() }
+
+    if ($total -ne [int64]$Payload.size -or $actualPayloadHash -cne [string]$Payload.sha256) {
+        throw 'Ordered staged payload parts do not reconstruct the exact signed payload size and SHA-256.'
+    }
+    return @($identities)
+}
+
 function Assert-CobbleLegacyCleanup {
     param(
         [AllowEmptyCollection()][Parameter(Mandatory)][object[]]$Entries,
@@ -153,11 +360,24 @@ function Assert-CobbleV1Manifest {
         -not [Version]::TryParse([string]$Manifest.version, [ref]$parsed)) {
         throw 'Baseline manifest version must use canonical major.minor.patch form.'
     }
-    $files = ConvertTo-CobbleFileRecordSet -Entries @($Manifest.files) -Context 'baseline authoritative files'
-    Assert-CobblePayloadMetadata $Manifest.payload
+    Assert-CobbleSupportedMinimumUpdaterVersion -MinimumUpdaterVersion ([string](Get-CobbleOptionalPropertyValue $Manifest 'minimumUpdaterVersion')) | Out-Null
+
+    $base = Get-CobbleOptionalPropertyValue $Manifest 'base'
+    $payloadFiles = Get-CobbleRuntimeCollectionState $Manifest 'payloadFiles' 'Baseline payloadFiles'
+    $deletedFiles = Get-CobbleRuntimeCollectionState $Manifest 'deletedFiles' 'Baseline deletedFiles'
+    $filesState = Get-CobbleRuntimeCollectionState $Manifest 'files' 'Baseline files'
+    $deletePaths = Get-CobbleRuntimeCollectionState $Manifest 'deletePaths' 'Baseline deletePaths'
+    $legacyCleanup = Get-CobbleRuntimeCollectionState $Manifest 'legacyCleanup' 'Baseline legacyCleanup'
+    if ($null -ne $base -or $payloadFiles.Entries.Count -ne 0 -or $deletedFiles.Entries.Count -ne 0) {
+        throw 'Baseline manifests cannot contain delta-only base, payloadFiles, or deletedFiles data.'
+    }
+
+    $files = ConvertTo-CobbleFileRecordSet -Entries @($filesState.Entries) -Context 'baseline authoritative files'
+    $payload = Get-CobbleOptionalPropertyValue $Manifest 'payload'
+    Assert-CobblePayloadMetadata $payload
 
     $deleteKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    foreach ($pathValue in @($Manifest.deletePaths)) {
+    foreach ($pathValue in @($deletePaths.Entries)) {
         $path = [string]$pathValue
         Assert-CobbleManagedPath -Path $path -Context 'baseline deletePaths' | Out-Null
         $key = Get-CobblePathKey $path
@@ -165,7 +385,7 @@ function Assert-CobbleV1Manifest {
             throw "Baseline deletePaths is duplicate or overlaps files: $path"
         }
     }
-    Assert-CobbleLegacyCleanup -Entries @($Manifest.legacyCleanup) -ForbiddenSets @($files) | Out-Null
+    Assert-CobbleLegacyCleanup -Entries @($legacyCleanup.Entries) -ForbiddenSets @($files) | Out-Null
     return $true
 }
 
@@ -264,6 +484,14 @@ function Assert-CobbleDeltaManifest {
     if ([string]$Manifest.minimumUpdaterVersion -cne '1.2.0') {
         throw 'Delta manifests must require updater 1.2.0.'
     }
+    $filesState = Get-CobbleRuntimeCollectionState $Manifest 'files' 'Delta files'
+    $payloadFilesState = Get-CobbleRuntimeCollectionState $Manifest 'payloadFiles' 'Delta payloadFiles'
+    $deletedFilesState = Get-CobbleRuntimeCollectionState $Manifest 'deletedFiles' 'Delta deletedFiles'
+    $deletePaths = Get-CobbleRuntimeCollectionState $Manifest 'deletePaths' 'Delta deletePaths'
+    $legacyCleanup = Get-CobbleRuntimeCollectionState $Manifest 'legacyCleanup' 'Delta legacyCleanup'
+    if ($deletePaths.Entries.Count -ne 0) {
+        throw 'Delta manifests must use exact deletedFiles entries instead of path-only deletePaths.'
+    }
     if ($null -eq $Manifest.base -or [string]$Manifest.base.version -cne [string]$BaseManifest.version -or
         [string]$Manifest.base.manifestSha256 -cne $ExpectedBaseManifestSha256 -or
         [string]$Manifest.base.manifestSha256 -cnotmatch $script:Sha256Pattern) {
@@ -274,9 +502,9 @@ function Assert-CobbleDeltaManifest {
     }
     Assert-CobbleVersionAdvance -BaseVersion ([string]$Manifest.base.version) -TargetVersion ([string]$Manifest.version)
 
-    $expected = New-CobbleDeltaPlan -CurrentFiles @($Manifest.files) -BaseFiles @($BaseManifest.files)
-    $actualPayload = ConvertTo-CobbleFileRecordSet -Entries @($Manifest.payloadFiles) -Context 'delta payloadFiles' -AllowEmpty
-    $actualDeleted = ConvertTo-CobbleFileRecordSet -Entries @($Manifest.deletedFiles) -Context 'delta deletedFiles' -AllowEmpty
+    $expected = New-CobbleDeltaPlan -CurrentFiles @($filesState.Entries) -BaseFiles @($BaseManifest.files)
+    $actualPayload = ConvertTo-CobbleFileRecordSet -Entries @($payloadFilesState.Entries) -Context 'delta payloadFiles' -AllowEmpty
+    $actualDeleted = ConvertTo-CobbleFileRecordSet -Entries @($deletedFilesState.Entries) -Context 'delta deletedFiles' -AllowEmpty
     $expectedPayload = ConvertTo-CobbleFileRecordSet -Entries @($expected.PayloadFiles) -Context 'expected delta payloadFiles' -AllowEmpty
     $expectedDeleted = ConvertTo-CobbleFileRecordSet -Entries @($expected.DeletedFiles) -Context 'expected delta deletedFiles' -AllowEmpty
 
@@ -300,19 +528,19 @@ function Assert-CobbleDeltaManifest {
     }
 
     if ($actualPayload.Entries.Count -eq 0) {
-        if ($null -ne $Manifest.payload) { throw 'A deletion-only delta must have a null payload.' }
+        if ($null -ne (Get-CobbleOptionalPropertyValue $Manifest 'payload')) { throw 'A deletion-only delta must have a null payload.' }
         if ($actualDeleted.Entries.Count -eq 0) { throw 'A delta must change or delete at least one file.' }
     }
-    elseif ($null -eq $Manifest.payload) {
+    elseif ($null -eq (Get-CobbleOptionalPropertyValue $Manifest 'payload')) {
         throw 'A delta with changed/new files must declare a payload.'
     }
     else {
-        Assert-CobblePayloadMetadata $Manifest.payload
+        Assert-CobblePayloadMetadata (Get-CobbleOptionalPropertyValue $Manifest 'payload')
     }
 
-    $fullSet = ConvertTo-CobbleFileRecordSet -Entries @($Manifest.files) -Context 'delta authoritative files'
+    $fullSet = ConvertTo-CobbleFileRecordSet -Entries @($filesState.Entries) -Context 'delta authoritative files'
     $baseSet = ConvertTo-CobbleFileRecordSet -Entries @($BaseManifest.files) -Context 'delta signed-base files'
-    Assert-CobbleLegacyCleanup -Entries @($Manifest.legacyCleanup) -ForbiddenSets @($fullSet, $baseSet) | Out-Null
+    Assert-CobbleLegacyCleanup -Entries @($legacyCleanup.Entries) -ForbiddenSets @($fullSet, $baseSet) | Out-Null
 
     return $true
 }
@@ -337,20 +565,21 @@ function New-CobbleExpectedAssetIndex {
     return [pscustomobject]@{ ByName = $expected }
 }
 
-function Assert-CobblePublishedBaseAssets {
+function Assert-CobblePublishedRequiredAssets {
     param(
         [Parameter(Mandatory)][object[]]$LocalAssets,
-        [Parameter(Mandatory)][object[]]$RemoteAssets
+        [Parameter(Mandatory)][object[]]$RemoteAssets,
+        [Parameter(Mandatory)][string[]]$RequiredNames,
+        [Parameter(Mandatory)][string]$Context
     )
 
-    $requiredNames = @('cobble-music-update.json', 'cobble-music-update.sig')
     $local = (New-CobbleExpectedAssetIndex $LocalAssets).ByName
-    if ($local.Count -ne $requiredNames.Count -or $requiredNames.Where({ -not $local.ContainsKey($_) }).Count -gt 0) {
-        throw 'Local base identity must contain exactly the manifest and detached signature assets.'
+    if ($local.Count -ne $RequiredNames.Count -or $RequiredNames.Where({ -not $local.ContainsKey($_) }).Count -gt 0) {
+        throw "$Context local identity does not contain exactly the required assets."
     }
-    foreach ($requiredName in $requiredNames) {
+    foreach ($requiredName in $RequiredNames) {
         if ($local[$requiredName].name -cne $requiredName -or $local[$requiredName].size -le 0) {
-            throw "Local base asset identity is invalid: $requiredName"
+            throw "$Context local asset identity is invalid: $requiredName"
         }
     }
 
@@ -358,18 +587,57 @@ function Assert-CobblePublishedBaseAssets {
     $matched = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($remote in $RemoteAssets) {
         $name = [string]$remote.name
-        if (-not $seenRemote.Add($name)) { throw "Published base release contains duplicate or case-colliding assets: $name" }
+        if (-not $seenRemote.Add($name)) { throw "$Context published release contains duplicate or case-colliding assets: $name" }
         if (-not $local.ContainsKey($name)) { continue }
 
         $wanted = $local[$name]
         if ($name -cne $wanted.name -or [string]$remote.state -cne 'uploaded' -or
             [int64]$remote.size -ne $wanted.size -or [string]$remote.digest -cne "sha256:$($wanted.sha256)") {
-            throw "Local base asset does not exactly match the uploaded published release asset: $name"
+            throw "$Context local asset does not exactly match the uploaded published release asset: $name"
         }
         [void]$matched.Add($name)
     }
-    $missing = @($requiredNames | Where-Object { -not $matched.Contains($_) })
-    if ($missing.Count -gt 0) { throw "Published base release is missing exact uploaded identity assets: $($missing -join ', ')" }
+    $missing = @($RequiredNames | Where-Object { -not $matched.Contains($_) })
+    if ($missing.Count -gt 0) { throw "$Context published release is missing exact uploaded identity assets: $($missing -join ', ')" }
+    return $true
+}
+
+function Assert-CobblePublishedBaseAssets {
+    param(
+        [Parameter(Mandatory)][object[]]$LocalAssets,
+        [Parameter(Mandatory)][object[]]$RemoteAssets
+    )
+
+    return Assert-CobblePublishedRequiredAssets -LocalAssets $LocalAssets -RemoteAssets $RemoteAssets `
+        -RequiredNames @('cobble-music-update.json', 'cobble-music-update.sig') -Context 'Signed base'
+}
+
+function Assert-CobblePublishedUpdaterAsset {
+    param(
+        [Parameter(Mandatory)]$LocalAsset,
+        [Parameter(Mandatory)][object[]]$RemoteAssets
+    )
+
+    return Assert-CobblePublishedRequiredAssets -LocalAssets @($LocalAsset) -RemoteAssets $RemoteAssets `
+        -RequiredNames @('CobbleMusicUpdater.exe') -Context 'Pinned updater'
+}
+
+function Test-CobblePaginationHasNextPage {
+    param(
+        [Parameter(Mandatory)][int]$Page,
+        [Parameter(Mandatory)][int]$ResultCount,
+        [int]$PageSize = 100,
+        [Parameter(Mandatory)][int]$MaximumPages,
+        [string]$Context = 'GitHub API result'
+    )
+
+    if ($Page -lt 1 -or $PageSize -lt 1 -or $MaximumPages -lt 1 -or $ResultCount -lt 0 -or $ResultCount -gt $PageSize) {
+        throw "$Context returned invalid pagination metadata."
+    }
+    if ($ResultCount -lt $PageSize) { return $false }
+    if ($Page -ge $MaximumPages) {
+        throw "$Context reached its $MaximumPages-page safety cap; refusing a truncated result."
+    }
     return $true
 }
 
@@ -460,6 +728,59 @@ function Get-CobbleRepairableStarterAssets {
     return @($repairable)
 }
 
+function Get-CobbleStarterAssetForDeletion {
+    param(
+        [Parameter(Mandatory)]$Candidate,
+        [AllowEmptyCollection()][Parameter(Mandatory)][object[]]$ExpectedAssets,
+        [AllowEmptyCollection()][Parameter(Mandatory)][object[]]$RemoteAssets
+    )
+
+    $repairable = @(Get-CobbleRepairableStarterAssets -ExpectedAssets $ExpectedAssets -RemoteAssets $RemoteAssets)
+    $matches = @($repairable | Where-Object {
+        [int64]$_.id -eq [int64]$Candidate.id -and [string]$_.name -ceq [string]$Candidate.name
+    })
+    if ($matches.Count -gt 1) { throw "Starter repair candidate is ambiguous: $($Candidate.name)" }
+    if ($matches.Count -eq 0) { return $null }
+    return $matches[0]
+}
+
+function Assert-CobbleReleaseIdentityState {
+    param(
+        [Parameter(Mandatory)]$Release,
+        [Parameter(Mandatory)][int64]$ExpectedId,
+        [Parameter(Mandatory)][string]$ExpectedTag,
+        [Parameter(Mandatory)][ValidateSet('draft', 'public')][string]$ExpectedState
+    )
+
+    if ($null -eq $Release) { throw "GitHub release identity is missing for reserved tag $ExpectedTag." }
+    foreach ($requiredProperty in @('id', 'tag_name', 'draft', 'prerelease')) {
+        if ($null -eq $Release.PSObject.Properties[$requiredProperty]) {
+            throw "GitHub release identity is missing $requiredProperty for reserved tag $ExpectedTag."
+        }
+    }
+    [int64]$actualId = 0
+    if (-not [int64]::TryParse(
+        [Convert]::ToString((Get-CobbleOptionalPropertyValue $Release 'id'), [Globalization.CultureInfo]::InvariantCulture),
+        [Globalization.NumberStyles]::None,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$actualId) -or $actualId -ne $ExpectedId -or
+        [string](Get-CobbleOptionalPropertyValue $Release 'tag_name') -cne $ExpectedTag -or
+        [bool](Get-CobbleOptionalPropertyValue $Release 'prerelease')) {
+        throw "GitHub release identity/state changed for reserved tag $ExpectedTag."
+    }
+    $isDraft = [bool](Get-CobbleOptionalPropertyValue $Release 'draft')
+    if (($ExpectedState -ceq 'draft' -and -not $isDraft) -or ($ExpectedState -ceq 'public' -and $isDraft)) {
+        throw "GitHub release is not in expected $ExpectedState state: $ExpectedTag"
+    }
+    if ($ExpectedState -ceq 'public') {
+        $publishedAt = $Release.PSObject.Properties['published_at']
+        if ($null -eq $publishedAt -or [string]::IsNullOrWhiteSpace([string]$publishedAt.Value)) {
+            throw "GitHub release has no public publication timestamp: $ExpectedTag"
+        }
+    }
+    return $true
+}
+
 function Assert-CobbleRemoteAssetInventory {
     param(
         [AllowEmptyCollection()]
@@ -494,14 +815,24 @@ function Assert-CobbleRemoteAssetInventory {
 
 Export-ModuleMember -Function @(
     'Assert-CobbleManagedPath',
+    'Assert-CobblePrivateKeyIsolation',
+    'Open-CobbleLockedFileSnapshot',
+    'Assert-CobbleLockedFileSnapshot',
+    'Close-CobbleLockedFileSnapshot',
     'ConvertTo-CobbleFileRecordSet',
+    'Assert-CobbleSupportedMinimumUpdaterVersion',
     'Assert-CobbleVersionAdvance',
     'Assert-CobbleBaseManifest',
     'Assert-CobbleV1Manifest',
     'New-CobbleDeltaPlan',
     'Assert-CobbleDeltaManifest',
     'Assert-CobblePublishedBaseAssets',
+    'Assert-CobblePublishedUpdaterAsset',
+    'Assert-CobbleStagedPayloadParts',
     'Assert-CobblePayloadZipInventory',
+    'Test-CobblePaginationHasNextPage',
     'Get-CobbleRepairableStarterAssets',
+    'Get-CobbleStarterAssetForDeletion',
+    'Assert-CobbleReleaseIdentityState',
     'Assert-CobbleRemoteAssetInventory'
 )

@@ -119,14 +119,22 @@ The signature test uses a committed public fixture and does not require the
 private key. A maintainer can add `-PrivateKey <offline-key-path>` for an
 optional live signing round trip.
 
-The reproducibility test exports the committed updater source into two clean
-directories with different absolute paths, performs a cold build in each and
-a repeated warm build in one, then compares all three EXEs byte-for-byte and
-by SHA-256. Release builds map their physical source root to a fixed virtual
-path, omit debug/PDB and Source Link data, ignore Git revision metadata, and
-use the exact SDK selected by `global.json`. `.gitattributes` keeps text build
-inputs at LF in every clean checkout while explicitly treating binaries as
-binary.
+The reproducibility test exports one exact commit into two clean directories
+with different absolute paths, performs a cold build in each and a repeated
+warm build in one, then compares all three EXEs byte-for-byte and by SHA-256.
+When the publisher runs it, the independently built EXEs must also be
+byte-identical to the actual staged release artifact. Release builds map their
+physical source root to a fixed virtual path, omit debug/PDB and Source Link
+data, ignore Git revision metadata, and use the exact SDK selected by
+`global.json`. The builder supplies the repository's explicit `NuGet.Config`,
+uses locked versions and content hashes, disables the shared NuGet HTTP cache,
+and extracts packages only under that exact source root's `updater\packages`
+directory. A repeated build may reuse only its own root's cache; a distinct
+source root gets a distinct cache regardless of `NUGET_PACKAGES`. The builder
+also disables inherited Directory.Build/Central Package imports and rejects
+implicit MSBuild inputs found anywhere above the project.
+`.gitattributes` keeps text build inputs at LF in every clean checkout while
+explicitly treating binaries as binary.
 
 The builder emits:
 
@@ -142,11 +150,21 @@ to the installer.
 Updater binaries use their own `updater-v*` releases and are completely
 separate from signed `modpack-v*` payload releases. The updater publisher
 derives the release version from the single `BuildInfo.Version` constant,
-requires the project version to match it, builds self-contained `win-x64`,
-computes the EXE's SHA-256, and tests a proposed bootstrap containing that
-exact version/hash. The publisher delegates to the same reproducible builder
-used by local builds, avoiding flag drift and checksum cycles; GitHub upload
-still requires every input to be committed.
+requires the project version to match it, and accepts only canonical
+three-part versions such as `1.2.0` (no leading zeroes or fourth component).
+A new stable updater release must be strictly newer than every existing stable
+`updater-v*` release; exact reruns of their own draft or published release stay
+idempotent, while downgrades and alternate spellings of the same numeric
+version are rejected.
+
+The publisher resolves Git only through its own repository root, captures one
+clean commit, exports the complete tree without reading live working-tree
+bytes, and uses the builder, source, tests, bootstrap, SDK pin, package lock,
+and NuGet configuration from that export. It builds self-contained `win-x64`,
+computes the EXE's SHA-256, tests a proposed bootstrap containing that exact
+version/hash, and proves that the staged EXE is byte-identical to independent
+builds of the same commit. The eventual Git tag and release target that exact
+commit.
 
 First stage locally. This runs every `tests/Test-*.ps1` plus every updater
 `*.Tests.csproj`, atomically refreshes the tracked bootstrap only after they
@@ -160,9 +178,12 @@ the release.
 ```
 
 Use `-DryRun` to build and test the proposed release without changing either
-the tracked bootstrap or GitHub. After a normal staging run, review and commit
-the updater source, publisher, tests, documentation, and refreshed bootstrap.
-The GitHub modes deliberately refuse dirty release inputs.
+the tracked bootstrap or GitHub. Release inputs must already be committed even
+for a dry run because the build is intentionally sourced from an exact commit,
+not the working tree. After a normal staging run, review and commit the
+refreshed bootstrap and local dist artifact. GitHub modes re-check that the
+same source commit and bootstrap remain bound before any remote mutation.
+In particular, dry-run never creates or changes a Git ref.
 
 Create or resume the release as a persistent draft:
 
@@ -170,17 +191,38 @@ Create or resume the release as a persistent draft:
 .\tools\Publish-CobbleMusicUpdater.ps1 -UploadDraft
 ```
 
-Rerunning that command retains already verified assets, replaces only an
-incomplete or mismatched asset with one of the two exact expected names, and
-leaves the validated release as a draft. Unexpected assets are never deleted
-automatically and block publication. The exact remote inventory is:
+Before creating or uploading that draft, the publisher reserves the exact
+lightweight `refs/tags/updater-v<version>` ref at the captured source commit.
+If another process races to create it, the run continues only when a re-fetch
+shows the same lightweight ref and commit; an annotated tag or foreign target
+blocks the release. A failed upload may therefore leave this safe tag reserved
+alongside the persistent draft. Every upload boundary and the publication
+PATCH revalidate it, including once immediately after publication.
+
+Rerunning that command retains already verified assets, uploads only missing
+assets, and leaves the validated release as a draft. An incomplete `starter`
+asset, uploaded size/digest mismatch, unexpected or case-colliding name,
+duplicate, or unknown state blocks the run; ordinary resume never deletes a
+remote asset. The exact remote inventory is:
 
 - `CobbleMusicUpdater.exe`
 - `Bootstrap-CobbleMusicUpdater.ps1`
 
 For each asset, GitHub must report `uploaded`, the exact local byte length,
-and the exact SHA-256 digest. Only after reviewing that draft, publish it with
-both explicit gates:
+and the exact SHA-256 digest. If an interrupted GitHub CLI process has
+definitely stopped but left an expected-name asset in GitHub's `starter`
+state, resume that existing draft with the additional recovery gate:
+
+```powershell
+.\tools\Publish-CobbleMusicUpdater.ps1 -UploadDraft -RepairStaleUploads
+```
+
+That mode validates the complete draft, exact tag target, and every asset
+before each deletion. It deletes only an expected-name asset that is still
+`starter`; it never deletes an uploaded mismatch or unknown state. Never use
+the repair switch while another uploader may still be active.
+
+Only after reviewing the exact draft, publish it with both explicit gates:
 
 ```powershell
 .\tools\Publish-CobbleMusicUpdater.ps1 -Publish -ConfirmPublish
@@ -261,6 +303,15 @@ mode so accidentally omitting a base version cannot upload the entire pack.
 Release and base versions use exactly `major.minor.patch` with no leading
 zeroes (for example, `1.0.5`); four-component variants are rejected.
 
+The modpack publisher never builds or loads the updater from the current C#
+working tree. Signing and verification use only
+`updater\dist\win-x64\CobbleMusicUpdater.exe`, whose version, ProductVersion,
+and SHA-256 must exactly match the committed `updater-v1.2.0` bootstrap pin.
+The EXE is held read-locked from checksum verification through each signer or
+verifier process. Keep the private signing key outside the Minecraft source,
+every managed source root, and `release-output`; the publisher rejects those
+locations before it inventories a single source file.
+
 The already-published `1.0.4` release is the full schema-v1 baseline. A new
 baseline is exceptional and must be requested explicitly:
 
@@ -290,7 +341,10 @@ the currently published, non-draft `modpack-v1.0.4` release through GitHub's
 API and requires the local manifest and signature raw sizes/SHA-256 hashes to
 match their exact `uploaded` release assets. A locally signed but unpublished
 or replaced base is rejected so the resulting delta cannot reference an
-unreachable chain.
+unreachable chain. Both base files are read-locked before this comparison; the
+same captured manifest bytes are signature-verified, parsed, and hashed into
+the delta's `base.manifestSha256`, and that exact manifest/signature hash pair
+is the pair revalidated at the final publication boundary.
 
 A v2 manifest still carries the complete authoritative `files` state. Its
 `payloadFiles` contains only changed/new files, while `deletedFiles` contains
@@ -298,6 +352,12 @@ the exact old path, size, and SHA-256 from the signed base. A deletion-only
 release is valid and has no ZIP or part assets. Case/Unicode-colliding paths,
 unsafe updater paths, stale or equal versions, incomplete differences, and
 case-only renames are rejected before signing.
+The staging/resume validators mirror updater 1.2's schema rules: a v1 baseline
+must declare a canonical supported `minimumUpdaterVersion` and cannot carry
+delta-only fields, while v2 cannot use path-only `deletePaths`. Truly absent
+legacy collection properties receive the runtime model's empty-list defaults;
+an explicit JSON `null` for any required collection is different and is
+rejected exactly as the distributed updater rejects it.
 
 Review `release-output\1.0.5\cobble-music-update.json`, its signature, and all
 generated part hashes. Staging makes no GitHub change. Payload parts default to
@@ -307,6 +367,13 @@ Before hashing or splitting that ZIP, the publisher streams every archive entry
 and requires its canonical path, uncompressed size, and SHA-256 to exactly
 match `payloadFiles`, with no duplicate, extra, or missing entries. This catches
 a source file that changes after the initial inventory but before archiving.
+Resume also streams the retained part files in their signed order, validating
+each part and the concatenated payload's exact signed size/SHA-256 without
+reconstructing or retaining another full ZIP.
+The manifest and detached signature are opened as read-locked byte snapshots
+before signature verification. Those same exact bytes are parsed, hashed for
+the expected asset inventory, and held against replacement through upload;
+their signature and hashes are checked again at every remote mutation boundary.
 
 After review, publish that **exact existing staging**:
 
@@ -321,6 +388,21 @@ signed staging and uploads only missing assets. Unexpected, incomplete, or
 mismatched assets stop the run; the release becomes public only after the
 remote inventory matches exactly. `-Publish -ConfirmDistributionRights` may
 instead stage and start that same draft workflow in one run.
+Immediately before `draft=false`, the tool re-fetches the target release by
+its original API ID and revalidates that same ID, reserved tag, draft and
+prerelease state, and complete exact asset inventory. It then postvalidates the
+same ID/tag in public state with the same inventory; a tag that was deleted,
+recreated, retargeted, or otherwise changed is never patched through stale
+state.
+
+Before any GitHub mutation, the publisher additionally requires the local
+pinned updater EXE to match the exact `uploaded` size and GitHub SHA-256 digest
+on the currently published, non-prerelease `updater-v1.2.0` release. It checks
+that dependency again immediately before making the modpack draft public. For
+a v2 delta it also re-fetches the stable base release at that final boundary
+and requires both base manifest and signature to match the identity captured
+during staging/resume. A replaced, unpublished, or incomplete dependency
+leaves the delta draft private.
 
 If an interrupted GitHub CLI process has definitely stopped but left an asset
 in GitHub's incomplete `starter` state, recovery requires an additional,
@@ -331,10 +413,12 @@ explicit switch:
   -ResumePublish -RepairStaleUploads -ConfirmDistributionRights
 ```
 
-Before deleting anything, that mode validates the complete draft. It deletes
-only exact expected-name assets whose API state is still `starter`, then
-uploads those now-missing parts normally. It never deletes an `uploaded`
-asset; any uploaded size/digest mismatch, unexpected or case-colliding name,
+Before deleting anything, that mode validates the complete draft. Immediately
+before every deletion it re-fetches the exact release by ID and revalidates its
+tag, draft/prerelease state, and complete asset inventory. It deletes only the
+same exact expected-name asset while its API state is still `starter`; if that
+asset finished uploading or was replaced meanwhile, the old candidate is
+skipped. Any uploaded size/digest mismatch, unexpected or case-colliding name,
 duplicate, unknown state, or missing asset ID blocks the entire repair. Never
 use the switch while another `gh` upload process is active.
 

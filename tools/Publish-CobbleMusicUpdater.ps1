@@ -23,18 +23,29 @@ param(
     [switch]$DryRun,
     [switch]$UploadDraft,
     [switch]$Publish,
-    [switch]$ConfirmPublish
+    [switch]$ConfirmPublish,
+
+    # Recovery is intentionally separate from ordinary resume. It is valid
+    # only for an already-existing draft after the operator has confirmed no
+    # GitHub CLI upload is still active.
+    [switch]$RepairStaleUploads,
+
+    # Read-only diagnostic used by the safety suite to prove that a publisher
+    # invoked by full path never binds Git operations to the caller's CWD.
+    [switch]$VerifySourceBinding
 )
 
 $ErrorActionPreference = 'Stop'
-$Root = Split-Path -Parent $PSScriptRoot
+$Root = [IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot)).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
 $BuildInfoPath = Join-Path $Root 'updater\CobbleMusicUpdater\BuildInfo.cs'
 $ProjectPath = Join-Path $Root 'updater\CobbleMusicUpdater\CobbleMusicUpdater.csproj'
 $BuildScript = Join-Path $Root 'tools\Build-CobbleMusicUpdater.ps1'
 $GlobalJsonPath = Join-Path $Root 'global.json'
+$NuGetConfigPath = Join-Path $Root 'NuGet.Config'
 $BootstrapPath = Join-Path $Root 'bootstrap\Bootstrap-CobbleMusicUpdater.ps1'
 $DistExe = Join-Path $Root 'updater\dist\win-x64\CobbleMusicUpdater.exe'
 $PipelineTest = Join-Path $Root 'tests\Test-UpdaterReleasePipeline.ps1'
+$ReproducibilityTest = Join-Path $Root 'tests\Test-UpdaterBuildReproducibility.ps1'
 $TemporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('cobble-music-updater-release-' + [Guid]::NewGuid().ToString('N'))
 $GitHubMutation = $UploadDraft -or $Publish
 
@@ -67,11 +78,23 @@ function Copy-Atomically([string]$Source, [string]$Destination) {
     }
 }
 
-function Get-BuildVersion {
-    if (-not (Test-Path -LiteralPath $BuildInfoPath -PathType Leaf)) { throw "BuildInfo.cs is missing: $BuildInfoPath" }
-    if (-not (Test-Path -LiteralPath $ProjectPath -PathType Leaf)) { throw "Updater project is missing: $ProjectPath" }
+function ConvertTo-CanonicalUpdaterVersion([string]$Version, [string]$Context) {
+    if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        throw "$Context must be a canonical three-part numeric version with no leading zeroes: $Version"
+    }
+    try { $parsed = [Version]::new($Version) }
+    catch { throw "$Context is outside the supported numeric version range: $Version" }
+    if ($parsed.ToString(3) -cne $Version) {
+        throw "$Context is not canonical: $Version"
+    }
+    return $parsed
+}
 
-    $buildInfo = [IO.File]::ReadAllText($BuildInfoPath)
+function Get-BuildVersion([string]$SourceBuildInfoPath, [string]$SourceProjectPath) {
+    if (-not (Test-Path -LiteralPath $SourceBuildInfoPath -PathType Leaf)) { throw "BuildInfo.cs is missing: $SourceBuildInfoPath" }
+    if (-not (Test-Path -LiteralPath $SourceProjectPath -PathType Leaf)) { throw "Updater project is missing: $SourceProjectPath" }
+
+    $buildInfo = [IO.File]::ReadAllText($SourceBuildInfoPath)
     $versionMatches = [regex]::Matches(
         $buildInfo,
         '(?m)^\s*public\s+const\s+string\s+Version\s*=\s*"(?<version>[^"]+)"\s*;\s*$')
@@ -79,11 +102,9 @@ function Get-BuildVersion {
         throw "Expected exactly one BuildInfo.Version constant, found $($versionMatches.Count)."
     }
     $version = $versionMatches[0].Groups['version'].Value
-    if ($version -notmatch '^\d+\.\d+\.\d+$') {
-        throw "BuildInfo.Version must be a three-part numeric version for a stable updater release: $version"
-    }
+    $null = ConvertTo-CanonicalUpdaterVersion $version 'BuildInfo.Version'
 
-    [xml]$project = [IO.File]::ReadAllText($ProjectPath)
+    [xml]$project = [IO.File]::ReadAllText($SourceProjectPath)
     $projectVersionNodes = @($project.SelectNodes('/Project/PropertyGroup/Version'))
     if ($projectVersionNodes.Count -ne 1) {
         throw "Expected exactly one <Version> in the updater project, found $($projectVersionNodes.Count)."
@@ -117,9 +138,9 @@ function Set-SingleQuotedAssignment([string]$Text, [string]$Name, [string]$Value
         1)
 }
 
-function Get-ProposedBootstrap([string]$Version, [string]$UpdaterSha256) {
-    if (-not (Test-Path -LiteralPath $BootstrapPath -PathType Leaf)) { throw "Bootstrap script is missing: $BootstrapPath" }
-    $text = [IO.File]::ReadAllText($BootstrapPath)
+function Get-ProposedBootstrap([string]$Version, [string]$UpdaterSha256, [string]$SourceBootstrapPath) {
+    if (-not (Test-Path -LiteralPath $SourceBootstrapPath -PathType Leaf)) { throw "Bootstrap script is missing: $SourceBootstrapPath" }
+    $text = [IO.File]::ReadAllText($SourceBootstrapPath)
     $bootstrapRepository = Get-SingleQuotedAssignment $text 'Repository'
     if ($bootstrapRepository -cne $Repository) {
         throw "Bootstrap repository ($bootstrapRepository) does not match requested repository ($Repository)."
@@ -154,6 +175,57 @@ function Invoke-Checked([string]$Description, [scriptblock]$Action) {
     if ($LASTEXITCODE -ne 0) { throw "$Description failed with exit code $LASTEXITCODE." }
 }
 
+function Invoke-RootGit([string[]]$Arguments) {
+    $output = @(& git -C $Root @Arguments 2>&1)
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "git -C $Root $($Arguments -join ' ') failed with exit code ${exitCode}: $([string]::Join([Environment]::NewLine, $output))"
+    }
+    return @($output)
+}
+
+function Get-BoundSourceCommit {
+    $topLevelOutput = @(Invoke-RootGit @('rev-parse', '--show-toplevel'))
+    if ($topLevelOutput.Count -ne 1) { throw 'Git did not return exactly one repository root.' }
+    $topLevel = [IO.Path]::GetFullPath(([string]$topLevelOutput[0]).Trim()).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    if (-not $topLevel.Equals($Root, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Publisher source root $Root does not exactly match its Git repository root $topLevel."
+    }
+
+    $commitOutput = @(Invoke-RootGit @('rev-parse', '--verify', 'HEAD^{commit}'))
+    if ($commitOutput.Count -ne 1) { throw 'Git did not return exactly one source commit.' }
+    $commit = ([string]$commitOutput[0]).Trim().ToLowerInvariant()
+    if ($commit -notmatch '^[0-9a-f]{40,64}$') { throw "Git returned an invalid source commit: $commit" }
+    return $commit
+}
+
+function Assert-NoArchiveTransformAttributes([string]$Commit) {
+    $treePaths = @(Invoke-RootGit @('ls-tree', '-r', '--name-only', $Commit, '--'))
+    $attributePaths = @($treePaths | Where-Object { [IO.Path]::GetFileName([string]$_) -ceq '.gitattributes' })
+    foreach ($attributePath in $attributePaths) {
+        $attributeLines = @(Invoke-RootGit @('show', "${Commit}:$attributePath"))
+        foreach ($line in $attributeLines) {
+            $trimmed = ([string]$line).Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed) -or $trimmed.StartsWith('#', [StringComparison]::Ordinal)) { continue }
+            if ($trimmed -match '(?i)(^|\s)export-(ignore|subst)(\s|$)') {
+                throw "Exact source export forbids export-ignore/export-subst attributes: $attributePath"
+            }
+        }
+    }
+}
+
+function Export-CommitTree([string]$Commit, [string]$Destination) {
+    if ($Commit -notmatch '^[0-9a-f]{40,64}$') { throw "Refusing to export invalid source commit: $Commit" }
+    if (Test-Path -LiteralPath $Destination) { throw "Commit export destination already exists: $Destination" }
+    Assert-NoArchiveTransformAttributes $Commit
+    $archivePath = Join-Path $TemporaryRoot ('exact-source-' + [Guid]::NewGuid().ToString('N') + '.zip')
+    Invoke-RootGit @('archive', '--format=zip', "--output=$archivePath", $Commit) | Out-Null
+    if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf)) { throw 'Git did not create the exact source archive.' }
+    New-Item -ItemType Directory -Path $Destination | Out-Null
+    Expand-Archive -LiteralPath $archivePath -DestinationPath $Destination
+    Remove-Item -LiteralPath $archivePath -Force
+}
+
 function Invoke-GhJson([string[]]$Arguments) {
     $output = @(& gh @Arguments 2>&1)
     $exitCode = $LASTEXITCODE
@@ -171,19 +243,57 @@ function Invoke-GhCommand([string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "gh $($Arguments -join ' ') failed with exit code $LASTEXITCODE." }
 }
 
-function Get-ReleasesByTag([string]$Tag) {
-    $matches = [Collections.Generic.List[object]]::new()
+function Get-AllReleases {
+    $releases = [Collections.Generic.List[object]]::new()
     $page = 1
     while ($true) {
         $batch = @(Invoke-GhJson @('api', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$Repository/releases?per_page=100&page=$page"))
-        foreach ($release in $batch) {
-            if ([string]$release.tag_name -ceq $Tag) { $matches.Add($release) }
-        }
+        foreach ($release in $batch) { $releases.Add($release) }
         if ($batch.Count -lt 100) { break }
         $page++
         if ($page -gt 100) { throw 'Refusing to scan more than 10,000 GitHub Releases.' }
     }
-    return @($matches)
+    return @($releases)
+}
+
+function ConvertFrom-UpdaterReleaseTag([string]$Tag) {
+    if (-not $Tag.StartsWith('updater-v', [StringComparison]::Ordinal)) { return $null }
+    $numeric = $Tag.Substring('updater-v'.Length)
+    if ($numeric -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+        throw "Published stable updater release has an unorderable tag: $Tag"
+    }
+    $parsed = $null
+    if (-not [Version]::TryParse($numeric, [ref]$parsed) -or $parsed.Build -lt 0 -or $parsed.Revision -ge 0) {
+        throw "Published stable updater release has an unsupported numeric tag: $Tag"
+    }
+    return $parsed
+}
+
+function Assert-UpdaterVersionReservation([object[]]$Releases, [string]$Version, [string]$Tag) {
+    $candidate = ConvertTo-CanonicalUpdaterVersion $Version 'Updater release version'
+    $exact = @($Releases | Where-Object { [string]$_.tag_name -ceq $Tag })
+    if ($exact.Count -gt 1) { throw "More than one GitHub Release uses exact tag $Tag." }
+    if ($exact.Count -eq 1 -and [bool]$exact[0].prerelease) {
+        throw "Reserved stable updater tag $Tag is unexpectedly marked prerelease."
+    }
+
+    # Re-checking an already-published exact release is idempotent and cannot
+    # create a downgrade. Inventory and tag-target validation happen later.
+    if ($exact.Count -eq 1 -and -not [bool]$exact[0].draft) { return }
+
+    foreach ($release in @($Releases)) {
+        if ([bool]$release.draft -or [bool]$release.prerelease) { continue }
+        $remoteTag = [string]$release.tag_name
+        if (-not $remoteTag.StartsWith('updater-v', [StringComparison]::Ordinal)) { continue }
+        $remoteVersion = ConvertFrom-UpdaterReleaseTag $remoteTag
+        $comparison = $candidate.CompareTo($remoteVersion)
+        if ($comparison -eq 0 -and $remoteTag -cne $Tag) {
+            throw "Updater version $Version is a semantic duplicate of existing stable release $remoteTag."
+        }
+        if ($comparison -le 0) {
+            throw "Fresh updater version $Version must be strictly newer than existing stable release $remoteTag."
+        }
+    }
 }
 
 function Get-Release([int64]$ReleaseId) {
@@ -238,10 +348,63 @@ function Assert-ExactRemoteInventory($Release, [hashtable]$ExpectedAssets) {
     }
 }
 
+function Get-ValidatedDraftAssetPlan([hashtable]$ExpectedAssets, [object[]]$RemoteAssets, [switch]$AllowStarter) {
+    $expectedNames = @($ExpectedAssets.Keys)
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $starterAssets = [Collections.Generic.List[object]]::new()
+
+    foreach ($remote in @($RemoteAssets)) {
+        $name = [string]$remote.name
+        if ([string]::IsNullOrWhiteSpace($name)) { throw 'GitHub draft contains an asset without a usable name.' }
+        if (-not $seen.Add($name)) { throw "GitHub draft contains duplicate or case-colliding asset names: $name" }
+
+        $exactNames = @($expectedNames | Where-Object { $_ -ceq $name })
+        if ($exactNames.Count -ne 1) {
+            $caseCollision = @($expectedNames | Where-Object { $_ -ieq $name })
+            if ($caseCollision.Count -gt 0) { throw "GitHub asset name casing does not exactly match expected staging: $name" }
+            throw "GitHub draft contains an unexpected asset: $name"
+        }
+
+        $expected = $ExpectedAssets[$exactNames[0]]
+        $state = [string]$remote.state
+        if ($state -ceq 'uploaded') {
+            if (-not (Test-RemoteAsset $remote $expected)) {
+                $actualDigest = Get-NormalizedAssetDigest $remote
+                if ($null -eq $actualDigest) { $actualDigest = '<missing>' }
+                throw "GitHub uploaded asset does not match local staging: $name (size=$($remote.size), sha256=$actualDigest)."
+            }
+            continue
+        }
+        if ($state -cne 'starter') {
+            throw "GitHub asset has an unsupported state and cannot be repaired automatically: $name ($state)"
+        }
+        if (-not $AllowStarter) {
+            throw "GitHub draft contains an unfinished starter asset for $name. No asset was deleted; after every uploader has stopped, rerun with -RepairStaleUploads."
+        }
+
+        [int64]$assetId = 0
+        $idProperty = $remote.PSObject.Properties['id']
+        $idValue = if ($null -eq $idProperty) { $null } else { $idProperty.Value }
+        if ($null -eq $idValue -or -not [int64]::TryParse(
+            [Convert]::ToString($idValue, [Globalization.CultureInfo]::InvariantCulture),
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$assetId) -or $assetId -le 0) {
+            throw "GitHub starter asset has no safe API identifier: $name"
+        }
+        $starterAssets.Add([pscustomobject]@{ Id = $assetId; Name = $name })
+    }
+
+    $missing = @($expectedNames | Where-Object { -not $seen.Contains($_) } | Sort-Object)
+    return [pscustomobject]@{ MissingNames = $missing; StarterAssets = @($starterAssets) }
+}
+
 function Assert-CleanReleaseInputs {
     $paths = @(
         '.gitattributes',
+        '.gitignore',
         'global.json',
+        'NuGet.Config',
         'updater/CobbleMusicUpdater',
         'updater/CobbleMusicUpdater.Tests',
         'tools/Build-CobbleMusicUpdater.ps1',
@@ -251,43 +414,104 @@ function Assert-CleanReleaseInputs {
         'docs/UPDATER.md'
     )
     $arguments = @('status', '--porcelain=v1', '--') + $paths
-    $dirty = @(& git @arguments)
-    if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect Git release inputs.' }
+    $dirty = @(Invoke-RootGit $arguments)
     if ($dirty.Count -gt 0) {
-        throw "GitHub upload is blocked because updater release inputs are not committed:`n$($dirty -join [Environment]::NewLine)`nRun without -UploadDraft first, review and commit the result, then rerun."
+        throw "Updater release is blocked because source-binding inputs are not committed:`n$($dirty -join [Environment]::NewLine)`nCommit the reviewed inputs, then rerun so the build can use one exact commit export."
     }
 }
 
-function Assert-TagTargetIfPresent([string]$Tag, [string]$ExpectedCommit) {
+function Assert-SourceStillBound([string]$ExpectedCommit) {
+    Assert-CleanReleaseInputs
+    $current = Get-BoundSourceCommit
+    if ($current -cne $ExpectedCommit) {
+        throw "Repository HEAD changed during release validation: expected $ExpectedCommit, now $current."
+    }
+}
+
+function Get-ExactUpdaterTagRef([string]$Tag) {
     $matching = @(Invoke-GhJson @('api', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$Repository/git/matching-refs/tags/$Tag"))
     $exact = @($matching | Where-Object { [string]$_.ref -ceq "refs/tags/$Tag" })
     if ($exact.Count -gt 1) { throw "GitHub returned duplicate exact Git refs for $Tag." }
-    if ($exact.Count -eq 0) { return }
+    if ($exact.Count -eq 0) { return $null }
+    return $exact[0]
+}
 
-    $objectType = [string]$exact[0].object.type
-    $objectSha = [string]$exact[0].object.sha
-    for ($depth = 0; $objectType -ceq 'tag' -and $depth -lt 5; $depth++) {
-        $tagObject = Invoke-GhJson @('api', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$Repository/git/tags/$objectSha")
-        $objectType = [string]$tagObject.object.type
-        $objectSha = [string]$tagObject.object.sha
+function Assert-ExactUpdaterTagRef($TagRef, [string]$Tag, [string]$ExpectedCommit) {
+    if ($null -eq $TagRef) { throw "Reserved updater Git ref is missing: refs/tags/$Tag" }
+    if ([string]$TagRef.ref -cne "refs/tags/$Tag") { throw "GitHub returned the wrong updater Git ref for $Tag." }
+    if ([string]$TagRef.object.type -cne 'commit' -or [string]$TagRef.object.sha -cne $ExpectedCommit) {
+        throw "Reserved updater tag $Tag is not a lightweight ref at exact source commit $ExpectedCommit."
     }
-    if ($objectType -cne 'commit' -or $objectSha -cne $ExpectedCommit) {
-        throw "Existing Git tag $Tag does not resolve to the committed updater source $ExpectedCommit."
+    return $TagRef
+}
+
+function Assert-ReservedUpdaterTagRef([string]$Tag, [string]$ExpectedCommit) {
+    $exact = Get-ExactUpdaterTagRef $Tag
+    $null = Assert-ExactUpdaterTagRef $exact $Tag $ExpectedCommit
+}
+
+function Reserve-UpdaterTagRef([string]$Tag, [string]$Commit) {
+    $existing = Get-ExactUpdaterTagRef $Tag
+    if ($null -ne $existing) {
+        $null = Assert-ExactUpdaterTagRef $existing $Tag $Commit
+        Write-Host "Retaining reserved lightweight updater tag $Tag at $Commit."
+        return
+    }
+
+    $creationFailure = $null
+    try {
+        $null = Invoke-GhJson @(
+            'api', '--method', 'POST',
+            '-H', 'Accept: application/vnd.github+json',
+            '-H', 'X-GitHub-Api-Version: 2022-11-28',
+            "/repos/$Repository/git/refs",
+            '-f', "ref=refs/tags/$Tag",
+            '-f', "sha=$Commit"
+        )
+    }
+    catch { $creationFailure = $_.Exception }
+
+    # Always re-fetch rather than trusting the create response. A concurrent
+    # creator is idempotent only when the exact lightweight ref now points at
+    # the same captured commit; a foreign target remains a hard failure.
+    try {
+        $reserved = Get-ExactUpdaterTagRef $Tag
+        $null = Assert-ExactUpdaterTagRef $reserved $Tag $Commit
+    }
+    catch {
+        if ($null -ne $creationFailure) {
+            throw "Updater tag reservation failed and the raced ref was not identical. Create error: $($creationFailure.Message) Re-fetch error: $($_.Exception.Message)"
+        }
+        throw
+    }
+    if ($null -ne $creationFailure) {
+        Write-Host "A concurrent creator reserved the identical updater tag $Tag at $Commit; continuing idempotently."
+    }
+    else {
+        Write-Host "Reserved lightweight updater tag $Tag at exact source commit $Commit."
     }
 }
 
-function New-OrResumeDraft([string]$Tag, [string]$Version, [string]$Commit, [string]$NotesPath) {
-    $tagMatches = @(Get-ReleasesByTag $Tag)
+function New-OrResumeDraft([string]$Tag, [string]$Version, [string]$Commit, [string]$NotesPath, [object[]]$KnownReleases) {
+    $tagMatches = @($KnownReleases | Where-Object { [string]$_.tag_name -ceq $Tag })
     if ($tagMatches.Count -gt 1) { throw "More than one GitHub Release uses exact tag $Tag." }
     if ($tagMatches.Count -eq 1) {
         $existing = Get-Release ([int64]$tagMatches[0].id)
         if ([string]$existing.tag_name -cne $Tag) { throw 'GitHub returned the wrong release tag.' }
-        if (-not [bool]$existing.draft) { return $existing }
+        if ([bool]$existing.prerelease) { throw "Reserved stable updater tag $Tag is unexpectedly marked prerelease." }
+        if (-not [bool]$existing.draft) {
+            if ($RepairStaleUploads) { throw '-RepairStaleUploads is valid only when resuming an existing persistent draft.' }
+            return $existing
+        }
         if ([string]$existing.target_commitish -cne $Commit) {
             throw "Existing draft $Tag targets $($existing.target_commitish), not current committed updater source $Commit."
         }
         Write-Host "Resuming persistent draft $Tag (release id $($existing.id))."
         return $existing
+    }
+
+    if ($RepairStaleUploads) {
+        throw '-RepairStaleUploads is valid only when resuming an existing persistent draft; no exact draft exists.'
     }
 
     $body = [IO.File]::ReadAllText($NotesPath)
@@ -310,44 +534,70 @@ function New-OrResumeDraft([string]$Tag, [string]$Version, [string]$Commit, [str
     return $created
 }
 
-function Sync-DraftAssets($Release, [hashtable]$ExpectedAssets, [string]$Tag) {
+function Assert-DraftReleaseIdentity($Release, [int64]$ExpectedReleaseId, [string]$Tag, [string]$Commit) {
+    if ([int64]$Release.id -ne $ExpectedReleaseId) { throw 'GitHub returned the wrong updater release identifier.' }
+    if ([string]$Release.tag_name -cne $Tag) { throw 'GitHub returned the wrong updater release tag.' }
+    if ([string]$Release.target_commitish -cne $Commit) {
+        throw "Updater draft $Tag no longer targets exact source commit $Commit."
+    }
+}
+
+function Sync-DraftAssets($Release, [hashtable]$ExpectedAssets, [string]$Tag, [string]$Commit) {
+    $releaseId = [int64]$Release.id
+    Assert-ReservedUpdaterTagRef $Tag $Commit
+    $Release = Get-Release $releaseId
+    Assert-DraftReleaseIdentity $Release $releaseId $Tag $Commit
     if (-not [bool]$Release.draft) {
         Assert-ExactRemoteInventory $Release $ExpectedAssets
         Write-Host "$Tag is already published with the exact expected assets."
         return $Release
     }
 
-    $unexpected = @($Release.assets | Where-Object { -not $ExpectedAssets.ContainsKey([string]$_.name) })
-    if ($unexpected.Count -gt 0) {
-        throw "Draft contains unexpected assets; none were deleted: $([string]::Join(', ', @($unexpected.name)))"
+    if ($RepairStaleUploads) {
+        # Validate the complete draft and exact tag target before every
+        # deletion. Only an expected-name asset that is still in GitHub's
+        # unfinished `starter` state is ever repairable; an uploaded mismatch,
+        # unknown state, duplicate/case collision, or unexpected asset blocks
+        # every deletion.
+        Assert-ReservedUpdaterTagRef $Tag $Commit
+        $repairPlan = Get-ValidatedDraftAssetPlan $ExpectedAssets @($Release.assets) -AllowStarter
+        foreach ($approvedStarter in @($repairPlan.StarterAssets)) {
+            $current = Get-Release $releaseId
+            Assert-DraftReleaseIdentity $current $releaseId $Tag $Commit
+            if (-not [bool]$current.draft) { throw 'Refusing to repair an asset on a published release.' }
+            Assert-ReservedUpdaterTagRef $Tag $Commit
+            $currentPlan = Get-ValidatedDraftAssetPlan $ExpectedAssets @($current.assets) -AllowStarter
+            $stillStarter = @($currentPlan.StarterAssets | Where-Object {
+                [int64]$_.Id -eq [int64]$approvedStarter.Id -and [string]$_.Name -ceq [string]$approvedStarter.Name
+            })
+            if ($stillStarter.Count -eq 0) {
+                Write-Host "Starter asset changed state before repair; retaining current validated state: $($approvedStarter.Name)"
+                continue
+            }
+            if ($stillStarter.Count -ne 1) { throw "Draft repair identity became ambiguous: $($approvedStarter.Name)" }
+            Write-Host "Removing explicitly approved stale starter asset: $($approvedStarter.Name) (asset id $($approvedStarter.Id))"
+            Invoke-GhCommand @('api', '--method', 'DELETE', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$Repository/releases/assets/$($approvedStarter.Id)")
+        }
     }
 
-    foreach ($expectedName in @($ExpectedAssets.Keys | Sort-Object)) {
+    $current = Get-Release $releaseId
+    Assert-DraftReleaseIdentity $current $releaseId $Tag $Commit
+    if (-not [bool]$current.draft) { throw 'Updater release became published before draft synchronization completed.' }
+    $plan = Get-ValidatedDraftAssetPlan $ExpectedAssets @($current.assets)
+    foreach ($expectedName in @($plan.MissingNames)) {
         $expected = $ExpectedAssets[$expectedName]
-        $current = Get-Release ([int64]$Release.id)
-        $named = @($current.assets | Where-Object { [string]$_.name -ceq $expectedName })
-        if ($named.Count -eq 1 -and (Test-RemoteAsset $named[0] $expected)) {
-            Write-Host "Retaining verified draft asset: $expectedName"
-            continue
-        }
-
-        # Only assets with an exact expected name are replaceable. Unknown
-        # draft assets are never silently deleted.
-        foreach ($stale in $named) {
-            if (-not [bool]$current.draft) { throw 'Refusing to replace an asset on a published release.' }
-            Write-Host "Removing incomplete or mismatched draft asset: $expectedName (asset id $($stale.id))"
-            Invoke-GhCommand @('api', '--method', 'DELETE', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$Repository/releases/assets/$($stale.id)")
-        }
-
-        Write-Host "Uploading draft asset: $expectedName"
+        Assert-ReservedUpdaterTagRef $Tag $Commit
+        Write-Host "Uploading missing draft asset: $expectedName"
         Invoke-GhCommand @('release', 'upload', $Tag, $expected.Path, '--repo', $Repository)
     }
 
     $validated = $null
     for ($attempt = 0; $attempt -lt 20; $attempt++) {
-        $validated = Get-Release ([int64]$Release.id)
+        $validated = Get-Release $releaseId
         try {
+            Assert-DraftReleaseIdentity $validated $releaseId $Tag $Commit
             Assert-ExactRemoteInventory $validated $ExpectedAssets
+            Assert-ReservedUpdaterTagRef $Tag $Commit
             Write-Host 'GitHub reports the exact expected updater asset inventory, sizes, and SHA-256 digests.'
             return $validated
         }
@@ -362,27 +612,59 @@ function Sync-DraftAssets($Release, [hashtable]$ExpectedAssets, [string]$Tag) {
 if ($DryRun -and $GitHubMutation) { throw '-DryRun cannot be combined with -UploadDraft or -Publish.' }
 if ($ConfirmPublish -and -not $Publish) { throw '-ConfirmPublish is valid only with -Publish.' }
 if ($Publish -and -not $ConfirmPublish) { throw 'Final publication requires both -Publish and -ConfirmPublish.' }
+if ($RepairStaleUploads -and -not $GitHubMutation) { throw '-RepairStaleUploads is allowed only while resuming an existing draft with -UploadDraft or -Publish.' }
+if ($VerifySourceBinding -and ($DryRun -or $GitHubMutation -or $ConfirmPublish -or $RepairStaleUploads)) {
+    throw '-VerifySourceBinding is a standalone read-only diagnostic.'
+}
 
-foreach ($required in @($BuildInfoPath, $ProjectPath, $BuildScript, $GlobalJsonPath, $BootstrapPath, $PipelineTest)) {
+if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Git is required on PATH for exact updater source binding.' }
+if ($VerifySourceBinding) {
+    $diagnosticCommit = Get-BoundSourceCommit
+    Write-Output "SOURCE_ROOT=$Root"
+    Write-Output "SOURCE_COMMIT=$diagnosticCommit"
+    exit 0
+}
+
+foreach ($required in @($BuildInfoPath, $ProjectPath, $BuildScript, $GlobalJsonPath, $NuGetConfigPath, $BootstrapPath, $PipelineTest, $ReproducibilityTest)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required release input is missing: $required" }
 }
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw 'dotnet is required on PATH.' }
 if ($GitHubMutation) {
     if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'GitHub CLI is required on PATH for draft upload or publication.' }
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Git is required on PATH for draft upload or publication.' }
 }
 
 try {
     New-Item -ItemType Directory -Path $TemporaryRoot -Force | Out-Null
-    $version = Get-BuildVersion
+    Assert-CleanReleaseInputs
+    $commit = Get-BoundSourceCommit
+    $sourceRoot = Join-Path $TemporaryRoot 'exact-commit-source'
+    Export-CommitTree $commit $sourceRoot
+
+    $sourceBuildInfoPath = Join-Path $sourceRoot 'updater\CobbleMusicUpdater\BuildInfo.cs'
+    $sourceProjectPath = Join-Path $sourceRoot 'updater\CobbleMusicUpdater\CobbleMusicUpdater.csproj'
+    $sourceBuildScript = Join-Path $sourceRoot 'tools\Build-CobbleMusicUpdater.ps1'
+    $sourceGlobalJsonPath = Join-Path $sourceRoot 'global.json'
+    $sourceNuGetConfigPath = Join-Path $sourceRoot 'NuGet.Config'
+    $sourcePackagesPath = Join-Path $sourceRoot 'updater\packages'
+    $sourceBootstrapPath = Join-Path $sourceRoot 'bootstrap\Bootstrap-CobbleMusicUpdater.ps1'
+    $sourcePipelineTest = Join-Path $sourceRoot 'tests\Test-UpdaterReleasePipeline.ps1'
+    $sourceReproducibilityTest = Join-Path $sourceRoot 'tests\Test-UpdaterBuildReproducibility.ps1'
+    foreach ($required in @($sourceBuildInfoPath, $sourceProjectPath, $sourceBuildScript, $sourceGlobalJsonPath, $sourceNuGetConfigPath, $sourceBootstrapPath, $sourcePipelineTest, $sourceReproducibilityTest)) {
+        if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Exact commit export is missing required release input: $required" }
+    }
+    if (Test-Path -LiteralPath $sourcePackagesPath) {
+        throw "Exact commit unexpectedly contains the generated NuGet package cache: $sourcePackagesPath"
+    }
+
+    $version = Get-BuildVersion $sourceBuildInfoPath $sourceProjectPath
     $tag = "updater-v$version"
-    Write-Host "Building exact BuildInfo version $version as reproducible self-contained win-x64."
+    Write-Host "Building exact source commit $commit as canonical $tag, reproducible self-contained win-x64."
     $publishOutput = Join-Path $TemporaryRoot 'publish'
     New-Item -ItemType Directory -Path $publishOutput -Force | Out-Null
     # The standalone builder owns the SDK pin, PathMap, debug policy, and all
     # determinism flags so local and release builds cannot silently diverge.
     Invoke-Checked 'Publishing reproducible self-contained win-x64 updater...' {
-        & $BuildScript -Runtime win-x64 -OutputDirectory $publishOutput
+        & $sourceBuildScript -Runtime win-x64 -OutputDirectory $publishOutput
     }
     $builtExe = Join-Path $publishOutput 'CobbleMusicUpdater.exe'
     if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) { throw "Updater build output is missing: $builtExe" }
@@ -390,7 +672,7 @@ try {
     $stagedBootstrap = Join-Path $TemporaryRoot 'Bootstrap-CobbleMusicUpdater.ps1'
     [IO.File]::Copy($builtExe, $stagedExe, $true)
     $updaterSha256 = Get-Sha256 $stagedExe
-    $proposedBootstrap = Get-ProposedBootstrap $version $updaterSha256
+    $proposedBootstrap = Get-ProposedBootstrap $version $updaterSha256 $sourceBootstrapPath
     [IO.File]::WriteAllText($stagedBootstrap, $proposedBootstrap, [Text.UTF8Encoding]::new($false))
     $bootstrapSha256 = Get-Sha256 $stagedBootstrap
 
@@ -405,13 +687,23 @@ try {
         }
     }
 
-    $ordinaryTests = @(Get-ChildItem -LiteralPath (Join-Path $Root 'tests') -Filter 'Test-*.ps1' -File |
-        Where-Object { $_.FullName -cne $PipelineTest } |
+    # The dist EXE is deliberately not a committed source input, but the
+    # modpack publisher safety suite verifies the exact checksum-pinned
+    # updater/bootstrap pair that would be distributed. Install that pair only
+    # into the disposable test export after the release artifact is complete.
+    $sourceTestDistExe = Join-Path $sourceRoot 'updater\dist\win-x64\CobbleMusicUpdater.exe'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $sourceTestDistExe) -Force | Out-Null
+    [IO.File]::Copy($stagedExe, $sourceTestDistExe, $true)
+    [IO.File]::WriteAllText($sourceBootstrapPath, $proposedBootstrap, [Text.UTF8Encoding]::new($false))
+    Write-Host 'Prepared the disposable exact-build updater/bootstrap pair for downstream publisher safety tests.'
+
+    $ordinaryTests = @(Get-ChildItem -LiteralPath (Join-Path $sourceRoot 'tests') -Filter 'Test-*.ps1' -File |
+        Where-Object { $_.FullName -cne $sourcePipelineTest -and $_.FullName -cne $sourceReproducibilityTest } |
         Sort-Object Name)
     foreach ($test in $ordinaryTests) {
         Invoke-Checked "Running $($test.Name)..." { & pwsh -NoProfile -File $test.FullName }
     }
-    $dotnetTestProjects = @(Get-ChildItem -LiteralPath (Join-Path $Root 'updater') -Filter '*.Tests.csproj' -File -Recurse | Sort-Object FullName)
+    $dotnetTestProjects = @(Get-ChildItem -LiteralPath (Join-Path $sourceRoot 'updater') -Filter '*.Tests.csproj' -File -Recurse | Sort-Object FullName)
     $consoleTestMarkers = @{
         'CobbleMusicUpdater.Tests.csproj' = 'Schema-v2 delta, release-chain, exact-baseline adoption, base-integrity, and journal commit-boundary checks passed.'
     }
@@ -449,15 +741,24 @@ try {
         throw "Cannot prove how to execute test project $($testProject.FullName). Declare OutputType=Exe for a marker-verified console harness, or configure a recognized test SDK."
     }
     Invoke-Checked 'Running updater release metadata/integrity checks...' {
-        & pwsh -NoProfile -File $PipelineTest `
+        & pwsh -NoProfile -File $sourcePipelineTest `
+            -BuildInfoPath $sourceBuildInfoPath `
+            -ProjectPath $sourceProjectPath `
             -UpdaterExePath $stagedExe `
             -BootstrapPath $stagedBootstrap `
             -ExpectedVersion $version `
             -ExpectedRepository $Repository
     }
+    Invoke-Checked 'Proving the exact release artifact against cold, warm, and distinct-root commit builds...' {
+        & pwsh -NoProfile -File $sourceReproducibilityTest `
+            -SourceRepositoryRoot $Root `
+            -SourceCommit $commit `
+            -ExpectedExePath $stagedExe
+    }
+    Assert-SourceStillBound $commit
 
     if ($DryRun) {
-        Write-Host "Dry run passed. Tracked bootstrap remains unchanged; GitHub was not contacted for mutation. Proposed tag: $tag"
+        Write-Host "Dry run passed for exact source commit $commit. Tracked bootstrap remains unchanged; GitHub was not contacted for mutation. Proposed tag: $tag"
         exit 0
     }
 
@@ -476,11 +777,10 @@ try {
         exit 0
     }
 
-    Assert-CleanReleaseInputs
-    $commit = (& git rev-parse HEAD).Trim()
-    if ($LASTEXITCODE -ne 0 -or $commit -notmatch '^[0-9a-f]{40,64}$') { throw 'Unable to resolve the committed updater source revision.' }
     $null = Invoke-GhJson @('api', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$Repository/commits/$commit")
-    Assert-TagTargetIfPresent $tag $commit
+    $knownReleases = @(Get-AllReleases)
+    Assert-UpdaterVersionReservation $knownReleases $version $tag
+    Reserve-UpdaterTagRef $tag $commit
 
     $notesPath = Join-Path $TemporaryRoot 'RELEASE_NOTES.md'
     $notes = @"
@@ -509,8 +809,8 @@ The bootstrap verifies the exact updater executable before installation. No priv
         }
     }
 
-    $release = New-OrResumeDraft $tag $version $commit $notesPath
-    $release = Sync-DraftAssets $release $expectedAssets $tag
+    $release = New-OrResumeDraft $tag $version $commit $notesPath $knownReleases
+    $release = Sync-DraftAssets $release $expectedAssets $tag $commit
 
     if (-not $Publish) {
         if (-not [bool]$release.draft) {
@@ -528,13 +828,18 @@ The bootstrap verifies the exact updater executable before installation. No priv
     }
     # Re-read immediately before the only publication mutation, so a remote
     # inventory change between upload and approval cannot slip through.
-    $release = Get-Release ([int64]$release.id)
+    $validatedReleaseId = [int64]$release.id
+    $release = Get-Release $validatedReleaseId
+    Assert-DraftReleaseIdentity $release $validatedReleaseId $tag $commit
     Assert-ExactRemoteInventory $release $expectedAssets
-    Assert-TagTargetIfPresent $tag $commit
+    Assert-UpdaterVersionReservation @(Get-AllReleases) $version $tag
+    Assert-SourceStillBound $commit
     $publishPayload = Join-Path $TemporaryRoot 'publish-release.json'
     [IO.File]::WriteAllText($publishPayload, '{"draft":false}', [Text.UTF8Encoding]::new($false))
+    Assert-ReservedUpdaterTagRef $tag $commit
     $published = Invoke-GhJson @('api', '--method', 'PATCH', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$Repository/releases/$($release.id)", '--input', $publishPayload)
     if ([bool]$published.draft -or [string]$published.tag_name -cne $tag) { throw 'GitHub did not publish the exact validated updater draft.' }
+    Assert-ReservedUpdaterTagRef $tag $commit
     Assert-ExactRemoteInventory $published $expectedAssets
     Write-Host "Published validated updater release: $($published.html_url)"
 }

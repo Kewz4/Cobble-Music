@@ -71,6 +71,20 @@ $manifest = [pscustomobject]@{
     legacyCleanup = @()
 }
 Assert-True (Assert-CobbleDeltaManifest -Manifest $manifest -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash) 'Valid v2 manifest was rejected.'
+$rawDeltaMissingDeletePaths = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+Assert-True ($null -eq $rawDeltaMissingDeletePaths.PSObject.Properties['deletePaths']) 'Raw delta fixture unexpectedly contains deletePaths.'
+Assert-True (Assert-CobbleDeltaManifest -Manifest $rawDeltaMissingDeletePaths -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash) 'Missing v2 deletePaths did not preserve the runtime initialized empty list.'
+foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'deletePaths', 'legacyCleanup')) {
+    $deltaExplicitNull = $manifest.PSObject.Copy()
+    if ($null -eq $deltaExplicitNull.PSObject.Properties[$nullCollection]) {
+        $deltaExplicitNull | Add-Member -NotePropertyName $nullCollection -NotePropertyValue $null
+    }
+    else {
+        $deltaExplicitNull.$nullCollection = $null
+    }
+    $deltaExplicitNull = ($deltaExplicitNull | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+    Assert-Throws { Assert-CobbleDeltaManifest -Manifest $deltaExplicitNull -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } "V2 staged resume accepted explicit-null required collection $nullCollection."
+}
 
 $baselineManifest = [pscustomobject]@{
     schemaVersion = 1
@@ -78,6 +92,7 @@ $baselineManifest = [pscustomobject]@{
     channel = 'stable'
     version = '1.0.4'
     releaseTag = 'modpack-v1.0.4'
+    minimumUpdaterVersion = '1.0.0'
     payload = [pscustomobject]@{
         archiveName = 'cobble-music-payload.zip'
         size = 1
@@ -89,6 +104,43 @@ $baselineManifest = [pscustomobject]@{
     legacyCleanup = @()
 }
 Assert-True (Assert-CobbleV1Manifest -Manifest $baselineManifest) 'Valid schema-v1 baseline was rejected.'
+$rawLegacyMissingFields = ($baselineManifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+Assert-True ($null -eq $rawLegacyMissingFields.PSObject.Properties['payloadFiles']) 'Raw legacy fixture unexpectedly contains payloadFiles.'
+Assert-True (Assert-CobbleV1Manifest -Manifest $rawLegacyMissingFields) 'Truly absent legacy v1 collections were not treated as initialized empty runtime lists.'
+
+$legacyExplicitNullBase = $baselineManifest.PSObject.Copy()
+$legacyExplicitNullBase | Add-Member -NotePropertyName base -NotePropertyValue $null
+$legacyExplicitNullBase = ($legacyExplicitNullBase | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+Assert-True (Assert-CobbleV1Manifest -Manifest $legacyExplicitNullBase) 'Explicit null v1 base did not match the runtime nullable base model.'
+foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'deletePaths', 'legacyCleanup')) {
+    $legacyExplicitNull = $baselineManifest.PSObject.Copy()
+    if ($null -eq $legacyExplicitNull.PSObject.Properties[$nullCollection]) {
+        $legacyExplicitNull | Add-Member -NotePropertyName $nullCollection -NotePropertyValue $null
+    }
+    else {
+        $legacyExplicitNull.$nullCollection = $null
+    }
+    $legacyExplicitNull = ($legacyExplicitNull | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+    Assert-True ($null -ne $legacyExplicitNull.PSObject.Properties[$nullCollection] -and $null -eq $legacyExplicitNull.$nullCollection) "Raw v1 $nullCollection fixture did not preserve explicit JSON null."
+    Assert-Throws { Assert-CobbleV1Manifest -Manifest $legacyExplicitNull } "V1 staged resume accepted explicit-null required collection $nullCollection."
+}
+
+$badMinimumBaseline = $baselineManifest.PSObject.Copy()
+$badMinimumBaseline.minimumUpdaterVersion = '1.02.0'
+Assert-Throws { Assert-CobbleV1Manifest -Manifest $badMinimumBaseline } 'Non-canonical v1 minimumUpdaterVersion was accepted for staged resume.'
+$futureMinimumBaseline = $baselineManifest.PSObject.Copy()
+$futureMinimumBaseline.minimumUpdaterVersion = '1.2.1'
+Assert-Throws { Assert-CobbleV1Manifest -Manifest $futureMinimumBaseline } 'V1 requiring a newer-than-pinned updater was accepted for staged resume.'
+$deltaBaseInV1 = $baselineManifest.PSObject.Copy()
+$deltaBaseInV1 | Add-Member -NotePropertyName base -NotePropertyValue ([pscustomobject]@{ version = '1.0.3'; manifestSha256 = (New-Hash 'a') })
+Assert-Throws { Assert-CobbleV1Manifest -Manifest $deltaBaseInV1 } 'V1 staged resume accepted a delta-only base.'
+$payloadFilesInV1 = $baselineManifest.PSObject.Copy()
+$payloadFilesInV1 | Add-Member -NotePropertyName payloadFiles -NotePropertyValue @($base[0])
+Assert-Throws { Assert-CobbleV1Manifest -Manifest $payloadFilesInV1 } 'V1 staged resume accepted nonempty payloadFiles.'
+$deletedFilesInV1 = $baselineManifest.PSObject.Copy()
+$deletedFilesInV1 | Add-Member -NotePropertyName deletedFiles -NotePropertyValue @($base[0])
+Assert-Throws { Assert-CobbleV1Manifest -Manifest $deletedFilesInV1 } 'V1 staged resume accepted nonempty deletedFiles.'
+
 $badBaseline = $baselineManifest.PSObject.Copy()
 $badBaseline.deletePaths = @('mods/unchanged.jar')
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $badBaseline } 'Baseline deletion overlapping authoritative files was accepted.'
@@ -169,6 +221,10 @@ $tamperedDeletion = $manifest.PSObject.Copy()
 $tamperedDeletion.deletedFiles = @((New-Record 'resourcepacks/deleted.zip' 30 '9'))
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $tamperedDeletion -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Tampered deletedFiles metadata was accepted.'
 
+$pathOnlyDeltaDeletion = $manifest.PSObject.Copy()
+$pathOnlyDeltaDeletion | Add-Member -NotePropertyName deletePaths -NotePropertyValue @('mods/old.jar')
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $pathOnlyDeltaDeletion -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'V2 staged resume accepted nonempty path-only deletePaths.'
+
 $overlappingLegacy = $manifest.PSObject.Copy()
 $overlappingLegacy.legacyCleanup = @((New-Record 'mods/unchanged.jar' 10 'a'))
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $overlappingLegacy -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'legacyCleanup overlapping the signed base was accepted.'
@@ -199,6 +255,71 @@ Assert-Throws { Assert-CobblePublishedBaseAssets -LocalAssets $localBaseAssets -
 $missingPublishedBase = @($remoteAssets | Where-Object name -ne 'cobble-music-update.sig')
 Assert-Throws { Assert-CobblePublishedBaseAssets -LocalAssets $localBaseAssets -RemoteAssets $missingPublishedBase } 'Published release missing its exact signature asset was accepted.'
 
+$localUpdater = [pscustomobject]@{ name = 'CobbleMusicUpdater.exe'; size = 123456; sha256 = (New-Hash 'e') }
+$publishedUpdaterAssets = @(
+    [pscustomobject]@{ name = 'CobbleMusicUpdater.exe'; size = 123456; digest = "sha256:$(New-Hash 'e')"; state = 'uploaded' },
+    [pscustomobject]@{ name = 'Bootstrap-CobbleMusicUpdater.ps1'; size = 999; digest = "sha256:$(New-Hash 'f')"; state = 'uploaded' }
+)
+Assert-True (Assert-CobblePublishedUpdaterAsset -LocalAsset $localUpdater -RemoteAssets $publishedUpdaterAssets) 'Exact pinned updater did not match its public stable release asset.'
+$unfinishedUpdater = @($publishedUpdaterAssets | ForEach-Object { $_.PSObject.Copy() })
+$unfinishedUpdater[0].state = 'starter'
+Assert-Throws { Assert-CobblePublishedUpdaterAsset -LocalAsset $localUpdater -RemoteAssets $unfinishedUpdater } 'Non-uploaded public updater asset was accepted.'
+$replacedUpdater = @($publishedUpdaterAssets | ForEach-Object { $_.PSObject.Copy() })
+$replacedUpdater[0].digest = "sha256:$(New-Hash '9')"
+Assert-Throws { Assert-CobblePublishedUpdaterAsset -LocalAsset $localUpdater -RemoteAssets $replacedUpdater } 'Public updater asset with a replaced digest was accepted.'
+$missingUpdater = @($publishedUpdaterAssets | Where-Object name -ne 'CobbleMusicUpdater.exe')
+Assert-Throws { Assert-CobblePublishedUpdaterAsset -LocalAsset $localUpdater -RemoteAssets $missingUpdater } 'Public stable updater release missing its EXE was accepted.'
+
+Assert-True (Test-CobblePaginationHasNextPage -Page 9 -ResultCount 100 -MaximumPages 10 -Context 'test release index') 'A full nonterminal release-index page did not continue.'
+Assert-True (-not (Test-CobblePaginationHasNextPage -Page 3 -ResultCount 99 -MaximumPages 10 -Context 'test release index')) 'A partial release-index page incorrectly continued.'
+Assert-Throws { Test-CobblePaginationHasNextPage -Page 10 -ResultCount 100 -MaximumPages 10 -Context 'test release index' | Out-Null } 'A full final release-index page was silently truncated.'
+
+$pathTestRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-key-isolation-$([Guid]::NewGuid().ToString('N'))"
+$sourceRoot = Join-Path $pathTestRoot 'minecraft'
+$releaseRoot = Join-Path $pathTestRoot 'release-output'
+$externalManagedRoot = Join-Path $pathTestRoot 'external-managed'
+Assert-True (Assert-CobblePrivateKeyIsolation -PrivateKeyPath (Join-Path $pathTestRoot 'safe\private.key') -SourceMinecraftDir $sourceRoot -ReleaseOutputRoot $releaseRoot -ManagedRoots @($externalManagedRoot)) 'Safe external private-key location was rejected.'
+Assert-Throws { Assert-CobblePrivateKeyIsolation -PrivateKeyPath (Join-Path $sourceRoot 'mods\private.key') -SourceMinecraftDir $sourceRoot -ReleaseOutputRoot $releaseRoot -ManagedRoots @() } 'Private key under the source was accepted.'
+Assert-Throws { Assert-CobblePrivateKeyIsolation -PrivateKeyPath (Join-Path $releaseRoot '1.0.5\private.key') -SourceMinecraftDir $sourceRoot -ReleaseOutputRoot $releaseRoot -ManagedRoots @() } 'Private key under release staging was accepted.'
+Assert-Throws { Assert-CobblePrivateKeyIsolation -PrivateKeyPath (Join-Path $externalManagedRoot 'private.key') -SourceMinecraftDir $sourceRoot -ReleaseOutputRoot $releaseRoot -ManagedRoots @($externalManagedRoot) } 'Private key under an inventoried managed root was accepted.'
+
+$lockTestRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-publisher-lock-test-$([Guid]::NewGuid().ToString('N'))"
+[IO.Directory]::CreateDirectory($lockTestRoot) | Out-Null
+$manifestLock = $null
+$signatureLock = $null
+try {
+    $lockedManifestPath = Join-Path $lockTestRoot 'cobble-music-update.json'
+    $lockedSignaturePath = Join-Path $lockTestRoot 'cobble-music-update.sig'
+    [IO.File]::WriteAllText($lockedManifestPath, '{"locked":true}')
+    [IO.File]::WriteAllText($lockedSignaturePath, '{"signature":"locked"}')
+    $manifestLock = Open-CobbleLockedFileSnapshot $lockedManifestPath
+    $signatureLock = Open-CobbleLockedFileSnapshot $lockedSignaturePath
+    Assert-True (Assert-CobbleLockedFileSnapshot $manifestLock) 'Locked manifest snapshot failed its initial identity check.'
+    Assert-True (Assert-CobbleLockedFileSnapshot $signatureLock) 'Locked signature snapshot failed its initial identity check.'
+
+    Assert-Throws { [IO.File]::WriteAllText($lockedManifestPath, '{"swapped":true}') } 'Locked staged manifest could be overwritten between verification and upload.'
+    $replacementPath = Join-Path $lockTestRoot 'replacement.json'
+    [IO.File]::WriteAllText($replacementPath, '{"replacement":true}')
+    Assert-Throws { [IO.File]::Move($replacementPath, $lockedManifestPath, $true) } 'Locked staged manifest could be atomically replaced between verification and upload.'
+    Assert-Throws { [IO.File]::WriteAllText($lockedSignaturePath, '{"signature":"swapped"}') } 'Locked staged signature could be overwritten after verification.'
+
+    $lockedBaseAssets = @(
+        [pscustomobject]@{ name = 'cobble-music-update.json'; size = $manifestLock.size; sha256 = $manifestLock.sha256 },
+        [pscustomobject]@{ name = 'cobble-music-update.sig'; size = $signatureLock.size; sha256 = $signatureLock.sha256 }
+    )
+    $lockedRemoteAssets = @($lockedBaseAssets | ForEach-Object {
+        [pscustomobject]@{ name = $_.name; size = $_.size; digest = "sha256:$($_.sha256)"; state = 'uploaded' }
+    })
+    Assert-True (Assert-CobblePublishedBaseAssets -LocalAssets $lockedBaseAssets -RemoteAssets $lockedRemoteAssets) 'Exact locked base byte pair was not usable as its remote identity snapshot.'
+    Assert-True (Assert-CobbleLockedFileSnapshot $manifestLock) 'Manifest lock identity changed after adversarial swap attempts.'
+    Assert-True (Assert-CobbleLockedFileSnapshot $signatureLock) 'Signature lock identity changed after adversarial swap attempts.'
+}
+finally {
+    Close-CobbleLockedFileSnapshot $signatureLock
+    Close-CobbleLockedFileSnapshot $manifestLock
+    if ([IO.Directory]::Exists($lockTestRoot)) { [IO.Directory]::Delete($lockTestRoot, $true) }
+}
+
 $partialRemote = @($remoteAssets | Where-Object name -ne 'cobble-music-payload.part001')
 $missing = @(Assert-CobbleRemoteAssetInventory -ExpectedAssets $expectedAssets -RemoteAssets $partialRemote)
 Assert-True ($missing.Count -eq 1 -and $missing[0] -ceq 'cobble-music-payload.part001') 'Resumable inventory did not identify the exact missing asset.'
@@ -210,6 +331,16 @@ $starter[2] | Add-Member -NotePropertyName id -NotePropertyValue 12345
 Assert-Throws { Assert-CobbleRemoteAssetInventory -ExpectedAssets $expectedAssets -RemoteAssets $starter | Out-Null } 'Unfinalized GitHub starter asset was accepted.'
 $repairable = @(Get-CobbleRepairableStarterAssets -ExpectedAssets $expectedAssets -RemoteAssets $starter)
 Assert-True ($repairable.Count -eq 1 -and $repairable[0].id -eq 12345 -and $repairable[0].name -ceq 'cobble-music-payload.part001') 'Explicit repair did not select only the expected-name starter asset.'
+$deleteCandidate = Get-CobbleStarterAssetForDeletion -Candidate $repairable[0] -ExpectedAssets $expectedAssets -RemoteAssets $starter
+Assert-True ($null -ne $deleteCandidate -and $deleteCandidate.id -eq 12345) 'Immediately revalidated starter candidate was not deletable.'
+$starterBecameUploaded = @($starter | ForEach-Object { $_.PSObject.Copy() })
+$starterBecameUploaded[2].state = 'uploaded'
+$skipUploadedCandidate = Get-CobbleStarterAssetForDeletion -Candidate $repairable[0] -ExpectedAssets $expectedAssets -RemoteAssets $starterBecameUploaded
+Assert-True ($null -eq $skipUploadedCandidate) 'Repair would delete an asset that transitioned from starter to uploaded.'
+$replacementStarter = @($starter | ForEach-Object { $_.PSObject.Copy() })
+$replacementStarter[2].id = 67890
+$skipReplacementCandidate = Get-CobbleStarterAssetForDeletion -Candidate $repairable[0] -ExpectedAssets $expectedAssets -RemoteAssets $replacementStarter
+Assert-True ($null -eq $skipReplacementCandidate) 'Repair would delete a replacement starter with a different API identity.'
 
 $starterWithoutId = @($remoteAssets | ForEach-Object { $_.PSObject.Copy() })
 $starterWithoutId[2].state = 'starter'
@@ -222,6 +353,21 @@ Assert-Throws { Assert-CobbleRemoteAssetInventory -ExpectedAssets $expectedAsset
 $starterWithMismatch = @($starter | ForEach-Object { $_.PSObject.Copy() })
 $starterWithMismatch[0].digest = "sha256:$(New-Hash 'd')"
 Assert-Throws { Get-CobbleRepairableStarterAssets -ExpectedAssets $expectedAssets -RemoteAssets $starterWithMismatch | Out-Null } 'Starter repair proceeded beside an uploaded mismatched asset.'
+
+$draftRelease = [pscustomobject]@{ id = 1001; tag_name = 'modpack-v1.0.5'; draft = $true; prerelease = $false; published_at = $null }
+Assert-True (Assert-CobbleReleaseIdentityState -Release $draftRelease -ExpectedId 1001 -ExpectedTag 'modpack-v1.0.5' -ExpectedState draft) 'Exact draft release identity was rejected.'
+$publicRelease = $draftRelease.PSObject.Copy()
+$publicRelease.draft = $false
+$publicRelease.published_at = '2026-08-26T12:00:00Z'
+Assert-True (Assert-CobbleReleaseIdentityState -Release $publicRelease -ExpectedId 1001 -ExpectedTag 'modpack-v1.0.5' -ExpectedState public) 'Exact post-publish release identity was rejected.'
+Assert-Throws { Assert-CobbleReleaseIdentityState -Release $draftRelease -ExpectedId 1002 -ExpectedTag 'modpack-v1.0.5' -ExpectedState draft } 'Changed release ID was accepted before mutation.'
+Assert-Throws { Assert-CobbleReleaseIdentityState -Release $draftRelease -ExpectedId 1001 -ExpectedTag 'modpack-v1.0.6' -ExpectedState draft } 'Changed release tag was accepted before mutation.'
+$prereleaseDraft = $draftRelease.PSObject.Copy()
+$prereleaseDraft.prerelease = $true
+Assert-Throws { Assert-CobbleReleaseIdentityState -Release $prereleaseDraft -ExpectedId 1001 -ExpectedTag 'modpack-v1.0.5' -ExpectedState draft } 'Prerelease draft was accepted for mutation.'
+$publicWithoutTimestamp = $publicRelease.PSObject.Copy()
+$publicWithoutTimestamp.published_at = $null
+Assert-Throws { Assert-CobbleReleaseIdentityState -Release $publicWithoutTimestamp -ExpectedId 1001 -ExpectedTag 'modpack-v1.0.5' -ExpectedState public } 'Post-publication state without published_at was accepted.'
 
 $unexpected = @($remoteAssets) + @([pscustomobject]@{ name = 'extra.bin'; size = 0; digest = "sha256:$(New-Hash '0')"; state = 'uploaded' })
 Assert-Throws { Assert-CobbleRemoteAssetInventory -ExpectedAssets $expectedAssets -RemoteAssets $unexpected | Out-Null } 'Unexpected draft asset was accepted.'
@@ -259,12 +405,126 @@ finally {
     if ([IO.Directory]::Exists($zipTestRoot)) { [IO.Directory]::Delete($zipTestRoot, $true) }
 }
 
+$partsTestRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-publisher-parts-test-$([Guid]::NewGuid().ToString('N'))"
+[IO.Directory]::CreateDirectory($partsTestRoot) | Out-Null
+try {
+    $partOneBytes = [Text.Encoding]::UTF8.GetBytes('first staged chunk')
+    $partTwoBytes = [Text.Encoding]::UTF8.GetBytes('second staged chunk')
+    $allBytes = [byte[]]::new($partOneBytes.Length + $partTwoBytes.Length)
+    [Array]::Copy($partOneBytes, 0, $allBytes, 0, $partOneBytes.Length)
+    [Array]::Copy($partTwoBytes, 0, $allBytes, $partOneBytes.Length, $partTwoBytes.Length)
+    $partOneHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($partOneBytes)).ToLowerInvariant()
+    $partTwoHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($partTwoBytes)).ToLowerInvariant()
+    $allHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($allBytes)).ToLowerInvariant()
+    $partOne = [pscustomobject]@{ name = 'cobble-music-payload.part001'; size = $partOneBytes.Length; sha256 = $partOneHash }
+    $partTwo = [pscustomobject]@{ name = 'cobble-music-payload.part002'; size = $partTwoBytes.Length; sha256 = $partTwoHash }
+    [IO.File]::WriteAllBytes((Join-Path $partsTestRoot $partOne.name), $partOneBytes)
+    [IO.File]::WriteAllBytes((Join-Path $partsTestRoot $partTwo.name), $partTwoBytes)
+    $stagedPayload = [pscustomobject]@{
+        archiveName = 'cobble-music-payload.zip'
+        size = $allBytes.Length
+        sha256 = $allHash
+        parts = @($partOne, $partTwo)
+    }
+
+    $stagedPartIdentities = @(Assert-CobbleStagedPayloadParts -Payload $stagedPayload -StagingRoot $partsTestRoot)
+    Assert-True ($stagedPartIdentities.Count -eq 2) 'Exact staged parts failed ordered streaming validation.'
+
+    $reorderedPayload = $stagedPayload.PSObject.Copy()
+    $reorderedPayload.parts = @($partTwo, $partOne)
+    Assert-Throws { Assert-CobbleStagedPayloadParts -Payload $reorderedPayload -StagingRoot $partsTestRoot | Out-Null } 'Reordered staged parts passed the signed aggregate payload hash.'
+
+    [IO.File]::WriteAllBytes((Join-Path $partsTestRoot $partOne.name), [Text.Encoding]::UTF8.GetBytes('alter staged chunk'))
+    Assert-Throws { Assert-CobbleStagedPayloadParts -Payload $stagedPayload -StagingRoot $partsTestRoot | Out-Null } 'Mutated staged part passed resume streaming validation.'
+    [IO.File]::WriteAllBytes((Join-Path $partsTestRoot $partOne.name), $partOneBytes)
+
+    $wrongAggregatePayload = $stagedPayload.PSObject.Copy()
+    $wrongAggregatePayload.sha256 = New-Hash '8'
+    Assert-Throws { Assert-CobbleStagedPayloadParts -Payload $wrongAggregatePayload -StagingRoot $partsTestRoot | Out-Null } 'Wrong signed aggregate payload digest passed resume validation.'
+
+    [IO.File]::Delete((Join-Path $partsTestRoot $partTwo.name))
+    Assert-Throws { Assert-CobbleStagedPayloadParts -Payload $stagedPayload -StagingRoot $partsTestRoot | Out-Null } 'Missing staged part passed resume validation.'
+}
+finally {
+    if ([IO.Directory]::Exists($partsTestRoot)) { [IO.Directory]::Delete($partsTestRoot, $true) }
+}
+
 $tokens = $null
 $parseErrors = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile($Publisher, [ref]$tokens, [ref]$parseErrors)
 Assert-True ($parseErrors.Count -eq 0) 'Publisher script has PowerShell parse errors.'
 $chunkParameter = $ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'ChunkSizeMiB' }
 Assert-True ($null -ne $chunkParameter -and $chunkParameter.DefaultValue.Extent.Text -eq '256') 'Future release chunk default is not 256 MiB.'
+$publisherText = [IO.File]::ReadAllText($Publisher)
+Assert-True ($publisherText -notmatch '(?i)\bdotnet\b|UpdaterProject|UpdaterDll|Build-UpdaterSigningTool') 'Modpack publisher still builds or executes a mutable working-tree updater.'
+Assert-True ($publisherText -match [regex]::Escape("updater\dist\win-x64\CobbleMusicUpdater.exe")) 'Modpack publisher does not use the distributed updater artifact.'
+Assert-True ($publisherText -match 'Get-SingleQuotedBootstrapAssignment[\s\S]+ExpectedUpdaterSha256') 'Modpack publisher does not bind the distributed updater to the bootstrap version/hash.'
+
+$publishFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Publish-StagedRelease' }, $true)
+$publishFunctionText = $publishFunction.Extent.Text
+$patchIndex = $publishFunctionText.IndexOf("'draft=false'", [StringComparison]::Ordinal)
+$finalUpdaterCheckIndex = $publishFunctionText.LastIndexOf('Assert-PublishedPinnedUpdater', [StringComparison]::Ordinal)
+$finalBaseCheckIndex = $publishFunctionText.LastIndexOf('Assert-PublishedBaseReleaseIdentity', [StringComparison]::Ordinal)
+Assert-True ($patchIndex -gt 0 -and $finalUpdaterCheckIndex -gt 0 -and $finalUpdaterCheckIndex -lt $patchIndex) 'Pinned updater is not revalidated immediately before publication.'
+Assert-True ($finalBaseCheckIndex -gt 0 -and $finalBaseCheckIndex -lt $patchIndex) 'Signed base identity is not revalidated immediately before delta publication.'
+$finalDraftIndex = $publishFunctionText.LastIndexOf("Get-ExactReleaseSnapshotById -ReleaseId `$releaseId -Tag `$tag -State 'draft'", [StringComparison]::Ordinal)
+$postPublicIndex = $publishFunctionText.IndexOf("Get-ExactReleaseSnapshotById -ReleaseId `$releaseId -Tag `$tag -State 'public'", [StringComparison]::Ordinal)
+Assert-True ($finalDraftIndex -gt $finalBaseCheckIndex -and $finalDraftIndex -lt $patchIndex) 'Final PATCH does not immediately refetch and validate the exact draft ID/tag/assets.'
+Assert-True ($postPublicIndex -gt $patchIndex) 'Publication does not postvalidate the same release ID/tag/public state.'
+$deleteIndex = $publishFunctionText.IndexOf("'DELETE'", [StringComparison]::Ordinal)
+$deleteRefetchIndex = $publishFunctionText.LastIndexOf("Get-ExactReleaseSnapshotById -ReleaseId `$releaseId -Tag `$tag -State 'draft'", $deleteIndex, [StringComparison]::Ordinal)
+$deleteCandidateIndex = $publishFunctionText.LastIndexOf('Get-CobbleStarterAssetForDeletion', $deleteIndex, [StringComparison]::Ordinal)
+Assert-True ($deleteRefetchIndex -ge 0 -and $deleteCandidateIndex -gt $deleteRefetchIndex -and $deleteCandidateIndex -lt $deleteIndex) 'Starter DELETE is not guarded by an immediate exact draft/assets re-fetch and state transition check.'
+Assert-True ([regex]::Matches($publishFunctionText, 'Assert-ManifestSignatureIdentity').Count -ge 4) 'Locked manifest/signature bytes are not reverified before every remote mutation boundary.'
+
+$resumeFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Read-And-ValidateStagedManifest' }, $true)
+$resumeFunctionText = $resumeFunction.Extent.Text
+Assert-True ($resumeFunctionText -match 'Assert-CobbleV1Manifest' -and $resumeFunctionText -match 'Assert-CobbleDeltaManifest') 'Staged resume does not run the schema-specific publisher validators.'
+Assert-True ($resumeFunctionText -match 'Get-ExpectedStagedAssets') 'Staged resume does not stream-validate the signed payload parts.'
+Assert-True ($resumeFunctionText.IndexOf('Open-ManifestSignatureIdentity', [StringComparison]::Ordinal) -lt $resumeFunctionText.IndexOf('Assert-ManifestSignatureIdentity', [StringComparison]::Ordinal) -and
+    $resumeFunctionText.IndexOf('Assert-ManifestSignatureIdentity', [StringComparison]::Ordinal) -lt $resumeFunctionText.IndexOf('Read-JsonSnapshot', [StringComparison]::Ordinal)) 'Staged resume does not verify and parse the same locked manifest/signature bytes.'
+$baseResolver = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Resolve-BaseArtifacts' }, $true)
+$baseResolverText = $baseResolver.Extent.Text
+Assert-True ($baseResolverText.IndexOf('Open-ManifestSignatureIdentity', [StringComparison]::Ordinal) -lt $baseResolverText.IndexOf('Assert-CobblePublishedBaseAssets', [StringComparison]::Ordinal)) 'Base remote identity is not bound to a locked exact local byte pair.'
+Assert-True ($publisherText.IndexOf('Assert-CobblePrivateKeyIsolation', [StringComparison]::Ordinal) -lt $publisherText.IndexOf('Building authoritative file manifest', [StringComparison]::Ordinal)) 'Private key isolation does not run before source inventory.'
+
+$keyIsolationRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-publisher-key-gate-$([Guid]::NewGuid().ToString('N'))"
+$keyIsolationSource = Join-Path $keyIsolationRoot 'minecraft'
+$keyIsolationKey = Join-Path $keyIsolationSource 'mods\private.key'
+[IO.Directory]::CreateDirectory((Split-Path -Parent $keyIsolationKey)) | Out-Null
+[IO.File]::WriteAllText($keyIsolationKey, 'test key must never be inventoried')
+$keyIsolationVersion = '98.76.54'
+$keyIsolationOutput = Join-Path $Root "release-output\$keyIsolationVersion"
+try {
+    if (Test-Path -LiteralPath $keyIsolationOutput) { throw "Reserved key-isolation test output already exists: $keyIsolationOutput" }
+    $keyGateOutput = @(& pwsh -NoProfile -File $Publisher -Version $keyIsolationVersion -FullBaseline -SourceMinecraftDir $keyIsolationSource -PrivateKeyPath $keyIsolationKey 2>&1)
+    Assert-True ($LASTEXITCODE -ne 0 -and ($keyGateOutput -join "`n") -like '*Private signing key must not be inside*') 'Publisher did not reject a private key inside managed source before inventory.'
+    Assert-True (-not (Test-Path -LiteralPath $keyIsolationOutput)) 'Private-key rejection created release staging before failing.'
+}
+finally {
+    if ([IO.Directory]::Exists($keyIsolationRoot)) { [IO.Directory]::Delete($keyIsolationRoot, $true) }
+}
+
+# Exercise the real resume entrypoint with a valid public signature. The
+# fixture is intentionally not a publishable Cobble payload, so validation
+# must stop before any GitHub lookup or mutation after the pinned EXE verifies
+# its signature.
+$resumeFixtureVersion = '99.0.0'
+$resumeFixtureRoot = Join-Path $Root "release-output\$resumeFixtureVersion"
+$resumeFixtureManifest = Join-Path $Root 'updater\testdata\manifest-signature-fixture.json'
+$resumeFixtureSignature = Join-Path $Root 'updater\testdata\manifest-signature-fixture.sig'
+try {
+    if (Test-Path -LiteralPath $resumeFixtureRoot) { throw "Reserved staged-resume fixture output already exists: $resumeFixtureRoot" }
+    [IO.Directory]::CreateDirectory($resumeFixtureRoot) | Out-Null
+    [IO.File]::Copy($resumeFixtureManifest, (Join-Path $resumeFixtureRoot 'cobble-music-update.json'))
+    [IO.File]::Copy($resumeFixtureSignature, (Join-Path $resumeFixtureRoot 'cobble-music-update.sig'))
+    [IO.File]::WriteAllText((Join-Path $resumeFixtureRoot 'RELEASE_NOTES.md'), 'test-only invalid resume fixture')
+    $resumeGateOutput = @(& pwsh -NoProfile -File $Publisher -Version $resumeFixtureVersion -ResumePublish -ConfirmDistributionRights 2>&1)
+    Assert-True ($LASTEXITCODE -ne 0 -and ($resumeGateOutput -join "`n") -like '*Payload metadata is missing or invalid*') "Real staged resume did not use the pinned verifier and fail closed on invalid staging: $($resumeGateOutput -join ' | ')"
+}
+finally {
+    if ([IO.Directory]::Exists($resumeFixtureRoot)) { [IO.Directory]::Delete($resumeFixtureRoot, $true) }
+}
 
 $modeGateOutput = @(& pwsh -NoProfile -File $Publisher -Version 98.0.0 -FullBaseline -RepairStaleUploads 2>&1)
 Assert-True ($LASTEXITCODE -ne 0 -and ($modeGateOutput -join "`n") -like '*allowed only with -ResumePublish*') '-RepairStaleUploads did not fail closed outside resume mode.'
