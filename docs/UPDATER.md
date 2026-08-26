@@ -68,7 +68,7 @@ signed `modpack-v<version>` release format.
 
 GitHub limits individual Release assets to under 2 GiB. The current Reactive
 mega pack alone is about 2.42 GiB, while the older full `.mrpack` is about
-3.06 GB. The publisher therefore creates 512 MiB
+3.06 GB. The publisher therefore creates 256 MiB by default
 `cobble-music-payload.part###` assets. The updater reconstructs the ZIP only
 after every downloaded part passes its hash.
 
@@ -192,26 +192,69 @@ updates happen automatically when that player presses Prism's Play button.
 ## Publish a pack update
 
 The canonical source is the current live client, not Claude’s stale `1.0.3`
-`.mrpack` or its retained `mrpack\` folder. Stage a release first:
+`.mrpack` or its retained `mrpack\` folder. The publisher requires an explicit
+mode so accidentally omitting a base version cannot upload the entire pack.
+
+The already-published `1.0.4` release is the full schema-v1 baseline. A new
+baseline is exceptional and must be requested explicitly:
 
 ```powershell
-.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.4
+.\tools\Publish-CobbleMusicRelease.ps1 -Version 2.0.0 -FullBaseline
 ```
 
-Review `release-output\1.0.4\cobble-music-update.json`, its signature, and
-all generated chunk hashes. That command makes no GitHub change.
-
-Publishing is deliberately gated by an explicit rights confirmation:
+Normal releases are signed schema-v2 deltas. They download the prior release's
+manifest and detached signature, verify the signature with the updater's
+compiled-in public key, require the requested base/version binding, and compare
+that complete signed file set with the canonical live client:
 
 ```powershell
-.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.4 `
-  -Publish -ConfirmDistributionRights
+.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.5 -BaseVersion 1.0.4
 ```
 
-Only use it after confirming permission to redistribute **every** third-party
+For an offline/review workflow, supply both exact local base assets as well:
+
+```powershell
+.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.5 -BaseVersion 1.0.4 `
+  -BaseManifestPath .\reviewed-base\cobble-music-update.json `
+  -BaseSignaturePath .\reviewed-base\cobble-music-update.sig
+```
+
+A v2 manifest still carries the complete authoritative `files` state. Its
+`payloadFiles` contains only changed/new files, while `deletedFiles` contains
+the exact old path, size, and SHA-256 from the signed base. A deletion-only
+release is valid and has no ZIP or part assets. Case/Unicode-colliding paths,
+unsafe updater paths, stale or equal versions, incomplete differences, and
+case-only renames are rejected before signing.
+
+Review `release-output\1.0.5\cobble-music-update.json`, its signature, and all
+generated part hashes. Staging makes no GitHub change. Payload parts default to
+256 MiB; the temporary combined ZIP is removed immediately after splitting so
+staging does not retain a second full copy.
+
+After review, publish that **exact existing staging**:
+
+```powershell
+.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.5 `
+  -ResumePublish -ConfirmDistributionRights
+```
+
+Publishing creates a persistent draft before uploading. A retry reuses every
+already-finalized asset whose name, size, and GitHub SHA-256 digest matches the
+signed staging and uploads only missing assets. Unexpected, incomplete, or
+mismatched assets stop the run; the release becomes public only after the
+remote inventory matches exactly. `-Publish -ConfirmDistributionRights` may
+instead stage and start that same draft workflow in one run.
+
+Only publish after confirming permission to redistribute **every** third-party
 mod, music track, sound asset, and configuration in the payload. The tool
-publishes only the signed manifest and chunks; it never reads Claude
-scratchpads or old `.mrpack` output.
+publishes only the signed manifest, detached signature, and chunks; it never
+reads Claude scratchpads or old `.mrpack` output.
+
+> **Updater prerequisite:** schema-v2 deltas declare
+> `minimumUpdaterVersion: 1.2.0`. Do not publish the first v2 delta until the
+> updater release that understands base chains, `payloadFiles`, and exact
+> `deletedFiles` has been installed for players. Updater 1.1.x supports the
+> full schema-v1 baseline only.
 
 ### Clean first-run migration
 

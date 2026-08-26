@@ -30,6 +30,6 @@ credential before continuing any external handoff or release work.
 ## Distribution constraint
 
 The current music archive and full `.mrpack` exceed GitHub Releases' per-asset
-limit. The release pipeline uses signed 512 MiB payload chunks instead. Public
+limit. The release pipeline uses signed 256 MiB payload chunks by default instead. Public
 distribution additionally requires the maintainer to confirm rights for every
 third-party asset.
