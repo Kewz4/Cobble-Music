@@ -1,0 +1,35 @@
+# Private source packs, generated release payloads, and local build output.
+# The repository contains the updater source and release tooling only.
+*.zip
+*.mrpack
+*.jar
+*.ogg
+*.mp3
+*.wav
+*.7z
+*.rar
+*.exe
+*.pdb
+*.nupkg
+exec-*.png
+_build/
+_tools/
+release-output/
+publish-staging/
+**/bin/
+**/obj/
+
+# Never commit private keys, Claude exports, hosting credentials, or local data.
+.secrets/
+*.key
+*.pem
+*.pfx
+*.sig.private
+session-export-*.zip
+claude-session-*/
+AppData/
+
+# Minecraft user data is intentionally outside the managed update scope.
+saves/
+logs/
+screenshots/

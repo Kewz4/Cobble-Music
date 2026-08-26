@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "modpackId": "cobble-music",
+  "channel": "stable",
+  "version": "99.0.0",
+  "releaseTag": "modpack-v99.0.0",
+  "minimumUpdaterVersion": "1.0.0",
+  "mandatory": false,
+  "createdAtUtc": "2026-08-25T00:00:00+00:00",
+  "payload": {
+    "archiveName": "fixture.zip",
+    "size": 1,
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "parts": [
+      {
+        "name": "fixture.part001",
+        "size": 1,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ]
+  },
+  "files": [
+    {
+      "path": "mods/fixture.jar",
+      "size": 1,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "deletePaths": []
+}

@@ -1,0 +1,252 @@
+using System.Text.Json;
+
+namespace CobbleMusicUpdater;
+
+internal static class Program
+{
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
+    public static async Task<int> Main(string[] args)
+    {
+        try
+        {
+            if (args.Contains("--generate-keypair", StringComparer.Ordinal))
+            {
+                return GenerateKeyPair(args);
+            }
+            if (args.Contains("--sign-manifest", StringComparer.Ordinal))
+            {
+                return SignManifest(args);
+            }
+            if (args.Contains("--verify-manifest", StringComparer.Ordinal))
+            {
+                return VerifyManifest(args);
+            }
+            if (args.Contains("--help", StringComparer.Ordinal) || args.Contains("-h", StringComparer.Ordinal))
+            {
+                PrintUsage();
+                return 0;
+            }
+
+            CommandLine options = CommandLine.Parse(args);
+            return await RunUpdaterAsync(options);
+        }
+        catch (Exception exception)
+        {
+            Console.Error.WriteLine($"Cobble Updater: {exception.Message}");
+            return 1;
+        }
+    }
+
+    private static async Task<int> RunUpdaterAsync(CommandLine options)
+    {
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(30));
+        try
+        {
+            UpdaterPaths paths = LocalStateStore.ResolvePaths(options.InstanceDirectory, options.MinecraftDirectory);
+            using FileStream updateLock = LocalStateStore.AcquireOperationLock(paths);
+            // Recover before opening mutable local configuration. A corrupt
+            // configuration must not conceal an interrupted file transaction.
+            await TransactionStore.RecoverIfNeededAsync(paths, BuildInfo.SupportedRoots, Log);
+            UpdaterConfiguration configuration = LocalStateStore.LoadConfiguration(paths);
+            using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(configuration.NetworkTimeoutSeconds));
+
+            RemoteRelease? release;
+            try
+            {
+                Log("Checking GitHub Releases...");
+                release = await releaseClient.GetLatestAsync(configuration, cancellation.Token);
+            }
+            catch (Exception exception) when (configuration.AllowOfflineLaunch && IsExpectedNetworkFailure(exception))
+            {
+                Log($"GitHub is unavailable ({exception.GetType().Name}); launching the last known-good pack.");
+                return 0;
+            }
+
+            var engine = new UpdateEngine(paths, configuration, Log);
+            try
+            {
+                await engine.CheckAndUpdateAsync(release, options.CheckOnly, cancellation.Token);
+                return 0;
+            }
+            catch (TransactionRecoveryException)
+            {
+                throw;
+            }
+            catch (Exception exception) when (options.PrismPrelaunch)
+            {
+                // Bad or unreachable remote data must never partially modify a
+                // friend's instance or turn an otherwise playable local pack
+                // into a blocked Prism launch. The engine rolls back before
+                // this point whenever it has started a transaction.
+                Log($"Update was not applied: {exception.Message}");
+                Log("Launching the last known-good local pack.");
+                return 0;
+            }
+        }
+        catch (TransactionRecoveryException exception)
+        {
+            Log($"Local update recovery needs attention: {exception.Message}");
+            Log("Prism launch is blocked so a partially updated modpack cannot run.");
+            return 1;
+        }
+        catch (UpdaterBusyException exception)
+        {
+            Log($"Update check is already in progress: {exception.Message}");
+            Log("Prism launch is blocked until that update check finishes.");
+            return 1;
+        }
+        catch (Exception exception) when (options.PrismPrelaunch)
+        {
+            Log($"Updater setup issue: {exception.Message}");
+            Log("Launching without changing the local pack.");
+            return 0;
+        }
+    }
+
+    private static bool IsExpectedNetworkFailure(Exception exception) =>
+        exception is HttpRequestException or TaskCanceledException or TimeoutException;
+
+    private static int GenerateKeyPair(string[] args)
+    {
+        string privateOutput = RequiredValue(args, "--private-key-file");
+        string publicOutput = RequiredValue(args, "--public-key-file");
+        if (File.Exists(privateOutput) || File.Exists(publicOutput))
+        {
+            throw new IOException("Refusing to overwrite an existing signing key file.");
+        }
+
+        (byte[] privateSeed, byte[] publicKey) = ManifestSecurity.GenerateKeyPair();
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(privateOutput))!);
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(publicOutput))!);
+            File.WriteAllText(privateOutput, Convert.ToBase64String(privateSeed) + Environment.NewLine);
+            File.WriteAllText(publicOutput, Convert.ToBase64String(publicKey) + Environment.NewLine);
+            Console.WriteLine($"Cobble Updater: private signing seed written to {Path.GetFullPath(privateOutput)}");
+            Console.WriteLine($"Cobble Updater: public verification key written to {Path.GetFullPath(publicOutput)}");
+            Console.WriteLine("Cobble Updater: keep the private seed out of Git, Claude, and all shared folders.");
+            return 0;
+        }
+        finally
+        {
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(privateSeed);
+        }
+    }
+
+    private static int SignManifest(string[] args)
+    {
+        string manifestPath = RequiredValue(args, "--sign-manifest");
+        string privateKeyPath = RequiredValue(args, "--private-key-file");
+        string signatureOutput = RequiredValue(args, "--signature-output");
+        if (File.Exists(signatureOutput))
+        {
+            throw new IOException("Refusing to overwrite an existing manifest signature.");
+        }
+
+        byte[] manifest = File.ReadAllBytes(manifestPath);
+        byte[] seed = Convert.FromBase64String(File.ReadAllText(privateKeyPath).Trim());
+        try
+        {
+            byte[] signature = ManifestSecurity.Sign(manifest, seed);
+            var detached = new DetachedSignature
+            {
+                KeyId = TrustedKeyRing.CurrentKeyId,
+                Signature = Convert.ToBase64String(signature)
+            };
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(signatureOutput))!);
+            File.WriteAllBytes(signatureOutput, JsonSerializer.SerializeToUtf8Bytes(detached, JsonOptions));
+            Console.WriteLine($"Cobble Updater: signed manifest written to {Path.GetFullPath(signatureOutput)}");
+            return 0;
+        }
+        finally
+        {
+            System.Security.Cryptography.CryptographicOperations.ZeroMemory(seed);
+        }
+    }
+
+    private static int VerifyManifest(string[] args)
+    {
+        string manifestPath = RequiredValue(args, "--verify-manifest");
+        string signaturePath = RequiredValue(args, "--signature-file");
+        UpdateManifest manifest = ManifestParser.VerifyAndParse(File.ReadAllBytes(manifestPath), File.ReadAllBytes(signaturePath));
+        Console.WriteLine($"Cobble Updater: verified signed manifest for {manifest.ModpackId} {manifest.Version}.");
+        return 0;
+    }
+
+    private static string RequiredValue(string[] args, string key)
+    {
+        int index = Array.FindIndex(args, argument => string.Equals(argument, key, StringComparison.Ordinal));
+        if (index < 0 || index == args.Length - 1 || string.IsNullOrWhiteSpace(args[index + 1]))
+        {
+            throw new ArgumentException($"Missing required value for {key}.");
+        }
+        return args[index + 1];
+    }
+
+    private static void Log(string message) => Console.WriteLine($"Cobble Updater: {message}");
+
+    private static void PrintUsage()
+    {
+        Console.WriteLine("Cobble Music Updater");
+        Console.WriteLine("  CobbleMusicUpdater.exe --instance-dir <Prism instance> --minecraft-dir <minecraft folder> --prism-prelaunch");
+        Console.WriteLine("  CobbleMusicUpdater.exe --generate-keypair --private-key-file <path> --public-key-file <path>");
+        Console.WriteLine("  CobbleMusicUpdater.exe --sign-manifest <manifest.json> --private-key-file <path> --signature-output <manifest.sig>");
+        Console.WriteLine("  CobbleMusicUpdater.exe --verify-manifest <manifest.json> --signature-file <manifest.sig>");
+    }
+}
+
+internal sealed record CommandLine(
+    string InstanceDirectory,
+    string MinecraftDirectory,
+    bool PrismPrelaunch,
+    bool CheckOnly)
+{
+    public static CommandLine Parse(string[] args)
+    {
+        string? instanceDirectory = null;
+        string? minecraftDirectory = null;
+        bool prismPrelaunch = false;
+        bool checkOnly = false;
+
+        for (int index = 0; index < args.Length; index++)
+        {
+            switch (args[index])
+            {
+                case "--instance-dir":
+                    instanceDirectory = ReadValue(args, ref index, "--instance-dir");
+                    break;
+                case "--minecraft-dir":
+                    minecraftDirectory = ReadValue(args, ref index, "--minecraft-dir");
+                    break;
+                case "--prism-prelaunch":
+                    prismPrelaunch = true;
+                    break;
+                case "--check-only":
+                    checkOnly = true;
+                    break;
+                default:
+                    throw new ArgumentException($"Unknown argument: {args[index]}");
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(instanceDirectory) || string.IsNullOrWhiteSpace(minecraftDirectory))
+        {
+            throw new ArgumentException("--instance-dir and --minecraft-dir are required.");
+        }
+        return new CommandLine(instanceDirectory, minecraftDirectory, prismPrelaunch, checkOnly);
+    }
+
+    private static string ReadValue(string[] args, ref int index, string key)
+    {
+        if (++index >= args.Length || args[index].StartsWith("--", StringComparison.Ordinal))
+        {
+            throw new ArgumentException($"Missing value for {key}.");
+        }
+        return args[index];
+    }
+}
