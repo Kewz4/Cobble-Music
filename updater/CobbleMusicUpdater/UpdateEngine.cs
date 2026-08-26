@@ -478,6 +478,7 @@ internal sealed class UpdateEngine
                     await ValidateDeltaMutationTargetAsync(file.Path, signedBase, cancellationToken);
                 }
 
+                TransactionOperation operation;
                 if (File.Exists(target))
                 {
                     ManifestFile? expectedOriginal = null;
@@ -486,7 +487,7 @@ internal sealed class UpdateEngine
                     {
                         throw new InvalidDataException($"New delta target appeared immediately before mutation: {file.Path}");
                     }
-                    await BackupForOperationAsync("replace", target, backup, journal, cancellationToken, expectedOriginal);
+                    operation = await BackupForOperationAsync("replace", target, backup, journal, cancellationToken, expectedOriginal);
                 }
                 else
                 {
@@ -494,14 +495,26 @@ internal sealed class UpdateEngine
                     {
                         throw new InvalidDataException($"Delta file target became a directory immediately before mutation: {file.Path}");
                     }
-                    journal.Operations.Add(new TransactionOperation { Kind = "create", TargetPath = target });
+                    operation = new TransactionOperation
+                    {
+                        Kind = "create",
+                        TargetPath = target,
+                        TargetTemporaryPath = TransactionStore.CreateSiblingTemporaryPath(target)
+                    };
+                    journal.Operations.Add(operation);
                     await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
                 }
 
                 // The target was either moved into the journaled rollback
                 // area or proved absent. Never overwrite a file that appears
                 // in the remaining race window.
-                TransactionStore.MoveOrCopyNew(source, target);
+                await TransactionStore.MoveOrCopyNewAsync(
+                    source,
+                    target,
+                    operation.TargetTemporaryPath,
+                    file.Size,
+                    file.Sha256,
+                    cancellationToken);
                 await VerifyFileAsync(target, file.Size, file.Sha256, file.Path, cancellationToken);
                 appliedFiles++;
                 Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
@@ -688,7 +701,7 @@ internal sealed class UpdateEngine
         }
     }
 
-    private async Task BackupForOperationAsync(
+    private async Task<TransactionOperation> BackupForOperationAsync(
         string kind,
         string target,
         string backup,
@@ -702,7 +715,9 @@ internal sealed class UpdateEngine
             TargetPath = target,
             BackupPath = backup,
             OriginalSize = expectedOriginal?.Size ?? new FileInfo(target).Length,
-            OriginalSha256 = expectedOriginal?.Sha256 ?? await PathSafety.Sha256Async(target, cancellationToken)
+            OriginalSha256 = expectedOriginal?.Sha256 ?? await PathSafety.Sha256Async(target, cancellationToken),
+            TargetTemporaryPath = TransactionStore.CreateSiblingTemporaryPath(target),
+            BackupTemporaryPath = TransactionStore.CreateSiblingTemporaryPath(backup)
         };
         journal.Operations.Add(operation);
         await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
@@ -720,8 +735,15 @@ internal sealed class UpdateEngine
                 cancellationToken);
         }
         Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
-        TransactionStore.MoveOrCopyNew(target, backup);
+        await TransactionStore.MoveOrCopyNewAsync(
+            target,
+            backup,
+            operation.BackupTemporaryPath,
+            operation.OriginalSize,
+            operation.OriginalSha256,
+            cancellationToken);
         await VerifyFileAsync(backup, operation.OriginalSize, operation.OriginalSha256, "rollback backup", cancellationToken);
+        return operation;
     }
 
     internal StagingPreparation PrepareStagingAndEnsureSufficientDiskSpace(

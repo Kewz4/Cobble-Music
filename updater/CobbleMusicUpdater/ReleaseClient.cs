@@ -13,6 +13,7 @@ internal sealed class ReleaseClient : IDisposable
     private const int MaxManifestBytes = 8 * 1024 * 1024;
     private const int MaxSignatureBytes = 64 * 1024;
     private const int MaxReleasePages = 5;
+    private const int MaxAssetPagesPerRelease = 10;
 
     private readonly HttpClient _http;
     private readonly JsonSerializerOptions _jsonOptions = new()
@@ -297,7 +298,7 @@ internal sealed class ReleaseClient : IDisposable
 
     public void Dispose() => _http.Dispose();
 
-    private async Task<List<GitHubRelease>> GetPublishedModpackReleasesAsync(
+    internal async Task<List<GitHubRelease>> GetPublishedModpackReleasesAsync(
         UpdaterConfiguration configuration,
         CancellationToken cancellationToken)
     {
@@ -321,9 +322,7 @@ internal sealed class ReleaseClient : IDisposable
             result.AddRange(pageReleases.Where(candidate => !candidate.Draft
                 && !candidate.Prerelease
                 && candidate.TagName.StartsWith("modpack-v", StringComparison.OrdinalIgnoreCase)
-                && VersionPolicy.TryParseCanonical(candidate.TagName["modpack-v".Length..], out _)
-                && candidate.Assets.Any(asset => string.Equals(asset.Name, configuration.ManifestAsset, StringComparison.Ordinal))
-                && candidate.Assets.Any(asset => string.Equals(asset.Name, configuration.SignatureAsset, StringComparison.Ordinal))));
+                && VersionPolicy.TryParseCanonical(candidate.TagName["modpack-v".Length..], out _)));
             if (pageReleases.Count < 100)
             {
                 break;
@@ -333,7 +332,65 @@ internal sealed class ReleaseClient : IDisposable
                 throw new InvalidDataException("GitHub has too many releases for the updater's bounded release-chain scan.");
             }
         }
-        return result;
+        if (result.Any(release => release.Id <= 0))
+        {
+            throw new InvalidDataException("GitHub returned a modpack release without a valid release ID.");
+        }
+
+        // GitHub's nested `assets` field in list-releases responses may be
+        // truncated. Bind security-sensitive names and sizes only against the
+        // explicitly paginated release-assets endpoint.
+        using var throttle = new SemaphoreSlim(4);
+        Task[] assetTasks = result.Select(async release =>
+        {
+            await throttle.WaitAsync(cancellationToken);
+            try
+            {
+                release.Assets = await GetAllReleaseAssetsAsync(configuration, release.Id, cancellationToken);
+            }
+            finally
+            {
+                throttle.Release();
+            }
+        }).ToArray();
+        await Task.WhenAll(assetTasks);
+        return result.Where(release =>
+            release.Assets.Any(asset => string.Equals(asset.Name, configuration.ManifestAsset, StringComparison.Ordinal))
+            && release.Assets.Any(asset => string.Equals(asset.Name, configuration.SignatureAsset, StringComparison.Ordinal))).ToList();
+    }
+
+    internal async Task<List<GitHubAsset>> GetAllReleaseAssetsAsync(
+        UpdaterConfiguration configuration,
+        long releaseId,
+        CancellationToken cancellationToken)
+    {
+        if (releaseId <= 0)
+        {
+            throw new InvalidDataException("GitHub release asset lookup requires a valid release ID.");
+        }
+        var assets = new List<GitHubAsset>();
+        for (int page = 1; page <= MaxAssetPagesPerRelease; page++)
+        {
+            string endpoint = $"https://api.github.com/repos/{configuration.Repository}/releases/{releaseId}/assets?per_page=100&page={page}";
+            using HttpResponseMessage response = await _http.GetAsync(endpoint, cancellationToken);
+            response.EnsureSuccessStatusCode();
+            byte[] assetIndex = await ReadBoundedBytesAsync(response.Content, MaxReleaseIndexBytes, cancellationToken);
+            List<GitHubAsset>? pageAssets = JsonSerializer.Deserialize<List<GitHubAsset>>(assetIndex, _jsonOptions);
+            if (pageAssets is null || pageAssets.Count > 100 || pageAssets.Any(asset => asset is null))
+            {
+                throw new InvalidDataException($"GitHub returned an invalid asset index for release {releaseId}.");
+            }
+            assets.AddRange(pageAssets);
+            if (pageAssets.Count < 100)
+            {
+                return assets;
+            }
+            if (page == MaxAssetPagesPerRelease)
+            {
+                throw new InvalidDataException($"GitHub release {releaseId} exceeds the updater's bounded asset scan.");
+            }
+        }
+        throw new InvalidDataException($"GitHub release {releaseId} asset scan did not terminate safely.");
     }
 
     private async Task<RemoteRelease> DownloadAndVerifyReleaseAsync(

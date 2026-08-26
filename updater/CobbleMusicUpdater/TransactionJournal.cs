@@ -22,6 +22,16 @@ internal sealed class TransactionOperation
     public string BackupPath { get; set; } = "";
     public long OriginalSize { get; set; } = -1;
     public string OriginalSha256 { get; set; } = "";
+    public string TargetTemporaryPath { get; set; } = "";
+    public string BackupTemporaryPath { get; set; } = "";
+}
+
+internal enum TransactionCopyStage
+{
+    Copying,
+    Flushed,
+    Verified,
+    Committed
 }
 
 internal sealed class TransactionRecoveryException : IOException
@@ -111,14 +121,26 @@ internal static class TransactionStore
 
             if (rollback)
             {
+                if (EnsureRecoveryTemporaryPaths(journal))
+                {
+                    await SaveAsync(paths, journal, CancellationToken.None);
+                    ValidateJournal(paths, allowedRoots, journal);
+                }
                 log("Recovering an interrupted local update transaction...");
                 foreach (TransactionOperation operation in journal.Operations.AsEnumerable().Reverse())
                 {
-                    Restore(paths, operation, journal, log);
+                    await RestoreAsync(paths, operation, journal, log, CancellationToken.None);
                 }
                 if (journal.SchemaVersion == 2)
                 {
                     await LocalStateStore.SaveStateAsync(paths, journal.PreviousState!, CancellationToken.None);
+                }
+            }
+            else
+            {
+                foreach (TransactionOperation operation in journal.Operations)
+                {
+                    CleanupTemporaryArtifacts(paths, operation);
                 }
             }
             File.Delete(path);
@@ -132,6 +154,26 @@ internal static class TransactionStore
         {
             throw new TransactionRecoveryException("The updater could not safely recover its last transaction. Prism will not launch to avoid a partial modpack.", exception);
         }
+    }
+
+    private static bool EnsureRecoveryTemporaryPaths(TransactionJournal journal)
+    {
+        bool changed = false;
+        foreach (TransactionOperation operation in journal.Operations)
+        {
+            if (string.IsNullOrWhiteSpace(operation.TargetTemporaryPath))
+            {
+                operation.TargetTemporaryPath = CreateSiblingTemporaryPath(operation.TargetPath);
+                changed = true;
+            }
+            if (operation.Kind is "replace" or "delete"
+                && string.IsNullOrWhiteSpace(operation.BackupTemporaryPath))
+            {
+                operation.BackupTemporaryPath = CreateSiblingTemporaryPath(operation.BackupPath);
+                changed = true;
+            }
+        }
+        return changed;
     }
 
     private static async Task ValidateCommittedOutcomesAsync(
@@ -226,6 +268,54 @@ internal static class TransactionStore
             {
                 throw new TransactionRecoveryException("The updater transaction journal is missing original-file recovery metadata.");
             }
+
+            ValidateTemporaryPath(
+                operation.TargetTemporaryPath,
+                operation.TargetPath,
+                paths.MinecraftDirectory,
+                allowedRoots,
+                "target");
+            if (needsBackup)
+            {
+                ValidateTemporaryPath(
+                    operation.BackupTemporaryPath,
+                    operation.BackupPath,
+                    rollbackRoot,
+                    allowedRoots: null,
+                    "backup");
+            }
+            else if (!string.IsNullOrWhiteSpace(operation.BackupTemporaryPath))
+            {
+                throw new TransactionRecoveryException("The updater transaction journal gives a create operation a backup temporary path.");
+            }
+        }
+    }
+
+    private static void ValidateTemporaryPath(
+        string temporaryPath,
+        string destinationPath,
+        string containmentRoot,
+        IReadOnlyCollection<string>? allowedRoots,
+        string description)
+    {
+        // Empty values are accepted for journals written by earlier updater
+        // versions. Recovery persists a validated sibling path before copying.
+        if (string.IsNullOrWhiteSpace(temporaryPath))
+        {
+            return;
+        }
+        string temporaryFullPath = Path.GetFullPath(temporaryPath);
+        string destinationParent = Path.GetDirectoryName(Path.GetFullPath(destinationPath))!;
+        string name = Path.GetFileName(temporaryFullPath);
+        if (!string.Equals(Path.GetDirectoryName(temporaryFullPath), destinationParent, StringComparison.OrdinalIgnoreCase)
+            || !name.StartsWith(".cobble-music-txn-", StringComparison.Ordinal)
+            || !name.EndsWith(".tmp", StringComparison.Ordinal)
+            || name.Length != ".cobble-music-txn-".Length + 32 + ".tmp".Length
+            || name[".cobble-music-txn-".Length..^".tmp".Length].Any(character => !Uri.IsHexDigit(character))
+            || !PathSafety.TryGetRelativePathUnder(containmentRoot, temporaryFullPath, out string relative)
+            || (allowedRoots is not null && !PathSafety.IsAllowed(relative, allowedRoots)))
+        {
+            throw new TransactionRecoveryException($"The updater transaction journal contains an unsafe {description} temporary path.");
         }
     }
 
@@ -270,13 +360,19 @@ internal static class TransactionStore
             && string.Equals(file.Sha256, expected.Sha256, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static void Restore(UpdaterPaths paths, TransactionOperation operation, TransactionJournal journal, Action<string> log)
+    private static async Task RestoreAsync(
+        UpdaterPaths paths,
+        TransactionOperation operation,
+        TransactionJournal journal,
+        Action<string> log,
+        CancellationToken cancellationToken)
     {
         PathSafety.AssertNoReparsePointsOnTargetPath(paths.MinecraftDirectory, operation.TargetPath);
         if ((operation.Kind is "replace" or "delete") && File.Exists(operation.BackupPath))
         {
             PathSafety.AssertNoReparsePointsOnTargetPath(Path.Combine(paths.LocalDataDirectory, "rollback"), operation.BackupPath);
         }
+        CleanupTemporaryArtifacts(paths, operation);
         switch (operation.Kind)
         {
             case "create":
@@ -293,7 +389,7 @@ internal static class TransactionStore
             case "delete":
                 if (journal.SchemaVersion == 2)
                 {
-                    RestoreSchemaTwoBackup(paths, operation, journal);
+                    await RestoreSchemaTwoBackupAsync(paths, operation, journal, cancellationToken);
                 }
                 else
                 {
@@ -306,7 +402,13 @@ internal static class TransactionStore
                         File.Delete(operation.TargetPath);
                     }
                     Directory.CreateDirectory(Path.GetDirectoryName(operation.TargetPath)!);
-                    MoveOrCopy(operation.BackupPath, operation.TargetPath);
+                    await MoveOrCopyNewAsync(
+                        operation.BackupPath,
+                        operation.TargetPath,
+                        operation.TargetTemporaryPath,
+                        expectedSize: null,
+                        expectedSha256: null,
+                        cancellationToken);
                 }
                 break;
             default:
@@ -333,10 +435,11 @@ internal static class TransactionStore
         File.Delete(operation.TargetPath);
     }
 
-    private static void RestoreSchemaTwoBackup(
+    private static async Task RestoreSchemaTwoBackupAsync(
         UpdaterPaths paths,
         TransactionOperation operation,
-        TransactionJournal journal)
+        TransactionJournal journal,
+        CancellationToken cancellationToken)
     {
         bool targetExists = File.Exists(operation.TargetPath);
         if (!targetExists && Directory.Exists(operation.TargetPath))
@@ -373,7 +476,13 @@ internal static class TransactionStore
             File.Delete(operation.TargetPath);
         }
         Directory.CreateDirectory(Path.GetDirectoryName(operation.TargetPath)!);
-        MoveOrCopy(operation.BackupPath, operation.TargetPath);
+        await MoveOrCopyNewAsync(
+            operation.BackupPath,
+            operation.TargetPath,
+            operation.TargetTemporaryPath,
+            operation.OriginalSize,
+            operation.OriginalSha256,
+            cancellationToken);
     }
 
     private static bool TryGetNextFile(
@@ -439,27 +548,123 @@ internal static class TransactionStore
         }
     }
 
-    public static void MoveOrCopy(string source, string destination)
+    internal static bool ForceCrossVolumeCopyForTests { get; set; }
+    internal static Action<TransactionCopyStage>? CopyStageHookForTests { get; set; }
+
+    internal static string CreateSiblingTemporaryPath(string destination) =>
+        Path.Combine(
+            Path.GetDirectoryName(Path.GetFullPath(destination))!,
+            $".cobble-music-txn-{Guid.NewGuid():N}.tmp");
+
+    private static void CleanupTemporaryArtifacts(UpdaterPaths paths, TransactionOperation operation)
     {
-        try
-        {
-            File.Move(source, destination, overwrite: true);
-        }
-        catch (IOException) when (!string.Equals(Path.GetPathRoot(source), Path.GetPathRoot(destination), StringComparison.OrdinalIgnoreCase))
-        {
-            File.Copy(source, destination, overwrite: true);
-            File.Delete(source);
-        }
+        CleanupTemporaryArtifact(paths.MinecraftDirectory, operation.TargetTemporaryPath);
+        CleanupTemporaryArtifact(Path.Combine(paths.LocalDataDirectory, "rollback"), operation.BackupTemporaryPath);
     }
 
-    public static void MoveOrCopyNew(string source, string destination)
+    private static void CleanupTemporaryArtifact(string containmentRoot, string temporaryPath)
     {
-        if (string.Equals(Path.GetPathRoot(source), Path.GetPathRoot(destination), StringComparison.OrdinalIgnoreCase))
+        if (string.IsNullOrWhiteSpace(temporaryPath))
         {
-            File.Move(source, destination);
             return;
         }
-        File.Copy(source, destination, overwrite: false);
+        FileAttributes attributes;
+        try
+        {
+            attributes = File.GetAttributes(temporaryPath);
+        }
+        catch (FileNotFoundException)
+        {
+            return;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return;
+        }
+        PathSafety.AssertNoReparsePointsOnTargetPath(containmentRoot, temporaryPath);
+        if ((attributes & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new TransactionRecoveryException($"Transaction temporary path became a reparse point: {temporaryPath}");
+        }
+        if ((attributes & FileAttributes.Directory) != 0)
+        {
+            throw new TransactionRecoveryException($"Transaction temporary path became a directory: {temporaryPath}");
+        }
+        File.Delete(temporaryPath);
+    }
+
+    internal static async Task MoveOrCopyNewAsync(
+        string source,
+        string destination,
+        string temporaryPath,
+        long? expectedSize,
+        string? expectedSha256,
+        CancellationToken cancellationToken)
+    {
+        bool crossVolume = ForceCrossVolumeCopyForTests
+            || !string.Equals(Path.GetPathRoot(source), Path.GetPathRoot(destination), StringComparison.OrdinalIgnoreCase);
+        if (!crossVolume)
+        {
+            File.Move(source, destination);
+            CopyStageHookForTests?.Invoke(TransactionCopyStage.Committed);
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(temporaryPath)
+            || File.Exists(temporaryPath)
+            || Directory.Exists(temporaryPath))
+        {
+            throw new IOException("Transaction copy temporary path is missing or already exists.");
+        }
+        Directory.CreateDirectory(Path.GetDirectoryName(temporaryPath)!);
+
+        long verifiedSize = expectedSize ?? new FileInfo(source).Length;
+        string verifiedHash = string.IsNullOrWhiteSpace(expectedSha256)
+            ? await PathSafety.Sha256Async(source, cancellationToken)
+            : expectedSha256;
+        if (verifiedSize < 0 || verifiedHash.Length != 64 || verifiedHash.Any(character => !Uri.IsHexDigit(character)))
+        {
+            throw new InvalidDataException("Transaction copy has invalid expected file metadata.");
+        }
+
+        await using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, useAsync: true))
+        await using (var output = new FileStream(
+            temporaryPath,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            1024 * 1024,
+            FileOptions.Asynchronous | FileOptions.WriteThrough))
+        {
+            byte[] buffer = new byte[256 * 1024];
+            long copied = 0;
+            int read;
+            while ((read = await input.ReadAsync(buffer, cancellationToken)) > 0)
+            {
+                if (copied > verifiedSize - read)
+                {
+                    throw new InvalidDataException("Transaction copy source exceeded its expected size.");
+                }
+                await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                copied += read;
+                CopyStageHookForTests?.Invoke(TransactionCopyStage.Copying);
+            }
+            await output.FlushAsync(cancellationToken);
+            output.Flush(flushToDisk: true);
+            CopyStageHookForTests?.Invoke(TransactionCopyStage.Flushed);
+        }
+
+        if (new FileInfo(temporaryPath).Length != verifiedSize
+            || !PathSafety.IsExpectedHash(await PathSafety.Sha256Async(temporaryPath, cancellationToken), verifiedHash))
+        {
+            throw new InvalidDataException("Transaction copy temporary file failed exact verification.");
+        }
+        CopyStageHookForTests?.Invoke(TransactionCopyStage.Verified);
+
+        // The temporary and destination paths are siblings, so this final
+        // no-overwrite rename is same-volume and atomic.
+        File.Move(temporaryPath, destination);
+        CopyStageHookForTests?.Invoke(TransactionCopyStage.Committed);
         File.Delete(source);
     }
 

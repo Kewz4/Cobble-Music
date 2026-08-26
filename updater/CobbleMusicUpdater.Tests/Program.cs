@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Text.Json;
 using CobbleMusicUpdater;
 
 internal static class Program
@@ -19,10 +20,12 @@ internal static class Program
             TestOfflineLaunchPolicy();
             TestResumeStagingPreparation(Path.Combine(tempRoot, "staging"));
             await TestAdversarialAssetDownloadsAsync(Path.Combine(tempRoot, "downloads"));
+            await TestPaginatedReleaseAssetsAsync();
             await TestExactBaselineAdoptionAsync(Path.Combine(tempRoot, "adoption"));
             await TestExactDeltaBaseValidationAsync(Path.Combine(tempRoot, "delta"));
             await TestDeltaApplyTimeValidationAsync(Path.Combine(tempRoot, "delta-toctou"));
             await TestJournalCommitBoundaryAsync(Path.Combine(tempRoot, "journal"));
+            await TestCrossVolumeTransactionRecoveryAsync(Path.Combine(tempRoot, "cross-volume"));
             Console.WriteLine("Schema-v2 delta, release-chain, exact-baseline adoption, base-integrity, and journal commit-boundary checks passed.");
             return 0;
         }
@@ -311,6 +314,96 @@ internal static class Program
         ReleaseClient.ValidateBoundedAssetMetadata(metadataAsset, 8, "manifest");
     }
 
+    private static async Task TestPaginatedReleaseAssetsAsync()
+    {
+        UpdaterConfiguration configuration = Configuration();
+        configuration.Repository = "owner/repository";
+        const long releaseId = 4242;
+        List<GitHubAsset> firstPage = Enumerable.Range(0, 100)
+            .Select(index => Asset($"filler-{index:D3}.bin", 1))
+            .ToList();
+        List<GitHubAsset> secondPage =
+        [
+            Asset(configuration.ManifestAsset, 128),
+            Asset(configuration.SignatureAsset, 64),
+            Asset("late.part001", 7)
+        ];
+        int assetPageRequests = 0;
+        var pagedHandler = new StubHttpHandler(request =>
+        {
+            string path = request.RequestUri!.AbsolutePath;
+            if (path.EndsWith("/releases", StringComparison.Ordinal))
+            {
+                return JsonResponse(new[]
+                {
+                    new GitHubRelease
+                    {
+                        Id = releaseId,
+                        TagName = "modpack-v1.0.5",
+                        // Deliberately empty: the nested assets list is not a
+                        // trusted complete inventory.
+                        Assets = []
+                    }
+                });
+            }
+            if (path.EndsWith($"/releases/{releaseId}/assets", StringComparison.Ordinal))
+            {
+                assetPageRequests++;
+                string query = request.RequestUri.Query;
+                return query.EndsWith("page=1", StringComparison.Ordinal)
+                    ? JsonResponse(firstPage)
+                    : JsonResponse(secondPage);
+            }
+            throw new InvalidOperationException($"Unexpected test URL: {request.RequestUri}");
+        });
+        using (var client = new ReleaseClient(pagedHandler, TimeSpan.FromSeconds(5)))
+        {
+            List<GitHubRelease> releases = await client.GetPublishedModpackReleasesAsync(
+                configuration,
+                NoCancellation);
+            Equal(1, releases.Count, "release retained after explicit asset paging");
+            Equal(103, releases[0].Assets.Count, "all release asset pages collected");
+            Equal(2, assetPageRequests, "asset endpoint pagination count");
+            UpdateManifest signed = DeltaManifest();
+            signed.Payload!.Size = 7;
+            signed.Payload.Parts =
+            [
+                new PayloadPart { Name = "late.part001", Size = 7, Sha256 = HashText("late") }
+            ];
+            IReadOnlyDictionary<string, Uri> bound = ReleaseClient.BindSignedPartAssets(
+                signed,
+                releases[0].Assets.ToDictionary(asset => asset.Name, StringComparer.OrdinalIgnoreCase));
+            Equal(true, bound.ContainsKey("late.part001"), "signed part found only on later asset page");
+        }
+
+        int cappedRequests = 0;
+        var cappedHandler = new StubHttpHandler(_ =>
+        {
+            cappedRequests++;
+            return JsonResponse(firstPage);
+        });
+        using (var client = new ReleaseClient(cappedHandler, TimeSpan.FromSeconds(5)))
+        {
+            await ThrowsAsync<InvalidDataException>(() => client.GetAllReleaseAssetsAsync(
+                configuration,
+                releaseId,
+                NoCancellation));
+        }
+        Equal(10, cappedRequests, "asset pagination hard cap");
+    }
+
+    private static GitHubAsset Asset(string name, long size) => new()
+    {
+        Name = name,
+        Size = size,
+        BrowserDownloadUrl = $"https://example.invalid/{name}"
+    };
+
+    private static HttpResponseMessage JsonResponse<T>(T value) => new(HttpStatusCode.OK)
+    {
+        Content = new ByteArrayContent(JsonSerializer.SerializeToUtf8Bytes(value))
+    };
+
     private static async Task TestExactDeltaBaseValidationAsync(string root)
     {
         UpdaterPaths paths = Paths(root);
@@ -595,6 +688,179 @@ internal static class Program
             ]
         };
 
+    private static async Task TestCrossVolumeTransactionRecoveryAsync(string root)
+    {
+        TransactionStore.ForceCrossVolumeCopyForTests = true;
+        try
+        {
+            await TestInterruptedCrossVolumeCreateAsync(Path.Combine(root, "create"));
+            await TestInterruptedCrossVolumeReplaceAsync(Path.Combine(root, "replace"));
+            await TestInterruptedCrossVolumeRollbackAsync(Path.Combine(root, "rollback"));
+        }
+        finally
+        {
+            TransactionStore.CopyStageHookForTests = null;
+            TransactionStore.ForceCrossVolumeCopyForTests = false;
+        }
+    }
+
+    private static async Task TestInterruptedCrossVolumeCreateAsync(string root)
+    {
+        UpdaterPaths paths = Paths(root);
+        Directory.CreateDirectory(paths.MinecraftDirectory);
+        Directory.CreateDirectory(paths.InstallationDirectory);
+        string target = PathSafety.CombineUnder(paths.MinecraftDirectory, "mods/create.jar");
+        string source = Path.Combine(root, "source", "create.jar");
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(source)!);
+        byte[] payload = PayloadBytes(700_000, 17);
+        await File.WriteAllBytesAsync(source, payload);
+        var previous = new InstalledState();
+        var next = StateForBytes("1.0.5", HashText("create-next"), "mods/create.jar", payload);
+        var operation = new TransactionOperation
+        {
+            Kind = "create",
+            TargetPath = target,
+            TargetTemporaryPath = TransactionStore.CreateSiblingTemporaryPath(target)
+        };
+        await LocalStateStore.SaveStateAsync(paths, previous, NoCancellation);
+        await TransactionStore.SaveAsync(paths, new TransactionJournal
+        {
+            PreviousState = previous,
+            NextState = next,
+            Operations = [operation]
+        }, NoCancellation);
+
+        TransactionStore.CopyStageHookForTests = ThrowOnFirstCopyChunk();
+        await ThrowsAsync<IOException>(() => TransactionStore.MoveOrCopyNewAsync(
+            source,
+            target,
+            operation.TargetTemporaryPath,
+            payload.LongLength,
+            HashBytes(payload),
+            NoCancellation));
+        TransactionStore.CopyStageHookForTests = null;
+        Equal(false, File.Exists(target), "interrupted create never exposes a partial final target");
+        Equal(true, File.Exists(operation.TargetTemporaryPath), "interrupted create retains its journaled temporary artifact");
+        Equal(true, new FileInfo(operation.TargetTemporaryPath).Length < payload.LongLength, "interrupted create temp is partial");
+
+        await TransactionStore.RecoverIfNeededAsync(paths, BuildInfo.SupportedRoots, _ => { });
+        Equal(false, File.Exists(target), "create rollback leaves final target absent");
+        Equal(false, File.Exists(operation.TargetTemporaryPath), "create rollback removes transaction temp");
+        Equal(true, File.Exists(source), "interrupted create retains verified source");
+        Equal(false, File.Exists(TransactionStore.JournalPath(paths)), "create rollback clears journal");
+    }
+
+    private static async Task TestInterruptedCrossVolumeReplaceAsync(string root)
+    {
+        UpdaterPaths paths = Paths(root);
+        Directory.CreateDirectory(paths.MinecraftDirectory);
+        Directory.CreateDirectory(paths.InstallationDirectory);
+        string target = PathSafety.CombineUnder(paths.MinecraftDirectory, "mods/replace.jar");
+        string backup = Path.Combine(paths.LocalDataDirectory, "rollback", "tx", "files", "mods", "replace.jar");
+        string source = Path.Combine(root, "source", "replace.jar");
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(source)!);
+        byte[] oldPayload = PayloadBytes(600_000, 31);
+        byte[] newPayload = PayloadBytes(700_000, 47);
+        await File.WriteAllBytesAsync(backup, oldPayload);
+        await File.WriteAllBytesAsync(source, newPayload);
+        InstalledState previous = StateForBytes("1.0.4", HashText("replace-base"), "mods/replace.jar", oldPayload);
+        InstalledState next = StateForBytes("1.0.5", HashText("replace-next"), "mods/replace.jar", newPayload);
+        TransactionOperation operation = ReplacementOperation(target, backup, oldPayload);
+        await LocalStateStore.SaveStateAsync(paths, previous, NoCancellation);
+        await TransactionStore.SaveAsync(paths, new TransactionJournal
+        {
+            PreviousState = previous,
+            NextState = next,
+            Operations = [operation]
+        }, NoCancellation);
+
+        TransactionStore.CopyStageHookForTests = ThrowOnFirstCopyChunk();
+        await ThrowsAsync<IOException>(() => TransactionStore.MoveOrCopyNewAsync(
+            source,
+            target,
+            operation.TargetTemporaryPath,
+            newPayload.LongLength,
+            HashBytes(newPayload),
+            NoCancellation));
+        TransactionStore.CopyStageHookForTests = null;
+        Equal(false, File.Exists(target), "interrupted replacement never exposes a partial final target");
+
+        await TransactionStore.RecoverIfNeededAsync(paths, BuildInfo.SupportedRoots, _ => { });
+        Equal(HashBytes(oldPayload), await PathSafety.Sha256Async(target, NoCancellation), "replacement interruption restores exact old file");
+        Equal(false, File.Exists(operation.TargetTemporaryPath), "replacement recovery removes transaction temp");
+        Equal(false, File.Exists(backup), "replacement recovery consumes rollback backup");
+        Equal(true, File.Exists(source), "replacement interruption retains verified payload source");
+    }
+
+    private static async Task TestInterruptedCrossVolumeRollbackAsync(string root)
+    {
+        UpdaterPaths paths = Paths(root);
+        Directory.CreateDirectory(paths.MinecraftDirectory);
+        Directory.CreateDirectory(paths.InstallationDirectory);
+        string target = PathSafety.CombineUnder(paths.MinecraftDirectory, "mods/rollback.jar");
+        string backup = Path.Combine(paths.LocalDataDirectory, "rollback", "tx", "files", "mods", "rollback.jar");
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+        byte[] oldPayload = PayloadBytes(700_000, 59);
+        byte[] newPayload = PayloadBytes(700_000, 71);
+        await File.WriteAllBytesAsync(target, newPayload);
+        await File.WriteAllBytesAsync(backup, oldPayload);
+        InstalledState previous = StateForBytes("1.0.4", HashText("rollback-base"), "mods/rollback.jar", oldPayload);
+        InstalledState next = StateForBytes("1.0.5", HashText("rollback-next"), "mods/rollback.jar", newPayload);
+        TransactionOperation operation = ReplacementOperation(target, backup, oldPayload);
+        await LocalStateStore.SaveStateAsync(paths, previous, NoCancellation);
+        await TransactionStore.SaveAsync(paths, new TransactionJournal
+        {
+            PreviousState = previous,
+            NextState = next,
+            Operations = [operation]
+        }, NoCancellation);
+
+        TransactionStore.CopyStageHookForTests = ThrowOnFirstCopyChunk();
+        await ThrowsAsync<TransactionRecoveryException>(() => TransactionStore.RecoverIfNeededAsync(
+            paths,
+            BuildInfo.SupportedRoots,
+            _ => { }));
+        TransactionStore.CopyStageHookForTests = null;
+        Equal(false, File.Exists(target), "interrupted rollback never leaves a partial final target");
+        Equal(true, File.Exists(backup), "interrupted rollback retains exact backup source");
+        Equal(true, File.Exists(operation.TargetTemporaryPath), "interrupted rollback retains journaled partial temp");
+        Equal(true, File.Exists(TransactionStore.JournalPath(paths)), "interrupted rollback retains journal");
+
+        await TransactionStore.RecoverIfNeededAsync(paths, BuildInfo.SupportedRoots, _ => { });
+        Equal(HashBytes(oldPayload), await PathSafety.Sha256Async(target, NoCancellation), "second recovery restores exact rollback file");
+        Equal(false, File.Exists(operation.TargetTemporaryPath), "second recovery cleans partial rollback temp");
+        Equal(false, File.Exists(backup), "second recovery consumes rollback backup");
+        Equal(false, File.Exists(TransactionStore.JournalPath(paths)), "second recovery clears journal");
+    }
+
+    private static TransactionOperation ReplacementOperation(string target, string backup, byte[] oldPayload) => new()
+    {
+        Kind = "replace",
+        TargetPath = target,
+        BackupPath = backup,
+        OriginalSize = oldPayload.LongLength,
+        OriginalSha256 = HashBytes(oldPayload),
+        TargetTemporaryPath = TransactionStore.CreateSiblingTemporaryPath(target),
+        BackupTemporaryPath = TransactionStore.CreateSiblingTemporaryPath(backup)
+    };
+
+    private static Action<TransactionCopyStage> ThrowOnFirstCopyChunk()
+    {
+        bool thrown = false;
+        return stage =>
+        {
+            if (!thrown && stage == TransactionCopyStage.Copying)
+            {
+                thrown = true;
+                throw new IOException("Simulated interruption during cross-volume copy.");
+            }
+        };
+    }
+
     private static UpdateManifest BaselineManifest(IReadOnlyDictionary<string, string> contents) => new()
     {
         SchemaVersion = 1,
@@ -694,6 +960,16 @@ internal static class Program
         ]
     };
 
+    private static InstalledState StateForBytes(string version, string manifestHash, string path, byte[] content) => new()
+    {
+        Version = version,
+        ManifestSha256 = manifestHash,
+        ManagedFiles =
+        [
+            new ManagedFileState { Path = path, Size = content.LongLength, Sha256 = HashBytes(content) }
+        ]
+    };
+
     private static ManifestFile FileEntry(string path, string content) => new()
     {
         Path = path,
@@ -729,6 +1005,16 @@ internal static class Program
 
     private static string HashText(string text) =>
         Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(text))).ToLowerInvariant();
+
+    private static string HashBytes(byte[] content) =>
+        Convert.ToHexString(SHA256.HashData(content)).ToLowerInvariant();
+
+    private static byte[] PayloadBytes(int length, int seed)
+    {
+        var bytes = new byte[length];
+        new Random(seed).NextBytes(bytes);
+        return bytes;
+    }
 
     private static void Equal<T>(T expected, T actual, string context)
     {

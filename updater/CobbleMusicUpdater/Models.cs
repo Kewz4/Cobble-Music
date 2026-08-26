@@ -41,6 +41,9 @@ internal sealed class ManagedFileState
 
 internal sealed class GitHubRelease
 {
+    [JsonPropertyName("id")]
+    public long Id { get; set; }
+
     [JsonPropertyName("tag_name")]
     public string TagName { get; set; } = "";
 
