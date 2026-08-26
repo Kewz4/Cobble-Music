@@ -16,6 +16,8 @@ param(
     [string[]]$IncludeRoots = @('mods', 'resourcepacks', 'defaultconfigs', 'kubejs', 'scripts'),
     [string[]]$IncludeFiles = @(
         'config/cobble-music-bridge.json',
+        'config/logbegone.json',
+        'config/MCBrowser/tabs.json',
         'config/ReactiveMusic.json5',
         'config/musicnotification.json',
         'config/resourcepackoverrides.json'
