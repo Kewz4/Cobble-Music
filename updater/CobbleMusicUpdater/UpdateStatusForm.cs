@@ -5,30 +5,47 @@ using System.Windows.Forms;
 
 namespace CobbleMusicUpdater;
 
+internal readonly record struct UpdateStatusLayout(
+    Size ClientSize,
+    Rectangle TitleBounds,
+    Rectangle SubtitleBounds,
+    Rectangle StatusBounds,
+    Rectangle DetailBounds,
+    Rectangle ProgressBounds,
+    Rectangle CloseBounds);
+
 internal sealed class UpdateStatusForm : Form
 {
+    private const int DesignDpi = 96;
+    private const int DesignWidth = 454;
+    private const int DesignHeight = 174;
     private const int CornerRadius = 18;
 
     private readonly CommandLine _options;
     private readonly Func<CommandLine, IProgress<UpdateProgress>?, Task<int>> _runUpdater;
+    private readonly Label _titleLabel;
+    private readonly Label _subtitleLabel;
     private readonly Label _statusLabel;
     private readonly Label _detailLabel;
     private readonly SmoothProgressIndicator _progressIndicator;
     private readonly Button _closeButton;
     private readonly System.Windows.Forms.Timer _closeTimer;
     private bool _canClose;
+    private bool _layingOutContent;
+    private bool _showCloseButton;
 
     public int ExitCode { get; private set; } = 1;
 
-    private UpdateStatusForm(
+    internal UpdateStatusForm(
         CommandLine options,
         Func<CommandLine, IProgress<UpdateProgress>?, Task<int>> runUpdater)
     {
         _options = options;
         _runUpdater = runUpdater;
 
+        SuspendLayout();
         Text = "Kewz's Cobblemon";
-        ClientSize = new Size(454, 174);
+        ClientSize = new Size(DesignWidth, DesignHeight);
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterScreen;
         MaximizeBox = false;
@@ -40,56 +57,48 @@ internal sealed class UpdateStatusForm : Form
         ForeColor = Color.FromArgb(247, 245, 255);
         Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
         DoubleBuffered = true;
-        ApplyRoundedRegion();
-        SizeChanged += (_, _) => ApplyRoundedRegion();
 
-        var titleLabel = new Label
+        _titleLabel = new Label
         {
-            AutoSize = true,
-            Location = new Point(25, 22),
+            Name = "titleLabel",
+            AutoEllipsis = true,
             Font = new Font("Segoe UI", 15F, FontStyle.Bold, GraphicsUnit.Point),
             ForeColor = Color.FromArgb(239, 230, 255),
             Text = "Kewz's Cobblemon"
         };
-        var subtitleLabel = new Label
+        _subtitleLabel = new Label
         {
-            AutoSize = true,
-            Location = new Point(27, 50),
+            Name = "subtitleLabel",
+            AutoEllipsis = true,
             Font = new Font("Segoe UI", 8.5F, FontStyle.Regular, GraphicsUnit.Point),
             ForeColor = Color.FromArgb(160, 153, 181),
             Text = "Preparing your adventure"
         };
         _statusLabel = new Label
         {
+            Name = "statusLabel",
             AutoEllipsis = true,
-            Location = new Point(25, 82),
-            Size = new Size(404, 23),
             Font = new Font("Segoe UI", 10F, FontStyle.Bold, GraphicsUnit.Point),
             ForeColor = Color.FromArgb(251, 249, 255),
             Text = "Checking for updates…"
         };
         _detailLabel = new Label
         {
+            Name = "detailLabel",
             AutoEllipsis = true,
-            Location = new Point(26, 106),
-            Size = new Size(402, 18),
             Font = new Font("Segoe UI", 8.25F, FontStyle.Regular, GraphicsUnit.Point),
             ForeColor = Color.FromArgb(166, 160, 185),
             Text = "Securely checking the latest release"
         };
         _progressIndicator = new SmoothProgressIndicator
         {
-            Location = new Point(26, 137),
-            Size = new Size(402, 8),
-            Anchor = AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom,
+            Name = "progressIndicator",
             IsIndeterminate = true
         };
         _closeButton = new Button
         {
+            Name = "closeButton",
             Text = "Close",
-            Location = new Point(348, 137),
-            Size = new Size(80, 28),
-            Anchor = AnchorStyles.Right | AnchorStyles.Bottom,
             FlatStyle = FlatStyle.Flat,
             BackColor = Color.FromArgb(101, 72, 154),
             ForeColor = Color.White,
@@ -115,12 +124,15 @@ internal sealed class UpdateStatusForm : Form
             Close();
         };
 
-        Controls.Add(titleLabel);
-        Controls.Add(subtitleLabel);
+        Controls.Add(_titleLabel);
+        Controls.Add(_subtitleLabel);
         Controls.Add(_statusLabel);
         Controls.Add(_detailLabel);
         Controls.Add(_progressIndicator);
         Controls.Add(_closeButton);
+        AutoScaleDimensions = new SizeF(DesignDpi, DesignDpi);
+        AutoScaleMode = AutoScaleMode.Dpi;
+        ResumeLayout(performLayout: false);
     }
 
     protected override CreateParams CreateParams
@@ -144,10 +156,124 @@ internal sealed class UpdateStatusForm : Form
         return form.ExitCode;
     }
 
+    internal static UpdateStatusLayout CalculateLayout(
+        int dpi,
+        int titlePreferredHeight,
+        int subtitlePreferredHeight,
+        int statusPreferredHeight,
+        int detailPreferredHeight,
+        Size closePreferredSize,
+        bool showCloseButton)
+    {
+        if (dpi <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(dpi));
+        }
+
+        int Scale(int value) => ScaleLogical(value, dpi);
+
+        int outerLeft = Scale(25);
+        int outerRight = Scale(25);
+        int insetLeft = Scale(1);
+        int progressLeft = outerLeft + insetLeft;
+        int progressRight = outerRight + insetLeft;
+        int activeClosePreferredWidth = showCloseButton ? closePreferredSize.Width : 0;
+        int activeClosePreferredHeight = showCloseButton ? closePreferredSize.Height : 0;
+        int progressHeight = Math.Max(2, Scale(8));
+        int closeWidth = Math.Max(Scale(80), activeClosePreferredWidth);
+        int closeHeight = showCloseButton
+            ? Math.Max(Scale(28), activeClosePreferredHeight)
+            : progressHeight;
+        int clientWidth = CalculateClientWidth(dpi, activeClosePreferredWidth);
+        int contentWidth = Math.Max(1, clientWidth - outerLeft - outerRight);
+
+        int top = Scale(22);
+        int titleHeight = Math.Max(Scale(25), titlePreferredHeight);
+        var titleBounds = new Rectangle(outerLeft, top, contentWidth, titleHeight);
+
+        top = titleBounds.Bottom + Scale(3);
+        int subtitleHeight = Math.Max(Scale(17), subtitlePreferredHeight);
+        var subtitleBounds = new Rectangle(
+            outerLeft + insetLeft,
+            top,
+            Math.Max(1, contentWidth - insetLeft),
+            subtitleHeight);
+
+        top = subtitleBounds.Bottom + Scale(15);
+        int statusHeight = Math.Max(Scale(23), statusPreferredHeight);
+        var statusBounds = new Rectangle(outerLeft, top, contentWidth, statusHeight);
+
+        top = statusBounds.Bottom + Scale(1);
+        int detailHeight = Math.Max(Scale(18), detailPreferredHeight);
+        var detailBounds = new Rectangle(
+            outerLeft + insetLeft,
+            top,
+            Math.Max(1, contentWidth - insetLeft),
+            detailHeight);
+
+        int footerTop = detailBounds.Bottom + Scale(13);
+        int progressWidth = Math.Max(1, clientWidth - progressLeft - progressRight);
+        var progressBounds = new Rectangle(
+            progressLeft,
+            footerTop,
+            progressWidth,
+            progressHeight);
+        var closeBounds = new Rectangle(
+            clientWidth - progressRight - closeWidth,
+            footerTop,
+            closeWidth,
+            closeHeight);
+
+        int footerBottom = showCloseButton ? closeBounds.Bottom : progressBounds.Bottom;
+        int requiredHeight = footerBottom + Scale(9);
+        int clientHeight = Math.Max(Scale(DesignHeight), requiredHeight);
+        return new UpdateStatusLayout(
+            new Size(clientWidth, clientHeight),
+            titleBounds,
+            subtitleBounds,
+            statusBounds,
+            detailBounds,
+            progressBounds,
+            closeBounds);
+    }
+
+    private static int CalculateClientWidth(int dpi, int closePreferredWidth)
+    {
+        int horizontalFooterMargins = 2 * (ScaleLogical(25, dpi) + ScaleLogical(1, dpi));
+        int closeWidth = Math.Max(ScaleLogical(80, dpi), closePreferredWidth);
+        return Math.Max(ScaleLogical(DesignWidth, dpi), horizontalFooterMargins + closeWidth);
+    }
+
     protected override void OnShown(EventArgs eventArgs)
     {
         base.OnShown(eventArgs);
         _ = StartUpdateAsync();
+    }
+
+    protected override void OnHandleCreated(EventArgs eventArgs)
+    {
+        base.OnHandleCreated(eventArgs);
+        PerformLayout();
+        ApplyRoundedRegion();
+    }
+
+    protected override void OnLayout(LayoutEventArgs layoutEventArgs)
+    {
+        base.OnLayout(layoutEventArgs);
+        LayoutContent();
+    }
+
+    protected override void OnSizeChanged(EventArgs eventArgs)
+    {
+        base.OnSizeChanged(eventArgs);
+        ApplyRoundedRegion();
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs eventArgs)
+    {
+        base.OnDpiChanged(eventArgs);
+        PerformLayout();
+        ApplyRoundedRegion();
     }
 
     protected override void OnFormClosing(FormClosingEventArgs eventArgs)
@@ -163,8 +289,14 @@ internal sealed class UpdateStatusForm : Form
     protected override void OnPaint(PaintEventArgs eventArgs)
     {
         base.OnPaint(eventArgs);
+        if (ClientSize.Width <= 1 || ClientSize.Height <= 1)
+        {
+            return;
+        }
         eventArgs.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-        using GraphicsPath path = CreateRoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), CornerRadius);
+        using GraphicsPath path = CreateRoundedPath(
+            new Rectangle(0, 0, ClientSize.Width - 1, ClientSize.Height - 1),
+            ScaleLogical(CornerRadius));
         using var border = new Pen(Color.FromArgb(84, 72, 113), 1F);
         eventArgs.Graphics.DrawPath(border, path);
     }
@@ -190,8 +322,10 @@ internal sealed class UpdateStatusForm : Form
         {
             _statusLabel.ForeColor = Color.FromArgb(255, 193, 204);
             _detailLabel.ForeColor = Color.FromArgb(223, 167, 178);
+            _showCloseButton = true;
             _progressIndicator.Visible = false;
             _closeButton.Visible = true;
+            PerformLayout();
         }
     }
 
@@ -255,17 +389,75 @@ internal sealed class UpdateStatusForm : Form
 
     private void ApplyRoundedRegion()
     {
-        if (Width <= 0 || Height <= 0)
+        if (!IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0)
         {
             return;
         }
-        using GraphicsPath path = CreateRoundedPath(ClientRectangle, CornerRadius);
+        using GraphicsPath path = CreateRoundedPath(ClientRectangle, ScaleLogical(CornerRadius));
         Region = new Region(path);
+    }
+
+    private void LayoutContent()
+    {
+        if (!IsHandleCreated || _layingOutContent || _titleLabel is null)
+        {
+            return;
+        }
+
+        _layingOutContent = true;
+        try
+        {
+            Size closePreferredSize = _closeButton.GetPreferredSize(Size.Empty);
+            int activeClosePreferredWidth = _showCloseButton ? closePreferredSize.Width : 0;
+            int expectedWidth = CalculateClientWidth(DeviceDpi, activeClosePreferredWidth);
+            int contentWidth = Math.Max(1, expectedWidth - ScaleLogical(25) - ScaleLogical(25));
+            int insetContentWidth = Math.Max(1, contentWidth - ScaleLogical(1));
+            UpdateStatusLayout layout = CalculateLayout(
+                DeviceDpi,
+                PreferredHeight(_titleLabel, contentWidth),
+                PreferredHeight(_subtitleLabel, insetContentWidth),
+                PreferredHeight(_statusLabel, contentWidth),
+                PreferredHeight(_detailLabel, insetContentWidth),
+                closePreferredSize,
+                _showCloseButton);
+
+            if (ClientSize != layout.ClientSize)
+            {
+                ClientSize = layout.ClientSize;
+            }
+            _titleLabel.Bounds = layout.TitleBounds;
+            _subtitleLabel.Bounds = layout.SubtitleBounds;
+            _statusLabel.Bounds = layout.StatusBounds;
+            _detailLabel.Bounds = layout.DetailBounds;
+            _progressIndicator.Bounds = layout.ProgressBounds;
+            _closeButton.Bounds = layout.CloseBounds;
+        }
+        finally
+        {
+            _layingOutContent = false;
+        }
+    }
+
+    private static int PreferredHeight(Label label, int width) =>
+        label.GetPreferredSize(new Size(Math.Max(1, width), 0)).Height;
+
+    private int ScaleLogical(int value) => ScaleLogical(value, DeviceDpi);
+
+    private static int ScaleLogical(int value, int dpi) =>
+        Math.Max(1, (int)Math.Round(value * dpi / (double)DesignDpi));
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _closeTimer.Dispose();
+        }
+        base.Dispose(disposing);
     }
 
     private static GraphicsPath CreateRoundedPath(Rectangle bounds, int radius)
     {
-        int diameter = radius * 2;
+        int diameter = Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height));
         var path = new GraphicsPath();
         path.AddArc(bounds.Left, bounds.Top, diameter, diameter, 180, 90);
         path.AddArc(bounds.Right - diameter, bounds.Top, diameter, diameter, 270, 90);

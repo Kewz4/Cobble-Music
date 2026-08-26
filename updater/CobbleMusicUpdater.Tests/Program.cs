@@ -1,7 +1,10 @@
 using System.Security.Cryptography;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Drawing;
+using System.Runtime.ExceptionServices;
 using System.Text.Json;
+using System.Windows.Forms;
 using CobbleMusicUpdater;
 
 internal static class Program
@@ -14,6 +17,8 @@ internal static class Program
         try
         {
             Directory.CreateDirectory(tempRoot);
+            TestCalculatedUpdaterWindowLayoutAt120Dpi();
+            TestUpdaterWindowLayout();
             TestManifestSchemaTwoValidation();
             TestSequentialReleaseChain();
             TestInstanceIdentityNormalization(Path.Combine(tempRoot, "identity"));
@@ -36,6 +41,189 @@ internal static class Program
                 Directory.Delete(tempRoot, recursive: true);
             }
         }
+    }
+
+    private static void TestCalculatedUpdaterWindowLayoutAt120Dpi()
+    {
+        UpdateStatusLayout layout = UpdateStatusForm.CalculateLayout(
+            dpi: 120,
+            titlePreferredHeight: 35,
+            subtitlePreferredHeight: 20,
+            statusPreferredHeight: 23,
+            detailPreferredHeight: 19,
+            closePreferredSize: new Size(100, 35),
+            showCloseButton: false);
+
+        Equal(new Size(568, 218), layout.ClientSize, "120 DPI client size");
+        Equal(new Rectangle(31, 28, 506, 35), layout.TitleBounds, "120 DPI title bounds");
+        Equal(new Rectangle(32, 67, 505, 21), layout.SubtitleBounds, "120 DPI subtitle bounds");
+        Equal(new Rectangle(31, 107, 506, 29), layout.StatusBounds, "120 DPI status bounds");
+        Equal(new Rectangle(32, 137, 505, 22), layout.DetailBounds, "120 DPI detail bounds");
+        Equal(new Rectangle(32, 175, 504, 10), layout.ProgressBounds, "120 DPI progress bounds");
+        Equal(new Rectangle(436, 175, 100, 10), layout.CloseBounds, "120 DPI hidden close bounds");
+
+        UpdateStatusLayout failureLayout = UpdateStatusForm.CalculateLayout(
+            dpi: 120,
+            titlePreferredHeight: 35,
+            subtitlePreferredHeight: 20,
+            statusPreferredHeight: 23,
+            detailPreferredHeight: 19,
+            closePreferredSize: new Size(100, 35),
+            showCloseButton: true);
+        Equal(new Size(568, 221), failureLayout.ClientSize, "120 DPI failure client size");
+        Equal(new Rectangle(436, 175, 100, 35), failureLayout.CloseBounds, "120 DPI visible close bounds");
+
+        UpdateStatusLayout largeButtonLayout = UpdateStatusForm.CalculateLayout(
+            dpi: 120,
+            titlePreferredHeight: 35,
+            subtitlePreferredHeight: 20,
+            statusPreferredHeight: 23,
+            detailPreferredHeight: 19,
+            closePreferredSize: new Size(600, 60),
+            showCloseButton: true);
+        Equal(new Size(664, 246), largeButtonLayout.ClientSize, "large close button grows client bounds");
+        Equal(new Rectangle(32, 175, 600, 60), largeButtonLayout.CloseBounds, "large close button remains inside client bounds");
+    }
+
+    private static void TestUpdaterWindowLayout()
+    {
+        Exception? failure = null;
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                if (!Application.SetHighDpiMode(HighDpiMode.PerMonitorV2))
+                {
+                    throw new InvalidOperationException("Could not enable PerMonitorV2 for the isolated updater UI test.");
+                }
+                using UpdateStatusForm form = CreateStatusForm();
+                form.StartPosition = FormStartPosition.Manual;
+                form.Location = new Point(-10_000, -10_000);
+                _ = form.Handle;
+
+                float appliedFontScale = 1F;
+                int scaleStep = 0;
+                foreach (float fontScale in new[] { 1F, 1.25F, 1.5F, 2F, 1F })
+                {
+                    scaleStep++;
+                    ScaleControlFonts(form, fontScale / appliedFontScale);
+                    appliedFontScale = fontScale;
+                    form.PerformLayout();
+                    AssertStatusLayout(form, $"{fontScale:0.##}x font scale at step {scaleStep}");
+                }
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
+        });
+        thread.IsBackground = true;
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        if (!thread.Join(TimeSpan.FromSeconds(15)))
+        {
+            throw new TimeoutException("The isolated updater UI layout test did not finish within 15 seconds.");
+        }
+
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+    }
+
+    private static UpdateStatusForm CreateStatusForm() => new(
+        new CommandLine("test-instance", "test-minecraft", PrismPrelaunch: true, CheckOnly: false, NoUi: false),
+        (_, _) => Task.FromResult(0));
+
+    private static void ScaleControlFonts(Control parent, float factor)
+    {
+        foreach (Control control in parent.Controls)
+        {
+            control.Font = new Font(
+                control.Font.FontFamily,
+                control.Font.SizeInPoints * factor,
+                control.Font.Style,
+                GraphicsUnit.Point);
+        }
+    }
+
+    private static void AssertStatusLayout(UpdateStatusForm form, string context)
+    {
+        Equal(AutoScaleMode.Dpi, form.AutoScaleMode, $"{context}: DPI autoscaling mode");
+        int minimumDpiWidth = (int)Math.Round(454 * form.DeviceDpi / 96D);
+        Equal(true, form.ClientSize.Width >= minimumDpiWidth, $"{context}: DPI-scaled minimum width");
+
+        Control title = FindControl(form, "titleLabel");
+        Control subtitle = FindControl(form, "subtitleLabel");
+        Control status = FindControl(form, "statusLabel");
+        Control detail = FindControl(form, "detailLabel");
+        Control progress = FindControl(form, "progressIndicator");
+        Control close = FindControl(form, "closeButton");
+
+        Size closePreferredSize = close.GetPreferredSize(Size.Empty);
+        UpdateStatusLayout expected = UpdateStatusForm.CalculateLayout(
+            form.DeviceDpi,
+            title.GetPreferredSize(new Size(title.Width, 0)).Height,
+            subtitle.GetPreferredSize(new Size(subtitle.Width, 0)).Height,
+            status.GetPreferredSize(new Size(status.Width, 0)).Height,
+            detail.GetPreferredSize(new Size(detail.Width, 0)).Height,
+            closePreferredSize,
+            showCloseButton: false);
+        Equal(expected.ClientSize, form.ClientSize, $"{context}: exact client size");
+        Equal(expected.TitleBounds, title.Bounds, $"{context}: exact title bounds");
+        Equal(expected.SubtitleBounds, subtitle.Bounds, $"{context}: exact subtitle bounds");
+        Equal(expected.StatusBounds, status.Bounds, $"{context}: exact status bounds");
+        Equal(expected.DetailBounds, detail.Bounds, $"{context}: exact detail bounds");
+        Equal(expected.ProgressBounds, progress.Bounds, $"{context}: exact progress bounds");
+        Equal(expected.CloseBounds, close.Bounds, $"{context}: exact close bounds");
+
+        foreach (Control control in new[] { title, subtitle, status, detail, progress, close })
+        {
+            Equal(true, form.ClientRectangle.Contains(control.Bounds), $"{context}: {control.Name} inside client bounds");
+        }
+
+        Equal(true, title.Bottom <= subtitle.Top, $"{context}: title/subtitle separation");
+        Equal(true, subtitle.Bottom <= status.Top, $"{context}: subtitle/status separation");
+        Equal(true, status.Bottom <= detail.Top, $"{context}: status/detail separation");
+        Equal(true, detail.Bottom <= progress.Top, $"{context}: detail/progress separation");
+        Equal(true, detail.Bottom <= close.Top, $"{context}: detail/close separation");
+
+        foreach (Control label in new[] { title, subtitle, status, detail })
+        {
+            int preferredHeight = label.GetPreferredSize(new Size(label.Width, 0)).Height;
+            Equal(true, label.Height >= preferredHeight, $"{context}: {label.Name} text height");
+        }
+        UpdateStatusLayout failureLayout = UpdateStatusForm.CalculateLayout(
+            form.DeviceDpi,
+            title.GetPreferredSize(new Size(title.Width, 0)).Height,
+            subtitle.GetPreferredSize(new Size(subtitle.Width, 0)).Height,
+            status.GetPreferredSize(new Size(status.Width, 0)).Height,
+            detail.GetPreferredSize(new Size(detail.Width, 0)).Height,
+            closePreferredSize,
+            showCloseButton: true);
+        Equal(true, failureLayout.CloseBounds.Width >= closePreferredSize.Width, $"{context}: visible close button text width");
+        Equal(true, failureLayout.CloseBounds.Height >= closePreferredSize.Height, $"{context}: visible close button text height");
+        Equal(
+            true,
+            new Rectangle(Point.Empty, failureLayout.ClientSize).Contains(failureLayout.CloseBounds),
+            $"{context}: visible close button inside failure client bounds");
+
+        using var regionBitmap = new Bitmap(Math.Max(1, form.ClientSize.Width), Math.Max(1, form.ClientSize.Height));
+        using Graphics graphics = Graphics.FromImage(regionBitmap);
+        RectangleF regionBounds = form.Region?.GetBounds(graphics)
+            ?? throw new InvalidOperationException($"{context}: rounded form region is missing.");
+        Equal(true, Math.Abs(regionBounds.Width - form.ClientSize.Width) <= 1F, $"{context}: region width tracks client width");
+        Equal(true, Math.Abs(regionBounds.Height - form.ClientSize.Height) <= 1F, $"{context}: region height tracks client height");
+    }
+
+    private static Control FindControl(Control parent, string name)
+    {
+        Control[] matches = parent.Controls.Find(name, searchAllChildren: true);
+        if (matches.Length != 1)
+        {
+            throw new InvalidOperationException($"Expected one updater UI control named {name}, found {matches.Length}.");
+        }
+        return matches[0];
     }
 
     private static void TestManifestSchemaTwoValidation()
