@@ -879,6 +879,8 @@ The bootstrap verifies the exact updater executable before installation. No priv
     $release = Get-Release $validatedReleaseId
     Assert-DraftReleaseIdentity $release $validatedReleaseId $tag $commit
     Assert-ExactRemoteInventory $release $expectedAssets
+    Assert-SourceStillBound $commit
+    Assert-ReservedUpdaterTagRef $tag $commit
     Invoke-GhJson @('api', '--method', 'PATCH', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$Repository/releases/$validatedReleaseId", '--input', $publishPayload) | Out-Null
     Assert-ReservedUpdaterTagRef $tag $commit
     $published = Get-Release $validatedReleaseId

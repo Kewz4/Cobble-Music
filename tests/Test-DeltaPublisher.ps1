@@ -555,17 +555,22 @@ finally {
 $publishFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Publish-StagedRelease' }, $true)
 $publishFunctionText = $publishFunction.Extent.Text
 $patchIndex = $publishFunctionText.IndexOf("'draft=false'", [StringComparison]::Ordinal)
+$patchCallStartIndex = $publishFunctionText.IndexOf("Invoke-GhJson -Arguments @('api', '--method', 'PATCH'", [StringComparison]::Ordinal)
 $finalUpdaterCheckIndex = $publishFunctionText.LastIndexOf('Assert-PublishedPinnedUpdater', [StringComparison]::Ordinal)
 $finalBaseCheckIndex = $publishFunctionText.LastIndexOf('Assert-PublishedBaseReleaseIdentity', [StringComparison]::Ordinal)
 Assert-True ($patchIndex -gt 0 -and $finalUpdaterCheckIndex -gt 0 -and $finalUpdaterCheckIndex -lt $patchIndex) 'Pinned updater is not revalidated immediately before publication.'
 Assert-True ($finalBaseCheckIndex -gt 0 -and $finalBaseCheckIndex -lt $patchIndex) 'Signed base identity is not revalidated immediately before delta publication.'
 $finalDraftIndex = $publishFunctionText.LastIndexOf("Get-ExactReleaseSnapshotById -ReleaseId `$releaseId -Tag `$tag -State 'draft'", [StringComparison]::Ordinal)
+$finalInventoryStatement = 'Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($finalDraft.Assets) -RequireComplete | Out-Null'
+$finalInventoryIndex = $publishFunctionText.LastIndexOf($finalInventoryStatement, $patchIndex, [StringComparison]::Ordinal)
 $postPublicIndex = $publishFunctionText.IndexOf("Get-ExactReleaseSnapshotById -ReleaseId `$releaseId -Tag `$tag -State 'public'", [StringComparison]::Ordinal)
-Assert-True ($finalDraftIndex -gt $finalBaseCheckIndex -and $finalDraftIndex -lt $patchIndex) 'Final PATCH does not immediately refetch and validate the exact draft ID/tag/assets.'
+Assert-True ($finalDraftIndex -gt $finalBaseCheckIndex -and $finalInventoryIndex -gt $finalDraftIndex -and $finalInventoryIndex -lt $patchIndex) 'Final PATCH does not immediately refetch and validate the exact draft ID/tag/assets.'
 Assert-True ($postPublicIndex -gt $patchIndex) 'Publication does not postvalidate the same release ID/tag/public state.'
 $preCapacityIndex = $publishFunctionText.LastIndexOf('Assert-CobblePublicReleaseCapacity -Releases @(Get-GitHubReleaseIndex) -AdditionalPublicReleases 1', $patchIndex, [StringComparison]::Ordinal)
 $postCapacityIndex = $publishFunctionText.IndexOf('Assert-CobblePublicReleaseCapacity -Releases @(Get-GitHubReleaseIndex) -AdditionalPublicReleases 0', $patchIndex, [StringComparison]::Ordinal)
-Assert-True ($preCapacityIndex -gt $finalDraftIndex -and $preCapacityIndex -lt $patchIndex) 'Publication does not gate the prospective public release index after final draft/inventory validation and directly before PATCH.'
+Assert-True ($preCapacityIndex -gt $finalBaseCheckIndex -and $preCapacityIndex -lt $finalDraftIndex) 'Publication does not gate capacity before the final exact draft/inventory re-fetch.'
+$betweenFinalInventoryAndPatch = $publishFunctionText.Substring($finalInventoryIndex + $finalInventoryStatement.Length, $patchCallStartIndex - ($finalInventoryIndex + $finalInventoryStatement.Length))
+Assert-True ([string]::IsNullOrWhiteSpace($betweenFinalInventoryAndPatch)) 'Another operation can race after final modpack draft/inventory validation and before PATCH.'
 Assert-True ($postCapacityIndex -gt $postPublicIndex) 'Publication does not postvalidate the updater-safe public release count.'
 $deleteIndex = $publishFunctionText.IndexOf("'DELETE'", [StringComparison]::Ordinal)
 $deleteRefetchIndex = $publishFunctionText.LastIndexOf("Get-ExactReleaseSnapshotById -ReleaseId `$releaseId -Tag `$tag -State 'draft'", $deleteIndex, [StringComparison]::Ordinal)

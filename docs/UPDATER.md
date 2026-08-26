@@ -235,6 +235,9 @@ two-asset inventory. The PATCH response is not trusted: another exact-ID GET
 must then report the same ID/tag/commit with `draft=false`,
 `prerelease=false`, and the same complete inventory. A failed upload or
 validation deliberately retains the draft so the next run can resume safely.
+After the final draft/assets GET, the publisher rechecks the bound local source
+commit and reserved lightweight tag, with the tag check directly adjacent to
+the PATCH.
 Authentication comes only from the GitHub CLI credential store; the publisher
 accepts and emits no secrets.
 
@@ -412,7 +415,9 @@ Updater 1.2 reads at most five 100-item GitHub release-index pages and treats a
 full fifth page as unsafe truncation. Before publication, the publisher fully
 scans the authenticated release index and permits the new public release only
 when it would leave at most 499 non-draft releases in total; public prereleases
-consume slots too. It repeats the count after the exact-ID publication check.
+consume slots too. That prospective scan occurs before a final exact-ID
+draft/assets re-fetch, leaving that identity snapshot directly adjacent to the
+PATCH. The publisher repeats the count after the exact-ID publication check.
 Drafts do not consume player-visible slots, but are still traversed so tag
 uniqueness checks cannot miss a reserved draft beyond the updater's public scan
 window.

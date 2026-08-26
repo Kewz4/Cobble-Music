@@ -86,11 +86,15 @@ if ($patchCallIndex -lt 0 -or $prePatchRefIndex -lt 0 -or $prePatchRefIndex -ge 
     -or $postPatchRefIndex -le $patchCallIndex) {
     throw 'Updater publisher does not revalidate the exact reserved tag immediately around publication PATCH.'
 }
-if ($finalSourceBindingIndex -lt 0 -or $prePatchRefIndex -le $finalSourceBindingIndex -or $prePatchGetIndex -le $prePatchRefIndex `
-    -or $prePatchIdentityIndex -le $prePatchGetIndex -or $prePatchInventoryIndex -le $prePatchIdentityIndex -or $prePatchInventoryIndex -ge $patchCallIndex `
+if ($prePatchGetIndex -lt 0 -or $prePatchIdentityIndex -le $prePatchGetIndex -or $prePatchInventoryIndex -le $prePatchIdentityIndex `
+    -or $finalSourceBindingIndex -le $prePatchInventoryIndex -or $prePatchRefIndex -le $finalSourceBindingIndex -or $prePatchRefIndex -ge $patchCallIndex `
     -or $postPatchGetIndex -le $patchCallIndex -or $postPatchIdentityIndex -le $postPatchGetIndex `
     -or $postPatchInventoryIndex -le $postPatchIdentityIndex) {
     throw 'Updater publisher does not fresh-fetch and fully validate exact release identity/state/assets on both sides of publication PATCH.'
+}
+$betweenFinalRefAndPatch = $publisherText.Substring($prePatchRefIndex + $reservedRefNeedle.Length, $patchCallIndex - ($prePatchRefIndex + $reservedRefNeedle.Length))
+if (-not [string]::IsNullOrWhiteSpace($betweenFinalRefAndPatch)) {
+    throw 'Another operation can race after final updater source/tag validation and before publication PATCH.'
 }
 $gitInvocations = @([regex]::Matches($publisherText, '(?m)&[ \t]+git\b[^\r\n]*') | ForEach-Object { $_.Value })
 if ($gitInvocations.Count -lt 1) { throw 'Updater publisher has no inspectable Git invocation.' }

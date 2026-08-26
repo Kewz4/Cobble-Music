@@ -560,13 +560,14 @@ function Publish-StagedRelease(
     # The final local signature check happens before the final exact-by-ID
     # draft/asset snapshot; no stale tag lookup is used for publication.
     Assert-ManifestSignatureIdentity $StagedIdentity | Out-Null
+    # Updater 1.2 reads at most five 100-item release-index pages and rejects a
+    # full fifth page as ambiguous truncation. Perform the prospective count
+    # before the last exact draft fetch, leaving at most 499 non-draft releases;
+    # public prereleases consume slots too. The exact ID/state/assets re-fetch
+    # then remains the final remote validation immediately before PATCH.
+    Assert-CobblePublicReleaseCapacity -Releases @(Get-GitHubReleaseIndex) -AdditionalPublicReleases 1 | Out-Null
     $finalDraft = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'draft'
     Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($finalDraft.Assets) -RequireComplete | Out-Null
-    # Updater 1.2 reads at most five 100-item release-index pages and rejects a
-    # full fifth page as ambiguous truncation. Perform the prospective count at
-    # the final mutation boundary and leave at most 499 non-draft releases;
-    # public prereleases consume slots too.
-    Assert-CobblePublicReleaseCapacity -Releases @(Get-GitHubReleaseIndex) -AdditionalPublicReleases 1 | Out-Null
     Invoke-GhJson -Arguments @('api', '--method', 'PATCH', "repos/$Repository/releases/$releaseId", '-F', 'draft=false') | Out-Null
 
     $published = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'public'
