@@ -96,6 +96,129 @@ function Assert-CobbleManagedPath {
     return $Path
 }
 
+function Assert-CobbleSourcePathPolicy {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$Context = 'managed source file',
+        [switch]$ExplicitSourceFile
+    )
+
+    $normalized = $Path.Replace('\', '/')
+    Assert-CobbleManagedPath -Path $normalized -Context $Context | Out-Null
+
+    # Minecraft stores downloaded native libraries and Chromium profile data
+    # beside mod jars. Neither is authored pack content. Limiting `mods` to
+    # top-level files prevents cache, cookies, IndexedDB, and other volatile
+    # runtime state from ever becoming release payload data.
+    if ($normalized.StartsWith('mods/', [StringComparison]::OrdinalIgnoreCase)) {
+        $underMods = $normalized.Substring('mods/'.Length)
+        if ($underMods.Contains('/')) {
+            throw "$Context is nested runtime data under mods and may not be distributed: $normalized"
+        }
+        if ($underMods -inotmatch '\.jar(?:\.disabled|\.disabled-by-cobble-music)?$') {
+            throw "$Context is not an approved top-level mod artifact: $normalized"
+        }
+    }
+
+    if ($normalized.StartsWith('resourcepacks/', [StringComparison]::OrdinalIgnoreCase)) {
+        $underResourcePacks = $normalized.Substring('resourcepacks/'.Length)
+        if ($underResourcePacks.Contains('/')) {
+            throw "$Context is nested generated data under resourcepacks and may not be distributed: $normalized"
+        }
+        $isZip = $underResourcePacks -imatch '\.zip$'
+        $isReviewedSidecar = $ExplicitSourceFile -and $underResourcePacks -imatch '\.rpo$'
+        if (-not $isZip -and -not $isReviewedSidecar) {
+            throw "$Context is not an approved top-level resource-pack artifact: $normalized"
+        }
+    }
+
+    if ($normalized -ieq 'config/MCBrowser/tabs.json') {
+        throw "$Context is per-user browser state and may not be distributed: $normalized"
+    }
+
+    $forbiddenSegments = @('.git', '.hg', '.svn', '.idea', '.vscode', 'node_modules', '__pycache__')
+    foreach ($segment in $normalized.Split('/')) {
+        if ($forbiddenSegments -icontains $segment) {
+            throw "$Context contains private or generated workspace state: $normalized"
+        }
+    }
+
+    return $true
+}
+
+function Get-CobbleManagedSourceFiles {
+    param(
+        [Parameter(Mandatory)][string]$SourceMinecraftDir,
+        [Parameter(Mandatory)][string[]]$IncludeRoots,
+        [Parameter(Mandatory)][string[]]$IncludeFiles,
+        [Parameter(Mandatory)][string[]]$AllowedRoots
+    )
+
+    $sourceRoot = [IO.Path]::GetFullPath($SourceMinecraftDir)
+    $byPath = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($rootName in $IncludeRoots | Sort-Object -Unique) {
+        if ($AllowedRoots -cnotcontains $rootName) {
+            throw "Include root is outside the updater allowlist: $rootName"
+        }
+        $rootPath = Join-Path $sourceRoot $rootName
+        if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) { continue }
+        $rootItem = Get-Item -LiteralPath $rootPath
+        if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Include root may not be a reparse point: $rootPath"
+        }
+
+        # Both loaders consume top-level artifacts. Hidden `.index` folders and
+        # other directories below these roots are generated runtime state.
+        $rootFiles = if ($rootName -in @('mods', 'resourcepacks')) {
+            $topLevelFiles = @(Get-ChildItem -LiteralPath $rootPath -File -Force)
+            $approvedPattern = if ($rootName -ceq 'mods') {
+                '\.jar(?:\.disabled|\.disabled-by-cobble-music)?$'
+            }
+            else {
+                '\.zip$'
+            }
+            $excluded = @($topLevelFiles | Where-Object {
+                $_.Name -inotmatch $approvedPattern -and -not ($rootName -ceq 'resourcepacks' -and $_.Name -imatch '\.rpo$')
+            })
+            if ($excluded.Count -gt 0) {
+                Write-Warning "Excluded non-pack artifacts under $rootName`: $($excluded.Name -join ', ')"
+            }
+            @($topLevelFiles | Where-Object { $_.Name -imatch $approvedPattern })
+        }
+        else {
+            @(Get-ChildItem -LiteralPath $rootPath -File -Force -Recurse)
+        }
+        foreach ($file in $rootFiles) {
+            if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Managed source may not be a reparse point: $($file.FullName)"
+            }
+            $relative = [IO.Path]::GetRelativePath($sourceRoot, $file.FullName).Replace('\', '/')
+            Assert-CobbleSourcePathPolicy -Path $relative -Context 'source file' | Out-Null
+            $key = $relative.Normalize([Text.NormalizationForm]::FormC)
+            if (-not $byPath.TryAdd($key, [pscustomobject]@{ full = $file.FullName; path = $relative })) {
+                throw "Managed source contains a duplicate path: $relative"
+            }
+        }
+    }
+
+    foreach ($relativeInput in $IncludeFiles | Sort-Object -Unique) {
+        $relative = $relativeInput.Replace('\', '/')
+        Assert-CobbleSourcePathPolicy -Path $relative -Context 'included file' -ExplicitSourceFile | Out-Null
+        $full = Join-Path $sourceRoot $relative.Replace('/', [IO.Path]::DirectorySeparatorChar)
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
+        $item = Get-Item -LiteralPath $full
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Managed source may not be a reparse point: $($item.FullName)"
+        }
+        $key = $relative.Normalize([Text.NormalizationForm]::FormC)
+        if (-not $byPath.ContainsKey($key)) {
+            $byPath.Add($key, [pscustomobject]@{ full = $item.FullName; path = $relative })
+        }
+    }
+
+    return @($byPath.Values | Sort-Object path)
+}
+
 function Test-CobblePathAtOrUnder {
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -866,6 +989,8 @@ function Assert-CobbleRemoteAssetInventory {
 Export-ModuleMember -Function @(
     'Get-CobbleOptionalPropertyValue',
     'Assert-CobbleManagedPath',
+    'Assert-CobbleSourcePathPolicy',
+    'Get-CobbleManagedSourceFiles',
     'Assert-CobblePrivateKeyIsolation',
     'Open-CobbleLockedFileSnapshot',
     'Assert-CobbleLockedFileSnapshot',

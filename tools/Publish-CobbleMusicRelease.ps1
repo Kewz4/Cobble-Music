@@ -11,18 +11,25 @@ param(
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
     [string]$Version,
 
-    [string]$SourceMinecraftDir = "C:\Program Files\Prism Launcher\instances\Kewz's Cobblemon - Client 1.0.1\minecraft",
+    [string]$SourceMinecraftDir,
     [ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')]
     [string]$Repository = 'Kewz4/Cobble-Music',
     [string]$PrivateKeyPath = (Join-Path $env:USERPROFILE '.cobble-music\keys\cobble-music-release-private.key'),
     [string[]]$IncludeRoots = @('mods', 'resourcepacks', 'defaultconfigs', 'kubejs', 'scripts'),
     [string[]]$IncludeFiles = @(
         'config/cobble-music-bridge.json',
+        'config/cobble-music-pack-version.json',
         'config/logbegone.json',
-        'config/MCBrowser/tabs.json',
         'config/ReactiveMusic.json5',
         'config/musicnotification.json',
-        'config/resourcepackoverrides.json'
+        'config/resourcepackoverrides.json',
+        'resourcepacks/[Chilli´s] punchy! cobblemon (2).zip.rpo',
+        'resourcepacks/Cobblemon Interface Modded.zip.rpo',
+        'resourcepacks/Cobblemon Interface.zip.rpo',
+        'resourcepacks/Icons Compats.zip.rpo',
+        'resourcepacks/Icons v.1.13.2.zip.rpo',
+        'resourcepacks/Punchy refined.zip.rpo',
+        'resourcepacks/refined torches 2.1.zip.rpo'
     ),
     [string]$LegacyCleanupManifest,
 
@@ -223,6 +230,35 @@ function Read-JsonFile([string]$Path, [string]$Description) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Description was not found: $Path" }
     try { return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json }
     catch { throw "$Description is not valid JSON: $Path" }
+}
+
+function Assert-SourceStateBoundToBase(
+    [string]$MinecraftDirectory,
+    [string]$ExpectedVersion,
+    [string]$ExpectedManifestSha256,
+    [object[]]$ExpectedFiles
+) {
+    $statePath = Join-Path $MinecraftDirectory 'cobble-music-updater\state.json'
+    $state = Read-JsonFile -Path $statePath -Description 'Canonical source updater state'
+    if ([int]$state.schemaVersion -ne 1 -or
+        [string]$state.version -cne $ExpectedVersion -or
+        [string]$state.manifestSha256 -cne $ExpectedManifestSha256) {
+        throw "Canonical source is not bound to the exact signed base $ExpectedVersion ($ExpectedManifestSha256): $statePath"
+    }
+
+    $stateSet = ConvertTo-CobbleFileRecordSet -Entries @($state.managedFiles) -Context 'canonical source updater state'
+    $baseSet = ConvertTo-CobbleFileRecordSet -Entries $ExpectedFiles -Context 'signed base files'
+    if ($stateSet.Entries.Count -ne $baseSet.Entries.Count) {
+        throw "Canonical source updater state does not contain the signed base file inventory: $statePath"
+    }
+    for ($index = 0; $index -lt $baseSet.Entries.Count; $index++) {
+        $actual = $stateSet.Entries[$index]
+        $expected = $baseSet.Entries[$index]
+        if ($actual.path -cne $expected.path -or $actual.size -ne $expected.size -or $actual.sha256 -cne $expected.sha256) {
+            throw "Canonical source updater state differs from signed base at $($expected.path): $statePath"
+        }
+    }
+    return $true
 }
 
 function Read-LegacyCleanupManifest([string]$Path, [string[]]$ForbiddenPaths) {
@@ -655,6 +691,9 @@ if (-not $FullBaseline -and [string]::IsNullOrWhiteSpace($BaseVersion)) {
 if ([string]::IsNullOrWhiteSpace($BaseVersion) -and (-not [string]::IsNullOrWhiteSpace($BaseManifestPath) -or -not [string]::IsNullOrWhiteSpace($BaseSignaturePath))) {
     throw '-BaseManifestPath/-BaseSignaturePath require -BaseVersion.'
 }
+if ([string]::IsNullOrWhiteSpace($SourceMinecraftDir)) {
+    throw '-SourceMinecraftDir is required when staging a release; choose the canonical instance explicitly.'
+}
 if (-not (Test-Path -LiteralPath $SourceMinecraftDir -PathType Container)) { throw "Minecraft source directory not found: $SourceMinecraftDir" }
 if (-not (Test-Path -LiteralPath $PrivateKeyPath -PathType Leaf)) { throw "Private signing key not found: $PrivateKeyPath" }
 if (Test-Path -LiteralPath $OutputRoot) { throw "Refusing to overwrite existing release staging output: $OutputRoot" }
@@ -684,33 +723,20 @@ try {
         $baseManifest = Read-JsonSnapshot $baseArtifacts.Identity.Manifest 'Signed base manifest'
         $baseSet = Assert-CobbleBaseManifest -Manifest $baseManifest -ExpectedVersion $BaseVersion -TargetVersion $Version
         $baseFiles = @($baseSet.Entries)
+        Assert-SourceStateBoundToBase -MinecraftDirectory $SourceMinecraftDir -ExpectedVersion $BaseVersion `
+            -ExpectedManifestSha256 $baseHash -ExpectedFiles $baseFiles | Out-Null
         Write-Host "Verified signed base $BaseVersion ($baseHash)."
     }
 
     Write-Host "Building authoritative file manifest from $SourceMinecraftDir"
-    $sourceFiles = [Collections.Generic.List[object]]::new()
-    foreach ($rootName in $IncludeRoots | Sort-Object -Unique) {
-        if ($AllowedRoots -cnotcontains $rootName) { throw "Include root is outside the updater allowlist: $rootName" }
-        $rootPath = Join-Path $SourceMinecraftDir $rootName
-        if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) { continue }
-        $rootItem = Get-Item -LiteralPath $rootPath
-        if (($rootItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Include root may not be a reparse point: $rootPath" }
-        foreach ($file in Get-ChildItem -LiteralPath $rootPath -File -Recurse) {
-            if (($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Managed source may not be a reparse point: $($file.FullName)" }
-            $relative = Get-RelativeSlashPath $file.FullName $SourceMinecraftDir
-            $sourceFiles.Add([pscustomobject]@{ full = $file.FullName; path = $relative; size = $file.Length; sha256 = (Get-Sha256 $file.FullName) })
-        }
-    }
-    foreach ($relativeInput in $IncludeFiles | Sort-Object -Unique) {
-        $relative = $relativeInput.Replace('\', '/')
-        Assert-CobbleManagedPath -Path $relative -Context 'included file' | Out-Null
-        $full = Join-Path $SourceMinecraftDir $relative.Replace('/', [IO.Path]::DirectorySeparatorChar)
-        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
-        if (@($sourceFiles | ForEach-Object { $_.path }) -ccontains $relative) { continue }
-        $item = Get-Item -LiteralPath $full
-        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Managed source may not be a reparse point: $($item.FullName)" }
-        $sourceFiles.Add([pscustomobject]@{ full = $item.FullName; path = $relative; size = $item.Length; sha256 = (Get-Sha256 $item.FullName) })
-    }
+    $sourceFiles = @(
+        Get-CobbleManagedSourceFiles -SourceMinecraftDir $SourceMinecraftDir -IncludeRoots $IncludeRoots `
+            -IncludeFiles $IncludeFiles -AllowedRoots $AllowedRoots |
+            ForEach-Object {
+                $item = Get-Item -LiteralPath $_.full
+                [pscustomobject]@{ full = $_.full; path = $_.path; size = $item.Length; sha256 = (Get-Sha256 $_.full) }
+            }
+    )
 
     $currentSet = ConvertTo-CobbleFileRecordSet -Entries @($sourceFiles) -Context 'current authoritative files'
     $sourcePathByKey = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -727,6 +753,21 @@ try {
         $payloadFiles = @($deltaPlan.PayloadFiles)
         $deletedFiles = @($deltaPlan.DeletedFiles)
         Write-Host "Delta plan: $($payloadFiles.Count) changed/new, $($deletedFiles.Count) deleted, $($deltaPlan.UnchangedFiles.Count) unchanged."
+    }
+
+    $explicitSourcePaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($explicitPath in $IncludeFiles) {
+        [void]$explicitSourcePaths.Add($explicitPath.Replace('\', '/').Normalize([Text.NormalizationForm]::FormC))
+    }
+    foreach ($baseFile in $baseFiles) {
+        $normalized = $baseFile.path.Normalize([Text.NormalizationForm]::FormC)
+        Assert-CobbleSourcePathPolicy -Path $baseFile.path -Context 'signed base manifest file' `
+            -ExplicitSourceFile:($explicitSourcePaths.Contains($normalized)) | Out-Null
+    }
+    foreach ($authoritativeFile in $authoritativeFiles) {
+        $normalized = $authoritativeFile.path.Normalize([Text.NormalizationForm]::FormC)
+        Assert-CobbleSourcePathPolicy -Path $authoritativeFile.path -Context 'final authoritative manifest file' `
+            -ExplicitSourceFile:($explicitSourcePaths.Contains($normalized)) | Out-Null
     }
 
     foreach ($payloadFile in $payloadFiles) {

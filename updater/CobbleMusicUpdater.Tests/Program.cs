@@ -29,6 +29,7 @@ internal static class Program
             await TestExactBaselineAdoptionAsync(Path.Combine(tempRoot, "adoption"));
             await TestExactDeltaBaseValidationAsync(Path.Combine(tempRoot, "delta"));
             await TestDeltaApplyTimeValidationAsync(Path.Combine(tempRoot, "delta-toctou"));
+            await TestSchemaOneSanitizedRecoveryAsync(Path.Combine(tempRoot, "sanitized-baseline"));
             await TestJournalCommitBoundaryAsync(Path.Combine(tempRoot, "journal"));
             await TestCrossVolumeTransactionRecoveryAsync(Path.Combine(tempRoot, "cross-volume"));
             Console.WriteLine("Schema-v2 delta, release-chain, exact-baseline adoption, base-integrity, and journal commit-boundary checks passed.");
@@ -309,6 +310,40 @@ internal static class Program
 
         IReadOnlyList<RemoteRelease> noBaseline = ReleaseClient.BuildSequentialChain([delta105, delta106], new InstalledState());
         Equal(0, noBaseline.Count, "v2-only fresh install must not jump into a delta");
+
+        RemoteRelease longBaseline105 = Remote("1.0.5", 1, HashText("long-manifest-105"));
+        RemoteRelease longDelta106 = Remote("1.0.6", 2, HashText("long-manifest-106"), longBaseline105);
+        RemoteRelease longDelta107 = Remote("1.0.7", 2, HashText("long-manifest-107"), longDelta106);
+        RemoteRelease longDelta108 = Remote("1.0.8", 2, HashText("long-manifest-108"), longDelta107);
+        var pristine101 = new InstalledState { Version = "1.0.1" };
+        IReadOnlyList<RemoteRelease> catchUpFrom101 = ReleaseClient.BuildSequentialChain(
+            [longDelta108, longDelta106, longBaseline105, longDelta107],
+            pristine101);
+        Equal(
+            "1.0.5,1.0.6,1.0.7,1.0.8",
+            string.Join(',', catchUpFrom101.Select(release => release.Manifest.Version)),
+            "1.0.1 player catches up through the full baseline and every exact delta");
+
+        IReadOnlyList<RemoteRelease> catchUpFrom106 = ReleaseClient.BuildSequentialChain(
+            [longDelta108, longDelta106, longBaseline105, longDelta107],
+            new InstalledState
+            {
+                Version = longDelta106.Manifest.Version,
+                ManifestSha256 = longDelta106.ManifestSha256
+            });
+        Equal(
+            "1.0.6,1.0.7,1.0.8",
+            string.Join(',', catchUpFrom106.Select(release => release.Manifest.Version)),
+            "managed 1.0.6 player resumes from its exact signed anchor");
+
+        RemoteRelease periodicFull108 = Remote("1.0.8", 1, HashText("full-manifest-108"));
+        IReadOnlyList<RemoteRelease> directPeriodicBaseline = ReleaseClient.BuildSequentialChain(
+            [longBaseline105, longDelta106, longDelta107, periodicFull108],
+            pristine101);
+        Equal(
+            "1.0.8",
+            string.Join(',', directPeriodicBaseline.Select(release => release.Manifest.Version)),
+            "newer periodic full baseline lets an old player jump directly to latest");
     }
 
     private static void TestInstanceIdentityNormalization(string root)
@@ -766,6 +801,87 @@ internal static class Program
         bool adoptedWithChangedFile = await engine.TryAdoptExistingBaselineAsync(
             baseline, manifestHash, new InstalledState(), NoCancellation);
         Equal(false, adoptedWithChangedFile, "changed same-size file must not be adopted");
+    }
+
+    private static async Task TestSchemaOneSanitizedRecoveryAsync(string root)
+    {
+        UpdaterPaths paths = Paths(root);
+        Directory.CreateDirectory(paths.MinecraftDirectory);
+
+        const string managedCachePath = "mods/mcef-cache/Network/Cookies";
+        const string unmanagedCachePath = "mods/mcef-cache/Network/UnmanagedCookies";
+        const string exactLegacyPath = "mods/timm-legacy.jar";
+        const string changedLegacyPath = "mods/infinite-music-legacy.jar";
+        const string currentPath = "mods/current.jar";
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, managedCachePath, "changed-private-cache");
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, unmanagedCachePath, "unmanaged-private-cache");
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, exactLegacyPath, "legacy-timm");
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, changedLegacyPath, "custom-infinite");
+
+        var previousState = new InstalledState
+        {
+            Version = "1.0.4",
+            ManifestSha256 = HashText("unsafe-baseline"),
+            ManagedFiles =
+            [
+                new ManagedFileState
+                {
+                    Path = managedCachePath,
+                    Size = "original-private-cache".Length,
+                    Sha256 = HashText("original-private-cache")
+                }
+            ]
+        };
+        await LocalStateStore.SaveStateAsync(paths, previousState, NoCancellation);
+
+        ManifestFile current = FileEntry(currentPath, "current-content");
+        var sanitizedBaseline = new UpdateManifest
+        {
+            SchemaVersion = 1,
+            Version = "1.0.5",
+            Files = [current],
+            LegacyCleanup =
+            [
+                new LegacyCleanupFile
+                {
+                    Path = exactLegacyPath,
+                    Size = "legacy-timm".Length,
+                    Sha256 = HashText("legacy-timm")
+                },
+                new LegacyCleanupFile
+                {
+                    Path = changedLegacyPath,
+                    Size = "legacy-infinite".Length,
+                    Sha256 = HashText("legacy-infinite")
+                }
+            ]
+        };
+        string extract = Path.Combine(root, "extract");
+        await WriteRelativeTextAsync(extract, currentPath, "current-content");
+        var logs = new List<string>();
+        var engine = new UpdateEngine(paths, Configuration(), logs.Add);
+        await engine.ApplyTransactionAsync(
+            sanitizedBaseline,
+            HashText("sanitized-baseline"),
+            extract,
+            previousState,
+            signedBase: null,
+            NoCancellation);
+
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, managedCachePath)), "drifted prior managed cache removed by full baseline");
+        Equal(true, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, unmanagedCachePath)), "similarly named unmanaged cache preserved");
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, exactLegacyPath)), "exact legacy music jar removed");
+        Equal("custom-infinite", await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, changedLegacyPath)), "changed legacy jar preserved");
+        Equal(true, logs.Any(line => line.Contains("Keeping changed legacy file", StringComparison.Ordinal)), "changed legacy preservation logged");
+        Equal("1.0.5", LocalStateStore.LoadState(paths).Version, "sanitized baseline state committed");
+        Equal(false, File.Exists(TransactionStore.JournalPath(paths)), "sanitized baseline left no transaction journal");
+    }
+
+    private static async Task WriteRelativeTextAsync(string root, string relativePath, string content)
+    {
+        string path = PathSafety.CombineUnder(root, relativePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        await File.WriteAllTextAsync(path, content);
     }
 
     private static async Task TestJournalCommitBoundaryAsync(string root)

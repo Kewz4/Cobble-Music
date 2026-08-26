@@ -1,0 +1,102 @@
+[
+  {
+    "path": "mods/AdvancementPlaques-1.21.1-fabric-1.6.8.jar",
+    "size": 195505,
+    "sha256": "dda6cc159edd450d05b9ff15832747b951dacd068c601018c219bca833ce5bef"
+  },
+  {
+    "path": "mods/AsyncParticles-21.1.4.0+1.21.1.jar",
+    "size": 1269710,
+    "sha256": "ba6f19e152af4011d0b616ba152e173a36e4c45cc62702b20cee999e2a9a3337"
+  },
+  {
+    "path": "mods/Enhanced-Celestials-Fabric-1.21.1-6.0.2.6.jar",
+    "size": 1535767,
+    "sha256": "660c0a0d03bf392c18b68cdf3548fdd685639339a128ef9c1979ad30dd334449"
+  },
+  {
+    "path": "mods/Only Bottle Caps-1.3.0.jar",
+    "size": 250451,
+    "sha256": "f18d5ddfaa0a77d0ef68b9db470a41095522878e25b1cc2a5282e747c784f09d"
+  },
+  {
+    "path": "mods/ToughAsNails-fabric-1.21.1-10.1.0.13.jar",
+    "size": 666863,
+    "sha256": "097dfeabbc2bf85b872e4e43ba0ad1297783bc9a4a464aa5fc973c5b402f595f"
+  },
+  {
+    "path": "mods/catchrate-display-fabric-2.8.24.jar",
+    "size": 261822,
+    "sha256": "12e3ccfd843e95b65db9e617be54ecacb91ff85fd4b5c307c3a7a29d9dc8656e"
+  },
+  {
+    "path": "mods/cobblemon-journey-mounts-1.7.30-cobbleverse.jar",
+    "size": 3495973,
+    "sha256": "8143cfa64c9e2622b4bafba400b1b770767012bd69d2167e1593616afa928635"
+  },
+  {
+    "path": "mods/colorlight-1.21.1-0.2.0.jar",
+    "size": 149717,
+    "sha256": "64218cb0743a450dd84f240229d8d1bd369a10ad43756ad65127515c37208e53"
+  },
+  {
+    "path": "mods/extrasounds-v3-legacy-3.0.1+1.21.11+1.14-build.3.jar",
+    "size": 2326548,
+    "sha256": "cca1d063566856704eb374f16ebd5704153e0485261dd266ffdd32cbe5e2e5c1"
+  },
+  {
+    "path": "mods/infinite-music-0.4.6.jar",
+    "size": 45913,
+    "sha256": "f90123fa679e170163f976819c851fc4bd6840d19cf95dde3ff8fe3682eed343"
+  },
+  {
+    "path": "mods/minecraft-cursor-fabric-3.11.3+1.21.1.jar",
+    "size": 295354,
+    "sha256": "cf2e26a1bfe7957872e549069fca322b9e6f277c93ab3d78dc4163e18a4a166d"
+  },
+  {
+    "path": "mods/packed_packs-fabric-2.2.3+1.21.1.jar",
+    "size": 820571,
+    "sha256": "432ad4135dd83d7b40dc9fefab13d9c90d36566883c30a2cc04ba4fc9d7ad064"
+  },
+  {
+    "path": "mods/particlerain-4.0.0-beta.10+1.21.1-fabric.jar",
+    "size": 608651,
+    "sha256": "49bf60c5b95ea954efa51c63609f0a4668230e12f870f0eb6bdb63d207a22dc8"
+  },
+  {
+    "path": "mods/screenshottoclipboard-1205~12111-1.1.0.jar",
+    "size": 36277,
+    "sha256": "4e445cbafbed5d326e1933b1556bc956d923dd3bd80ed2337cf5bb47285de064"
+  },
+  {
+    "path": "mods/smart_particles+mc1.21.1-1.01.10.jar",
+    "size": 50316,
+    "sha256": "42380961a313ac77ce62d223b2f59b3375f5c5a3507cd033d712ea6127cef78e"
+  },
+  {
+    "path": "mods/swinginglanterns-1.21.1-1.5.0.jar",
+    "size": 438164,
+    "sha256": "81fc65caf9014b8d778c165d168ca827e3926e99516f9d69b338540d87438c89"
+  },
+  {
+    "path": "mods/timm-1.1.2-1.21.1.jar",
+    "size": 155336231,
+    "sha256": "e843d529412a65f58e28a67e0b1829583f65e63872cad5e9c1f261dad7129c0a"
+  },
+  {
+    "path": "mods/vcc-0.4.0-beta.2-fabric+1.21.1.jar",
+    "size": 99784,
+    "sha256": "4c28bab9807eae5380278a74d446f2e5e90e06cae3bae0442e98488baeea0e0c"
+  },
+  {
+    "path": "resourcepacks/JigglyRadio.zip",
+    "size": 124240613,
+    "sha256": "b766be373fa546f0671e064263f78710943b2ec8a341fe1e2c41075d11b86700"
+  },
+  {
+    "path": "resourcepacks/Original Pokemon Battle Music.zip",
+    "size": 93138424,
+    "sha256": "73dbf078974cd81e5356f98d0b57b5b88c1dfed9aebbbddbfbcf8a3bc3600bb8"
+  }
+]
