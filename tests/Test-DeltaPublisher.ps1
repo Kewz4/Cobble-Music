@@ -554,6 +554,11 @@ finally {
 
 $publishFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Publish-StagedRelease' }, $true)
 $publishFunctionText = $publishFunction.Extent.Text
+$waitReleaseFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Wait-GitHubReleaseByTag' }, $true)
+Assert-True ($null -ne $waitReleaseFunction -and
+    $waitReleaseFunction.Extent.Text.Contains('Get-GitHubReleaseByTag $Tag', [StringComparison]::Ordinal) -and
+    $waitReleaseFunction.Extent.Text.Contains('Start-Sleep -Milliseconds', [StringComparison]::Ordinal)) 'Draft creation lost its bounded eventual-consistency lookup.'
+Assert-True ($publishFunctionText.Contains('Wait-GitHubReleaseByTag $tag', [StringComparison]::Ordinal)) 'Draft creation does not use the bounded release lookup.'
 $patchIndex = $publishFunctionText.IndexOf("'draft=false'", [StringComparison]::Ordinal)
 $patchCallStartIndex = $publishFunctionText.IndexOf("Invoke-GhJson -Arguments @('api', '--method', 'PATCH'", [StringComparison]::Ordinal)
 $finalUpdaterCheckIndex = $publishFunctionText.LastIndexOf('Assert-PublishedPinnedUpdater', [StringComparison]::Ordinal)

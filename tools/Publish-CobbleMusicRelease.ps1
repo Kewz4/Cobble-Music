@@ -376,6 +376,20 @@ function Get-GitHubReleaseByTag([string]$Tag) {
     return $matches[0]
 }
 
+function Wait-GitHubReleaseByTag([string]$Tag, [int]$MaximumAttempts = 8) {
+    if ($MaximumAttempts -lt 1) { throw 'Maximum release lookup attempts must be positive.' }
+    for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+        $release = Get-GitHubReleaseByTag $Tag
+        if ($null -ne $release) { return $release }
+        if ($attempt -lt $MaximumAttempts) {
+            # GitHub's paginated release index can lag immediately after
+            # draft creation even though gh has already returned its URL.
+            Start-Sleep -Milliseconds ([Math]::Min(2000, 250 * $attempt))
+        }
+    }
+    return $null
+}
+
 function Get-GitHubReleaseById([int64]$ReleaseId) {
     return Invoke-GhJson -Arguments @('api', "repos/$Repository/releases/$ReleaseId")
 }
@@ -533,7 +547,7 @@ function Publish-StagedRelease(
             'release', 'create', $tag, '--repo', $Repository,
             '--title', "Cobble Music $Version", '--notes-file', $NotesPath, '--draft'
         ) | Out-Host
-        $release = Get-GitHubReleaseByTag $tag
+        $release = Wait-GitHubReleaseByTag $tag
         if ($null -eq $release) { throw "GitHub did not create the expected draft release: $tag" }
     }
 
