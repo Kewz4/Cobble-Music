@@ -4,7 +4,7 @@ param()
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $Project = Join-Path $Root 'updater\CobbleMusicUpdater\CobbleMusicUpdater.csproj'
-$UpdaterDll = Join-Path $Root 'updater\CobbleMusicUpdater\bin\Release\net10.0\win-x64\CobbleMusicUpdater.dll'
+$UpdaterDll = Join-Path $Root 'updater\CobbleMusicUpdater\bin\Release\net10.0-windows\win-x64\CobbleMusicUpdater.dll'
 $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("cobble-music-recovery-test-" + [Guid]::NewGuid().ToString('N'))
 
 function Get-LocalDataDirectory([string]$InstanceDirectory) {
@@ -41,7 +41,7 @@ try {
     $journalPath = Join-Path $localData 'transaction.json'
     Write-Utf8 $journalPath ($journal | ConvertTo-Json -Depth 5)
 
-    & dotnet $UpdaterDll --instance-dir $instance --minecraft-dir $minecraft --prism-prelaunch | Out-Host
+    & dotnet $UpdaterDll --instance-dir $instance --minecraft-dir $minecraft --prism-prelaunch --no-ui | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "Valid rollback test exited with $LASTEXITCODE" }
     if ((Get-Content -Raw -LiteralPath $target) -ne 'old-content') { throw 'Interrupted replacement was not restored from the rollback copy.' }
     if (Test-Path -LiteralPath $journalPath) { throw 'Recovered transaction journal was not removed.' }
@@ -49,7 +49,7 @@ try {
     $lockPath = Join-Path $localData 'update.lock'
     $heldLock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     try {
-        & dotnet $UpdaterDll --instance-dir $instance --minecraft-dir $minecraft --prism-prelaunch 2>$null
+        & dotnet $UpdaterDll --instance-dir $instance --minecraft-dir $minecraft --prism-prelaunch --no-ui 2>$null
         if ($LASTEXITCODE -eq 0) { throw 'A concurrent updater lock unexpectedly allowed a Prism launch.' }
     }
     finally {
@@ -64,7 +64,7 @@ try {
         operations = @([ordered]@{ kind='delete'; targetPath=$outside; backupPath=$backup })
     }
     Write-Utf8 $journalPath ($unsafeJournal | ConvertTo-Json -Depth 5)
-    & dotnet $UpdaterDll --instance-dir $instance --minecraft-dir $minecraft --prism-prelaunch 2>$null
+    & dotnet $UpdaterDll --instance-dir $instance --minecraft-dir $minecraft --prism-prelaunch --no-ui 2>$null
     if ($LASTEXITCODE -eq 0) { throw 'Unsafe transaction journal unexpectedly allowed a Prism launch.' }
     if ((Get-Content -Raw -LiteralPath $outside) -ne 'do-not-touch') { throw 'Unsafe journal changed a file outside the Minecraft directory.' }
     if (-not (Test-Path -LiteralPath $journalPath)) { throw 'Unsafe journal was removed instead of retained for repair.' }

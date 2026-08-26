@@ -30,7 +30,7 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $OutputRoot = Join-Path $Root "release-output\$Version"
 $UpdaterProject = Join-Path $Root 'updater\CobbleMusicUpdater\CobbleMusicUpdater.csproj'
-$UpdaterDll = Join-Path $Root 'updater\CobbleMusicUpdater\bin\Release\net10.0\win-x64\CobbleMusicUpdater.dll'
+$UpdaterDll = Join-Path $Root 'updater\CobbleMusicUpdater\bin\Release\net10.0-windows\win-x64\CobbleMusicUpdater.dll'
 
 function Assert-Under([string]$Path, [string]$Base) {
     $fullPath = [IO.Path]::GetFullPath($Path)

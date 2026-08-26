@@ -8,12 +8,18 @@ internal sealed class UpdateEngine
     private readonly UpdaterPaths _paths;
     private readonly UpdaterConfiguration _configuration;
     private readonly Action<string> _log;
+    private readonly IProgress<UpdateProgress>? _progress;
 
-    public UpdateEngine(UpdaterPaths paths, UpdaterConfiguration configuration, Action<string> log)
+    public UpdateEngine(
+        UpdaterPaths paths,
+        UpdaterConfiguration configuration,
+        Action<string> log,
+        IProgress<UpdateProgress>? progress = null)
     {
         _paths = paths;
         _configuration = configuration;
         _log = log;
+        _progress = progress;
     }
 
     public async Task CheckAndUpdateAsync(RemoteRelease? remoteRelease, bool checkOnly, CancellationToken cancellationToken)
@@ -22,9 +28,11 @@ internal sealed class UpdateEngine
         if (remoteRelease is null)
         {
             _log("No published update release yet; launching the installed pack.");
+            Report(UpdatePhase.Complete, "No update is published yet — starting Minecraft.");
             return;
         }
 
+        Report(UpdatePhase.VerifyingRelease, "Verifying signed update information…");
         UpdateManifest manifest = ManifestParser.VerifyAndParse(remoteRelease.ManifestBytes, remoteRelease.SignatureBytes);
         ManifestParser.Validate(manifest, _configuration, remoteRelease.AssetUrls);
         if (!string.Equals(manifest.ReleaseTag, remoteRelease.Release.TagName, StringComparison.Ordinal))
@@ -36,24 +44,29 @@ internal sealed class UpdateEngine
 
         if (IsAlreadyInstalled(state, manifest, manifestHash))
         {
-            _log($"Already on Cobble Music {manifest.Version}.");
+            _log($"Already on Kewz's Cobblemon {manifest.Version}.");
+            Report(UpdatePhase.Complete, "You’re up to date — starting Minecraft.");
             return;
         }
         if (IsDowngradeOrMutation(state, manifest, manifestHash))
         {
             _log($"Ignoring non-newer or mutated release {manifest.Version}; keeping local {state.Version}.");
+            Report(UpdatePhase.Complete, "Keeping your installed Kewz's Cobblemon version.");
             return;
         }
 
         _log($"Update {manifest.Version} is available.");
+        Report(UpdatePhase.UpdateAvailable, $"Update found: Kewz's Cobblemon {manifest.Version}");
         if (checkOnly)
         {
+            Report(UpdatePhase.Complete, $"Kewz's Cobblemon {manifest.Version} is ready to install.");
             return;
         }
 
         LocalStateStore.AssertWritable(_paths);
         await DownloadVerifyAndApplyAsync(manifest, manifestHash, remoteRelease.AssetUrls, state, cancellationToken);
-        _log($"Cobble Music {manifest.Version} installed successfully.");
+        _log($"Kewz's Cobblemon {manifest.Version} installed successfully.");
+        Report(UpdatePhase.Complete, $"Kewz's Cobblemon {manifest.Version} installed — starting Minecraft.");
     }
 
     private bool IsAlreadyInstalled(InstalledState state, UpdateManifest manifest, string manifestHash)
@@ -78,7 +91,7 @@ internal sealed class UpdateEngine
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, manifestFile.Path);
             if (!File.Exists(target) || new FileInfo(target).Length != manifestFile.Size)
             {
-                _log($"Repairing incomplete local Cobble Music {manifest.Version} files.");
+                _log($"Repairing incomplete local Kewz's Cobblemon {manifest.Version} files.");
                 return false;
             }
         }
@@ -108,18 +121,31 @@ internal sealed class UpdateEngine
         Directory.CreateDirectory(partsDirectory);
 
         using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(_configuration.NetworkTimeoutSeconds));
+        long totalDownloadBytes = checked(manifest.Payload.Parts.Sum(part => part.Size));
+        long completedDownloadBytes = 0;
         foreach (PayloadPart part in manifest.Payload.Parts)
         {
             string partPath = Path.Combine(partsDirectory, part.Name);
             _log($"Downloading {part.Name}...");
-            await DownloadVerifiedPartAsync(releaseClient, assetUrls[part.Name], part, partPath, cancellationToken);
+            long completedBeforePart = completedDownloadBytes;
+            Report(UpdatePhase.Downloading, "Downloading update", completedBeforePart, totalDownloadBytes);
+            await DownloadVerifiedPartAsync(
+                releaseClient,
+                assetUrls[part.Name],
+                part,
+                partPath,
+                downloaded => Report(UpdatePhase.Downloading, "Downloading update", completedBeforePart + downloaded, totalDownloadBytes),
+                cancellationToken);
+            completedDownloadBytes = checked(completedDownloadBytes + part.Size);
         }
 
         _log("Reassembling verified update payload...");
+        Report(UpdatePhase.Reassembling, "Reassembling verified update…");
         await CombinePartsAsync(manifest.Payload.Parts, partsDirectory, archivePath, cancellationToken);
         await VerifyFileAsync(archivePath, manifest.Payload.Size, manifest.Payload.Sha256, "update payload", cancellationToken);
 
         _log("Validating update archive...");
+        Report(UpdatePhase.Validating, "Validating update files…");
         if (Directory.Exists(extractDirectory))
         {
             Directory.Delete(extractDirectory, recursive: true);
@@ -128,6 +154,7 @@ internal sealed class UpdateEngine
         await ExtractAndVerifyAsync(archivePath, extractDirectory, manifest.Files, cancellationToken);
 
         _log("Applying verified update...");
+        Report(UpdatePhase.Applying, "Installing verified files", 0, 0, 0, manifest.Files.Count);
         await ApplyTransactionAsync(manifest, manifestHash, extractDirectory, previousState, cancellationToken);
         TryDeleteDirectory(workDirectory);
     }
@@ -137,11 +164,12 @@ internal sealed class UpdateEngine
         Uri source,
         PayloadPart part,
         string destination,
+        Action<long>? reportDownloadedBytes,
         CancellationToken cancellationToken)
     {
         for (int attempt = 1; attempt <= 2; attempt++)
         {
-            await client.DownloadFileAsync(source, destination, part.Size, cancellationToken);
+            await client.DownloadFileAsync(source, destination, part.Size, reportDownloadedBytes, cancellationToken);
             string actualHash = await PathSafety.Sha256Async(destination, cancellationToken);
             if (PathSafety.IsExpectedHash(actualHash, part.Sha256))
             {
@@ -245,8 +273,11 @@ internal sealed class UpdateEngine
         var journal = new TransactionJournal();
         try
         {
+            int appliedFiles = 0;
+            int totalFiles = manifest.Files.Count;
             foreach (ManifestFile file in manifest.Files)
             {
+                Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
                 string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
                 string source = PathSafety.CombineUnder(extractDirectory, file.Path);
                 string backup = PathSafety.CombineUnder(backupDirectory, file.Path);
@@ -268,6 +299,8 @@ internal sealed class UpdateEngine
 
                 TransactionStore.MoveOrCopy(source, target);
                 await VerifyFileAsync(target, file.Size, file.Sha256, file.Path, cancellationToken);
+                appliedFiles++;
+                Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
             }
 
             var oldManagedPaths = previousState.ManagedFiles
@@ -374,4 +407,13 @@ internal sealed class UpdateEngine
             // The next updater run can safely clean its own staging directory.
         }
     }
+
+    private void Report(
+        UpdatePhase phase,
+        string message,
+        long completedBytes = 0,
+        long totalBytes = 0,
+        int currentItem = 0,
+        int totalItems = 0) =>
+        _progress?.Report(new UpdateProgress(phase, message, completedBytes, totalBytes, currentItem, totalItems));
 }

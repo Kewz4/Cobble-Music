@@ -1,4 +1,4 @@
-# Cobble Music
+# Kewz's Cobblemon
 
 Curated music, compatibility tooling, and a Windows updater for the Cobblemon
 client pack.
@@ -15,6 +15,12 @@ highest stable signed `modpack-v*` GitHub Release, downloads only declared updat
 verifies every SHA-256 hash, and applies only approved paths under the Minecraft
 folder. It never edits saves, screenshots, logs, `options.txt`, or arbitrary
 paths named by a remote release.
+
+At launch it displays a compact, borderless **Kewz's Cobblemon** status card;
+it shows a real download/install progress bar only when a signed update is
+found. Friends who do not yet have the EXE or Prism hook can run the
+checksum-verified one-time
+bootstrap documented in [the updater guide](docs/UPDATER.md#first-time-player-setup).
 
 Normal source or updater-binary releases may coexist in this repository: they
 are ignored unless they use the reserved signed `modpack-v*` release format.

@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Text.Json;
@@ -66,7 +68,7 @@ internal sealed class ReleaseClient : IDisposable
         if (!assets.TryGetValue(configuration.ManifestAsset, out GitHubAsset? manifestAsset)
             || !assets.TryGetValue(configuration.SignatureAsset, out GitHubAsset? signatureAsset))
         {
-            throw new InvalidDataException("Latest GitHub release is missing the signed Cobble Music manifest assets.");
+            throw new InvalidDataException("Latest GitHub release is missing the signed Kewz's Cobblemon manifest assets.");
         }
 
         byte[] manifest = await DownloadBytesAsync(new Uri(manifestAsset.BrowserDownloadUrl), MaxManifestBytes, cancellationToken);
@@ -75,7 +77,12 @@ internal sealed class ReleaseClient : IDisposable
         return new RemoteRelease(release, manifest, signature, urls);
     }
 
-    public async Task DownloadFileAsync(Uri source, string destination, long expectedSize, CancellationToken cancellationToken)
+    public async Task DownloadFileAsync(
+        Uri source,
+        string destination,
+        long expectedSize,
+        Action<long>? reportDownloadedBytes,
+        CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
         long existingSize = File.Exists(destination) ? new FileInfo(destination).Length : 0L;
@@ -86,6 +93,7 @@ internal sealed class ReleaseClient : IDisposable
         }
         if (existingSize == expectedSize)
         {
+            reportDownloadedBytes?.Invoke(expectedSize);
             return;
         }
 
@@ -103,6 +111,8 @@ internal sealed class ReleaseClient : IDisposable
             existingSize = 0L;
         }
 
+        reportDownloadedBytes?.Invoke(existingSize);
+
         await using Stream input = await response.Content.ReadAsStreamAsync(cancellationToken);
         await using var output = new FileStream(
             destination,
@@ -111,7 +121,28 @@ internal sealed class ReleaseClient : IDisposable
             FileShare.None,
             1024 * 1024,
             useAsync: true);
-        await input.CopyToAsync(output, 1024 * 1024, cancellationToken);
+        byte[] buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
+        try
+        {
+            long downloaded = existingSize;
+            var reportTimer = Stopwatch.StartNew();
+            int read;
+            while ((read = await input.ReadAsync(buffer.AsMemory(), cancellationToken)) > 0)
+            {
+                await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+                downloaded = checked(downloaded + read);
+                if (reportTimer.ElapsedMilliseconds >= 250)
+                {
+                    reportDownloadedBytes?.Invoke(downloaded);
+                    reportTimer.Restart();
+                }
+            }
+            reportDownloadedBytes?.Invoke(downloaded);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
         await output.FlushAsync(cancellationToken);
 
         long finalSize = new FileInfo(destination).Length;

@@ -2,8 +2,8 @@ namespace CobbleMusicUpdater;
 
 internal static class BuildInfo
 {
-    public const string ProductName = "Cobble Music Updater";
-    public const string Version = "1.0.0";
+    public const string ProductName = "Kewz's Cobblemon Updater";
+    public const string Version = "1.1.0";
     public const string UserAgent = "CobbleMusicUpdater/" + Version;
     public const string DefaultRepository = "Kewz4/Cobble-Music";
     public const string DefaultModpackId = "cobble-music";

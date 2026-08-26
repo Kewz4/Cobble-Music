@@ -49,7 +49,10 @@ if (-not (Test-Path -LiteralPath $SourceExe -PathType Leaf)) { throw "Updater EX
 if (-not (Test-Path -LiteralPath $InstanceConfig -PathType Leaf)) { throw "Prism instance configuration is missing: $InstanceConfig" }
 
 $lines = @(Get-Content -LiteralPath $InstanceConfig)
-$preLaunch = '"$INST_MC_DIR/cobble-music-updater/CobbleMusicUpdater.exe" --instance-dir "$INST_DIR" --minecraft-dir "$INST_MC_DIR" --prism-prelaunch'
+# Prism's QSettings INI parser requires escaped quotes in the physical
+# instance.cfg value. Without the backslashes it will later rewrite the command
+# and concatenate quoted arguments (notably paths under Program Files).
+$preLaunch = '\"$INST_MC_DIR/cobble-music-updater/CobbleMusicUpdater.exe\" --instance-dir \"$INST_DIR\" --minecraft-dir \"$INST_MC_DIR\" --prism-prelaunch'
 $existingPreLaunch = Get-InstanceSetting $lines 'PreLaunchCommand'
 if (-not [string]::IsNullOrWhiteSpace($existingPreLaunch) -and $existingPreLaunch -ne $preLaunch -and -not $Force) {
     throw "This Prism instance already has a different PreLaunchCommand. Refusing to replace it. Review it and rerun with -Force only if replacing it is intentional. Existing command: $existingPreLaunch"

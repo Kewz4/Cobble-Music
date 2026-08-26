@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $Project = Join-Path $Root 'updater\CobbleMusicUpdater\CobbleMusicUpdater.csproj'
-$UpdaterDll = Join-Path $Root 'updater\CobbleMusicUpdater\bin\Release\net10.0\win-x64\CobbleMusicUpdater.dll'
+$UpdaterDll = Join-Path $Root 'updater\CobbleMusicUpdater\bin\Release\net10.0-windows\win-x64\CobbleMusicUpdater.dll'
 $Fixture = Join-Path $Root 'updater\testdata\manifest-signature-fixture.json'
 $FixtureSignature = Join-Path $Root 'updater\testdata\manifest-signature-fixture.sig'
 $TempRoot = Join-Path ([IO.Path]::GetTempPath()) ("cobble-music-signature-test-" + [Guid]::NewGuid().ToString('N'))

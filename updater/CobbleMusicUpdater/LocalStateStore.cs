@@ -43,7 +43,7 @@ internal static class LocalStateStore
         if (!File.Exists(paths.ConfigurationPath))
         {
             throw new FileNotFoundException(
-                "The updater configuration is missing. Run Install-CobbleMusicUpdater.ps1 once for this instance.",
+                "The Kewz's Cobblemon updater configuration is missing. Run Install-CobbleMusicUpdater.ps1 once for this instance.",
                 paths.ConfigurationPath);
         }
 
@@ -112,7 +112,7 @@ internal static class LocalStateStore
         }
         catch (IOException exception)
         {
-            throw new UpdaterBusyException("Another Cobble Music update check is already running for this Prism instance.", exception);
+            throw new UpdaterBusyException("Another Kewz's Cobblemon update check is already running for this Prism instance.", exception);
         }
     }
 

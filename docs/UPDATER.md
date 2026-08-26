@@ -1,7 +1,7 @@
-# Cobble Music updater
+# Kewz's Cobblemon updater
 
 `CobbleMusicUpdater.exe` is a self-contained Windows executable that Prism
-Launcher runs before Minecraft. It keeps a friend’s approved Cobble Music
+Launcher runs before Minecraft. It keeps a friend’s approved Kewz's Cobblemon
 files current without touching player data.
 
 ## Runtime behavior
@@ -38,6 +38,27 @@ Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
 An **unrecoverable local transaction** is the sole fail-closed case: Prism is
 blocked so it cannot start with a half-applied pack.
+
+## What players see at launch
+
+When Prism starts the updater normally, a small centered **Kewz's Cobblemon**
+card appears immediately with **Checking for updates…**. It has no Windows
+title bar and uses a custom animated progress indicator while GitHub is being
+checked. If a signed pack update is available, the same card shows download
+percentage and then the file-install count.
+
+On an ordinary no-update, offline-fallback, or successful-update launch, it
+briefly shows the result and closes automatically before Minecraft starts. A
+local recovery or concurrent-update error stays visible and blocks launch,
+because starting a partly updated pack would be unsafe.
+
+The GUI build also writes its own rotating diagnostic log at
+`minecraft/cobble-music-updater/updater.log`; it never writes to Minecraft's
+normal `logs/` directory. The blocked state tells the player to check that
+file when more detail is needed.
+
+The `--no-ui` switch is only for diagnostics and automated tests; do not put
+it in Prism's normal pre-launch command.
 
 Normal source or updater-binary releases can live in this repository without
 interfering with clients. They are ignored unless they use the reserved,
@@ -121,9 +142,52 @@ instance-specific Prism pre-launch command:
 ```
 
 It refuses to overwrite a different existing `PreLaunchCommand`; inspect it
-first and use `-Force` only when replacement is deliberate. Prism waits for
-the pre-launch command, so Minecraft does not begin while an update is being
-applied.
+first and use `-Force` only when replacement is deliberate.
+
+The installers write the physical instance.cfg value with escaped quotes,
+which QSettings requires to retain both spaces and quote boundaries when Prism
+later saves the instance:
+
+    PreLaunchCommand=\"$INST_MC_DIR/cobble-music-updater/CobbleMusicUpdater.exe\" --instance-dir \"$INST_DIR\" --minecraft-dir \"$INST_MC_DIR\" --prism-prelaunch
+
+Prism waits for the pre-launch command, so Minecraft does not begin while an
+update is being applied.
+
+## First-time player setup
+
+A player who has neither the updater EXE nor the Prism command needs one
+one-time setup action—nothing exists on their PC yet that could check GitHub
+when they press Play. The published bootstrap performs that setup safely:
+
+1. verifies the selected Prism instance has `instance.cfg` and `minecraft/`;
+2. downloads the exact `updater-v1.1.0` EXE and checks its SHA-256;
+3. installs it at `minecraft/cobble-music-updater/CobbleMusicUpdater.exe`;
+4. writes only the updater's own `updater.json` (backing up an existing one);
+   and
+5. backs up `instance.cfg` and adds the instance-specific Prism pre-launch
+   command above.
+
+The bootstrap refuses to replace a different existing Prism pre-launch command
+unless the player deliberately reruns it with `-Force`. It does not touch
+saves, `options.txt`, `servers.dat`, logs, or resource-pack selections.
+
+After the bootstrap asset has been downloaded from
+[updater-v1.1.0](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.1.0),
+the player can paste this into PowerShell, replacing the example instance path:
+
+```powershell
+$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.1.0/Bootstrap-CobbleMusicUpdater.ps1'
+$path = Join-Path $env:TEMP 'Bootstrap-CobbleMusicUpdater.ps1'
+$expected = '733B41BFF9CA6E48D7228214C44E511DB7BE4E7BC3A3A79697D66414BA267DFC'
+Invoke-WebRequest -Uri $uri -OutFile $path
+if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $expected) { throw 'Bootstrap checksum mismatch.' }
+Unblock-File -LiteralPath $path
+& $path -InstanceDirectory 'C:\Program Files\Prism Launcher\instances\<your instance name>'
+```
+
+This intentionally is **not** an `irm | iex` command. The script is downloaded,
+verified by a pinned checksum, and only then run. Once it finishes, future
+updates happen automatically when that player presses Prism's Play button.
 
 ## Publish a pack update
 
@@ -173,17 +237,17 @@ The signed release deletes one of those files only if the friend’s local copy
 still matches exactly. Changed or unknown files remain untouched. Build this
 mapping from a reviewed known baseline, not guesses about a friend’s disk.
 
-## Friend installation and updater upgrades
+## Friend installation and updater-binary upgrades
 
 Give friends only the compiled EXE and approved setup/configuration—never the
 private signing seed. Their Prism instance must be writable; a user-writable
 Prism location is easiest.
 
-Version 1 of this tool updates the modpack payload, not its own running EXE.
-If a future release requires a newer updater, distribute the rebuilt EXE and
-rerun the installer before publishing that pack release. Older clients safely
-keep launching their last known-good pack rather than applying a format they
-cannot verify.
+This updater updates the signed **modpack payload**, not its own running EXE.
+If a future release requires a newer updater binary, publish a new bootstrap
+asset with a new pinned EXE checksum and have players run that one-time
+bootstrap again. Older clients safely keep launching their last known-good
+pack rather than applying a format they cannot verify.
 
 ## Claude workflow
 

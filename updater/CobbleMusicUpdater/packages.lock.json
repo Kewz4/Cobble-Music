@@ -1,7 +1,7 @@
 {
   "version": 1,
   "dependencies": {
-    "net10.0": {
+    "net10.0-windows7.0": {
       "BouncyCastle.Cryptography": {
         "type": "Direct",
         "requested": "[2.7.0, )",
@@ -15,6 +15,6 @@
         "contentHash": "0B6nZyCHWXnvmlB559oduOspVdNOnpNXPjhpWVMovLPAsDVG7A4jJR9rzECf67JUzxP8/ee/wA8clwIzJcWNFA=="
       }
     },
-    "net10.0/win-x64": {}
+    "net10.0-windows7.0/win-x64": {}
   }
 }
