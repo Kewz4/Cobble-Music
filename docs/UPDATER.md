@@ -304,7 +304,7 @@ bootstrap has its final checksum:
 
 ```powershell
 .\tools\New-CobbleMusicPrismBootstrapCommand.ps1 `
-  -UpdaterVersion 1.2.4 `
+  -UpdaterVersion 1.2.5 `
   -ExpectedBootstrapSha256 '<SHA-256 of the published Bootstrap-CobbleMusicUpdater.ps1>'
 ```
 
@@ -318,7 +318,7 @@ an owner who wants to close Prism and replace the field with the short direct
 EXE command. In manual mode it:
 
 1. verifies the selected Prism instance has `instance.cfg` and `minecraft/`;
-2. downloads the exact `updater-v1.2.4` EXE and checks its SHA-256;
+2. downloads the exact `updater-v1.2.5` EXE and checks its SHA-256;
 3. installs it at `minecraft/cobble-music-updater/CobbleMusicUpdater.exe`;
 4. writes only the updater's own `updater.json` (backing up an existing one);
    and
@@ -330,13 +330,13 @@ unless the player deliberately reruns it with `-Force`. It does not touch
 saves, `options.txt`, `servers.dat`, logs, or resource-pack selections.
 
 For that optional manual path, after the bootstrap asset has been downloaded from
-[updater-v1.2.4](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.4),
+[updater-v1.2.5](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.5),
 the player can paste this into PowerShell, replacing the example instance path:
 
 ```powershell
-$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.4/Bootstrap-CobbleMusicUpdater.ps1'
+$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.5/Bootstrap-CobbleMusicUpdater.ps1'
 $path = Join-Path $env:TEMP 'Bootstrap-CobbleMusicUpdater.ps1'
-$expected = '4722EFAF7CB128392A902F923D7D50601596412ED35D7DAB577792B19376DD41'
+$expected = 'E3EF3FB5881265838EA04EE26F89B94938BA7DE37458B2FDDFBF2C3455E453DB'
 Invoke-WebRequest -Uri $uri -OutFile $path
 if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $expected) { throw 'Bootstrap checksum mismatch.' }
 Unblock-File -LiteralPath $path
@@ -359,7 +359,7 @@ zeroes (for example, `1.0.5`); four-component variants are rejected.
 The modpack publisher never builds or loads the updater from the current C#
 working tree. Signing and verification use only
 `updater\dist\win-x64\CobbleMusicUpdater.exe`, whose version, ProductVersion,
-and SHA-256 must exactly match the committed `updater-v1.2.4` bootstrap pin.
+and SHA-256 must exactly match the committed `updater-v1.2.5` bootstrap pin.
 The EXE is held read-locked from checksum verification through each signer or
 verifier process. Keep the private signing key outside the Minecraft source,
 every managed source root, and `release-output`; the publisher rejects those
@@ -483,7 +483,7 @@ window.
 
 Before any GitHub mutation, the publisher additionally requires the local
 pinned updater EXE to match the exact `uploaded` size and GitHub SHA-256 digest
-on the currently published, non-prerelease `updater-v1.2.4` release. It checks
+on the currently published, non-prerelease `updater-v1.2.5` release. It checks
 that dependency again immediately before making the modpack draft public. For
 a v2 delta it also re-fetches the stable base release at that final boundary
 and requires both base manifest and signature to match the identity captured
