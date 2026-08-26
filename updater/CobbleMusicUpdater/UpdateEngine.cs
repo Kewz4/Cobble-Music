@@ -70,11 +70,13 @@ internal sealed class UpdateEngine
         LocalStateStore.AssertWritable(_paths);
         UpdateManifest? trustedBase = null;
         string trustedBaseHash = "";
+        var downloadProgress = new DownloadProgressScope(CalculateChainDownloadBytes(releaseChain));
         foreach (RemoteRelease release in releaseChain)
         {
             UpdateManifest manifest = release.Manifest;
             if (await TryAdoptExistingBaselineAsync(manifest, release.ManifestSha256, state, cancellationToken))
             {
+                downloadProgress.ExcludeSkippedPayload(CalculatePayloadDownloadBytes(manifest));
                 state = LocalStateStore.LoadState(_paths);
                 trustedBase = manifest;
                 trustedBaseHash = release.ManifestSha256;
@@ -86,6 +88,7 @@ internal sealed class UpdateEngine
                 && string.Equals(state.ManifestSha256, release.ManifestSha256, StringComparison.OrdinalIgnoreCase);
             if (sameIdentity && StateMatchesManifestAndSizes(state, manifest))
             {
+                downloadProgress.ExcludeSkippedPayload(CalculatePayloadDownloadBytes(manifest));
                 trustedBase = manifest;
                 trustedBaseHash = release.ManifestSha256;
                 continue;
@@ -124,6 +127,7 @@ internal sealed class UpdateEngine
                 release.AssetUrls,
                 state,
                 manifest.SchemaVersion == 2 ? trustedBase : null,
+                downloadProgress,
                 cancellationToken);
             state = LocalStateStore.LoadState(_paths);
             trustedBase = manifest;
@@ -257,6 +261,7 @@ internal sealed class UpdateEngine
         IReadOnlyDictionary<string, Uri> assetUrls,
         InstalledState previousState,
         UpdateManifest? signedBase,
+        DownloadProgressScope downloadProgress,
         CancellationToken cancellationToken)
     {
         string workDirectory = Path.Combine(_paths.LocalDataDirectory, "staging", manifestHash);
@@ -267,22 +272,19 @@ internal sealed class UpdateEngine
         {
             Directory.CreateDirectory(partsDirectory);
             using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(_configuration.NetworkTimeoutSeconds));
-            long totalDownloadBytes = checked(manifest.Payload.Parts.Sum(part => part.Size));
-            long completedDownloadBytes = 0;
             foreach (PayloadPart part in manifest.Payload.Parts)
             {
                 string partPath = Path.Combine(partsDirectory, part.Name);
                 _log($"Downloading {part.Name}...");
-                long completedBeforePart = completedDownloadBytes;
-                Report(UpdatePhase.Downloading, "Downloading update", completedBeforePart, totalDownloadBytes);
-                await DownloadVerifiedPartAsync(
+                Report(UpdatePhase.Downloading, "Downloading update", downloadProgress.CompletedBytes, downloadProgress.TotalBytes, networkBytes: downloadProgress.NetworkBytes);
+                long partNetworkBytes = await DownloadVerifiedPartAsync(
                     releaseClient,
                     assetUrls[part.Name],
                     part,
                     partPath,
-                    downloaded => Report(UpdatePhase.Downloading, "Downloading update", completedBeforePart + downloaded, totalDownloadBytes),
+                    partProgress => Report(downloadProgress.ForPart(partProgress)),
                     cancellationToken);
-                completedDownloadBytes = checked(completedDownloadBytes + part.Size);
+                downloadProgress.CompletePart(part.Size, partNetworkBytes);
             }
 
             _log("Reassembling verified update payload...");
@@ -316,26 +318,63 @@ internal sealed class UpdateEngine
         TryDeleteDirectory(workDirectory);
     }
 
-    private async Task DownloadVerifiedPartAsync(
+    private async Task<long> DownloadVerifiedPartAsync(
         ReleaseClient client,
         Uri source,
         PayloadPart part,
         string destination,
-        Action<long>? reportDownloadedBytes,
+        Action<PartDownloadProgress>? reportProgress,
         CancellationToken cancellationToken)
     {
+        long networkBytes = 0;
         for (int attempt = 1; attempt <= 2; attempt++)
         {
-            await client.DownloadFileAsync(source, destination, part.Size, reportDownloadedBytes, cancellationToken);
+            long observedDownloadedBytes = File.Exists(destination)
+                ? Math.Min(new FileInfo(destination).Length, part.Size)
+                : 0L;
+            await client.DownloadFileAsync(
+                source,
+                destination,
+                part.Size,
+                downloadedBytes =>
+                {
+                    if (downloadedBytes >= observedDownloadedBytes)
+                    {
+                        networkBytes = checked(networkBytes + downloadedBytes - observedDownloadedBytes);
+                    }
+                    observedDownloadedBytes = downloadedBytes;
+                    reportProgress?.Invoke(new PartDownloadProgress(downloadedBytes, networkBytes));
+                },
+                cancellationToken);
             string actualHash = await PathSafety.Sha256Async(destination, cancellationToken);
             if (PathSafety.IsExpectedHash(actualHash, part.Sha256))
             {
-                return;
+                return networkBytes;
             }
             File.Delete(destination);
         }
         throw new InvalidDataException($"Checksum verification failed for {part.Name}.");
     }
+
+    internal static UpdateProgress CreateDownloadProgress(
+        long completedBeforePart,
+        long totalDownloadBytes,
+        long networkBeforePart,
+        PartDownloadProgress partProgress) =>
+        new(
+            UpdatePhase.Downloading,
+            "Downloading update",
+            checked(completedBeforePart + partProgress.DownloadedBytes),
+            totalDownloadBytes,
+            NetworkBytes: checked(networkBeforePart + partProgress.NetworkBytes));
+
+    internal static long CalculatePayloadDownloadBytes(UpdateManifest manifest) =>
+        manifest.Payload is null
+            ? 0L
+            : checked(manifest.Payload.Parts.Sum(part => part.Size));
+
+    internal static long CalculateChainDownloadBytes(IEnumerable<RemoteRelease> releaseChain) =>
+        checked(releaseChain.Sum(release => CalculatePayloadDownloadBytes(release.Manifest)));
 
     private static async Task CombinePartsAndDeleteAsync(
         IReadOnlyCollection<PayloadPart> parts,
@@ -948,8 +987,11 @@ internal sealed class UpdateEngine
         long completedBytes = 0,
         long totalBytes = 0,
         int currentItem = 0,
-        int totalItems = 0) =>
-        _progress?.Report(new UpdateProgress(phase, message, completedBytes, totalBytes, currentItem, totalItems));
+        int totalItems = 0,
+        long networkBytes = 0) =>
+        _progress?.Report(new UpdateProgress(phase, message, completedBytes, totalBytes, currentItem, totalItems, networkBytes));
+
+    private void Report(UpdateProgress progress) => _progress?.Report(progress);
 }
 
 internal sealed record StagingPreparation(

@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Windows.Forms;
@@ -17,7 +18,7 @@ internal readonly record struct UpdateStatusLayout(
 internal sealed class UpdateStatusForm : Form
 {
     private const int DesignDpi = 96;
-    private const int DesignWidth = 454;
+    private const int DesignWidth = 520;
     private const int DesignHeight = 174;
     private const int CornerRadius = 18;
 
@@ -30,6 +31,7 @@ internal sealed class UpdateStatusForm : Form
     private readonly SmoothProgressIndicator _progressIndicator;
     private readonly Button _closeButton;
     private readonly System.Windows.Forms.Timer _closeTimer;
+    private readonly TransferMetricsTracker _transferMetrics = new(Stopwatch.Frequency);
     private bool _canClose;
     private bool _layingOutContent;
     private bool _showCloseButton;
@@ -337,7 +339,10 @@ internal sealed class UpdateStatusForm : Form
         }
 
         _statusLabel.Text = Describe(update);
-        _detailLabel.Text = DetailFor(update);
+        TransferMetrics transferMetrics = _transferMetrics.Observe(update, Stopwatch.GetTimestamp());
+        _detailLabel.Text = update.Phase == UpdatePhase.Downloading && update.TotalBytes > 0
+            ? TransferMetricsFormatter.FormatDownloadDetail(update, transferMetrics)
+            : DetailFor(update);
         switch (update.Phase)
         {
             case UpdatePhase.Downloading when update.TotalBytes > 0:

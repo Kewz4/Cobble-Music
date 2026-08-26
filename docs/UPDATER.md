@@ -44,8 +44,11 @@ blocked so it cannot start with a half-applied pack.
 When Prism starts the updater normally, a small centered **Kewz's Cobblemon**
 card appears immediately with **Checking for updates…**. It has no Windows
 title bar and uses a custom animated progress indicator while GitHub is being
-checked. If a signed pack update is available, the same card shows download
-percentage and then the file-install count.
+checked. If a signed pack update is available, the same card shows aggregate
+download percentage, downloaded/total size, smoothed live speed, and ETA
+across every payload part and release step, followed by the file-install count.
+Already cached resume bytes advance completion without inflating the speed or
+ETA estimate.
 
 On an ordinary no-update, offline-fallback, or successful-update launch, it
 briefly shows the result and closes automatically before Minecraft starts. A
@@ -151,7 +154,7 @@ Updater binaries use their own `updater-v*` releases and are completely
 separate from signed `modpack-v*` payload releases. The updater publisher
 derives the release version from the single `BuildInfo.Version` constant,
 requires the project version to match it, and accepts only canonical
-three-part versions such as `1.2.2` (no leading zeroes or fourth component).
+three-part versions such as `1.2.3` (no leading zeroes or fourth component).
 A new stable updater release must be strictly newer than every existing stable
 `updater-v*` release; exact reruns of their own draft or published release stay
 idempotent, while downgrades and alternate spellings of the same numeric
@@ -279,7 +282,7 @@ one-time setup action—nothing exists on their PC yet that could check GitHub
 when they press Play. The published bootstrap performs that setup safely:
 
 1. verifies the selected Prism instance has `instance.cfg` and `minecraft/`;
-2. downloads the exact `updater-v1.2.2` EXE and checks its SHA-256;
+2. downloads the exact `updater-v1.2.3` EXE and checks its SHA-256;
 3. installs it at `minecraft/cobble-music-updater/CobbleMusicUpdater.exe`;
 4. writes only the updater's own `updater.json` (backing up an existing one);
    and
@@ -291,13 +294,13 @@ unless the player deliberately reruns it with `-Force`. It does not touch
 saves, `options.txt`, `servers.dat`, logs, or resource-pack selections.
 
 After the bootstrap asset has been downloaded from
-[updater-v1.2.2](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.2),
+[updater-v1.2.3](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.3),
 the player can paste this into PowerShell, replacing the example instance path:
 
 ```powershell
-$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.2/Bootstrap-CobbleMusicUpdater.ps1'
+$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.3/Bootstrap-CobbleMusicUpdater.ps1'
 $path = Join-Path $env:TEMP 'Bootstrap-CobbleMusicUpdater.ps1'
-$expected = '9E5DE93558DAE18B3866AA111375CEBF946C0E651AD6816B5C8CF112EF67F1F3'
+$expected = 'DDBF43D6627274AE10CA8D999E7B26F912EEC73563C7ACCC30C819762C168BC2'
 Invoke-WebRequest -Uri $uri -OutFile $path
 if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $expected) { throw 'Bootstrap checksum mismatch.' }
 Unblock-File -LiteralPath $path
@@ -321,7 +324,7 @@ zeroes (for example, `1.0.5`); four-component variants are rejected.
 The modpack publisher never builds or loads the updater from the current C#
 working tree. Signing and verification use only
 `updater\dist\win-x64\CobbleMusicUpdater.exe`, whose version, ProductVersion,
-and SHA-256 must exactly match the committed `updater-v1.2.2` bootstrap pin.
+and SHA-256 must exactly match the committed `updater-v1.2.3` bootstrap pin.
 The EXE is held read-locked from checksum verification through each signer or
 verifier process. Keep the private signing key outside the Minecraft source,
 every managed source root, and `release-output`; the publisher rejects those
@@ -445,7 +448,7 @@ window.
 
 Before any GitHub mutation, the publisher additionally requires the local
 pinned updater EXE to match the exact `uploaded` size and GitHub SHA-256 digest
-on the currently published, non-prerelease `updater-v1.2.2` release. It checks
+on the currently published, non-prerelease `updater-v1.2.3` release. It checks
 that dependency again immediately before making the modpack draft public. For
 a v2 delta it also re-fetches the stable base release at that final boundary
 and requires both base manifest and signature to match the identity captured

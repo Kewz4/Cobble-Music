@@ -19,6 +19,7 @@ internal static class Program
             Directory.CreateDirectory(tempRoot);
             TestCalculatedUpdaterWindowLayoutAt120Dpi();
             TestUpdaterWindowLayout();
+            TestAggregateDownloadProgressAndTransferMetrics();
             TestManifestSchemaTwoValidation();
             TestSequentialReleaseChain();
             TestInstanceIdentityNormalization(Path.Combine(tempRoot, "identity"));
@@ -55,13 +56,13 @@ internal static class Program
             closePreferredSize: new Size(100, 35),
             showCloseButton: false);
 
-        Equal(new Size(568, 218), layout.ClientSize, "120 DPI client size");
-        Equal(new Rectangle(31, 28, 506, 35), layout.TitleBounds, "120 DPI title bounds");
-        Equal(new Rectangle(32, 67, 505, 21), layout.SubtitleBounds, "120 DPI subtitle bounds");
-        Equal(new Rectangle(31, 107, 506, 29), layout.StatusBounds, "120 DPI status bounds");
-        Equal(new Rectangle(32, 137, 505, 22), layout.DetailBounds, "120 DPI detail bounds");
-        Equal(new Rectangle(32, 175, 504, 10), layout.ProgressBounds, "120 DPI progress bounds");
-        Equal(new Rectangle(436, 175, 100, 10), layout.CloseBounds, "120 DPI hidden close bounds");
+        Equal(new Size(650, 218), layout.ClientSize, "120 DPI client size");
+        Equal(new Rectangle(31, 28, 588, 35), layout.TitleBounds, "120 DPI title bounds");
+        Equal(new Rectangle(32, 67, 587, 21), layout.SubtitleBounds, "120 DPI subtitle bounds");
+        Equal(new Rectangle(31, 107, 588, 29), layout.StatusBounds, "120 DPI status bounds");
+        Equal(new Rectangle(32, 137, 587, 22), layout.DetailBounds, "120 DPI detail bounds");
+        Equal(new Rectangle(32, 175, 586, 10), layout.ProgressBounds, "120 DPI progress bounds");
+        Equal(new Rectangle(518, 175, 100, 10), layout.CloseBounds, "120 DPI hidden close bounds");
 
         UpdateStatusLayout failureLayout = UpdateStatusForm.CalculateLayout(
             dpi: 120,
@@ -71,8 +72,8 @@ internal static class Program
             detailPreferredHeight: 19,
             closePreferredSize: new Size(100, 35),
             showCloseButton: true);
-        Equal(new Size(568, 221), failureLayout.ClientSize, "120 DPI failure client size");
-        Equal(new Rectangle(436, 175, 100, 35), failureLayout.CloseBounds, "120 DPI visible close bounds");
+        Equal(new Size(650, 221), failureLayout.ClientSize, "120 DPI failure client size");
+        Equal(new Rectangle(518, 175, 100, 35), failureLayout.CloseBounds, "120 DPI visible close bounds");
 
         UpdateStatusLayout largeButtonLayout = UpdateStatusForm.CalculateLayout(
             dpi: 120,
@@ -84,6 +85,67 @@ internal static class Program
             showCloseButton: true);
         Equal(new Size(664, 246), largeButtonLayout.ClientSize, "large close button grows client bounds");
         Equal(new Rectangle(32, 175, 600, 60), largeButtonLayout.CloseBounds, "large close button remains inside client bounds");
+    }
+
+    private static void TestAggregateDownloadProgressAndTransferMetrics()
+    {
+        const long mib = 1024L * 1024L;
+        var scope = new DownloadProgressScope(500 * mib);
+        scope.ExcludeSkippedPayload(100 * mib);
+        scope.CompletePart(100 * mib, 80 * mib);
+        UpdateProgress secondPart = scope.ForPart(new PartDownloadProgress(50 * mib, 30 * mib));
+        Equal(150 * mib, secondPart.CompletedBytes, "multipart progress stays aggregate");
+        Equal(400 * mib, secondPart.TotalBytes, "multipart total stays aggregate");
+        Equal(110 * mib, secondPart.NetworkBytes, "multipart network bytes stay aggregate");
+        scope.CompletePart(50 * mib, 30 * mib);
+        UpdateProgress nextRelease = scope.ForPart(new PartDownloadProgress(25 * mib, 20 * mib));
+        Equal(175 * mib, nextRelease.CompletedBytes, "multi-release progress does not reset");
+        Equal(400 * mib, nextRelease.TotalBytes, "multi-release total does not reset");
+        Equal(130 * mib, nextRelease.NetworkBytes, "multi-release network byte count does not reset");
+
+        var tracker = new TransferMetricsTracker(timestampFrequency: 1_000);
+        UpdateProgress start = secondPart with
+        {
+            CompletedBytes = 128 * mib,
+            NetworkBytes = 64 * mib
+        };
+        Equal(false, tracker.Observe(start, timestamp: 1_000).HasEstimate, "first transfer sample waits for timing data");
+
+        UpdateProgress later = secondPart with
+        {
+            CompletedBytes = 192 * mib,
+            NetworkBytes = 128 * mib
+        };
+        TransferMetrics metrics = tracker.Observe(later, timestamp: 3_000);
+        Equal(true, metrics.HasEstimate, "later transfer sample has speed and ETA");
+        Equal(32D * mib, metrics.BytesPerSecond, "aggregate transfer speed");
+        Equal(TimeSpan.FromSeconds(6.5), metrics.EstimatedTimeRemaining!.Value, "aggregate transfer ETA");
+        Equal(
+            "192.0 MiB / 400.0 MiB • 32.0 MiB/s • ETA 7s",
+            TransferMetricsFormatter.FormatDownloadDetail(later, metrics),
+            "concise transfer detail formatting");
+
+        tracker.Reset();
+        Equal(
+            false,
+            tracker.Observe(start with { NetworkBytes = 0 }, timestamp: 10_000).HasEstimate,
+            "reset transfer tracker starts a fresh estimate");
+
+        var resumedTracker = new TransferMetricsTracker(timestampFrequency: 1_000);
+        Equal(false, resumedTracker.Observe(start, timestamp: 20_000).HasEstimate, "resumed transfer seeds network baseline");
+        Equal(
+            false,
+            resumedTracker.Observe(start with { CompletedBytes = 192 * mib }, timestamp: 22_000).HasEstimate,
+            "existing-byte jump does not inflate download speed");
+        TransferMetrics resumedMetrics = resumedTracker.Observe(
+            start with { CompletedBytes = 224 * mib, NetworkBytes = 96 * mib },
+            timestamp: 23_000);
+        Equal(32D * mib, resumedMetrics.BytesPerSecond, "resumed transfer counts only new network bytes");
+        Equal(
+            "128.0 MiB / 400.0 MiB • Calculating speed and ETA…",
+            TransferMetricsFormatter.FormatDownloadDetail(start, default),
+            "initial transfer detail includes total size");
+        Equal("1h 01m", TransferMetricsFormatter.FormatDuration(TimeSpan.FromSeconds(3660)), "long ETA formatting");
     }
 
     private static void TestUpdaterWindowLayout()
@@ -151,7 +213,7 @@ internal static class Program
     private static void AssertStatusLayout(UpdateStatusForm form, string context)
     {
         Equal(AutoScaleMode.Dpi, form.AutoScaleMode, $"{context}: DPI autoscaling mode");
-        int minimumDpiWidth = (int)Math.Round(454 * form.DeviceDpi / 96D);
+        int minimumDpiWidth = (int)Math.Round(520 * form.DeviceDpi / 96D);
         Equal(true, form.ClientSize.Width >= minimumDpiWidth, $"{context}: DPI-scaled minimum width");
 
         Control title = FindControl(form, "titleLabel");

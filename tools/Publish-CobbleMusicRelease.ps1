@@ -55,7 +55,7 @@ $ReleaseOutputRoot = Join-Path $Root 'release-output'
 $CoreModule = Join-Path $PSScriptRoot 'CobbleMusicRelease.Core.psm1'
 $UpdaterBootstrap = Join-Path $Root 'bootstrap\Bootstrap-CobbleMusicUpdater.ps1'
 $PinnedUpdaterExe = Join-Path $Root 'updater\dist\win-x64\CobbleMusicUpdater.exe'
-$RequiredPinnedUpdaterVersion = '1.2.2'
+$RequiredPinnedUpdaterVersion = '1.2.3'
 $AllowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $MaximumManifestSnapshotBytes = 8MB
 $MaximumSignatureSnapshotBytes = 64KB
@@ -849,7 +849,7 @@ This release is a signed update payload for the Kewz's Cobblemon Prism updater.
 - Exact signed-base deletions: $($deletedFiles.Count)
 - Payload size: $($payloadResult.Size) bytes
 - Parts: $($payloadResult.Parts.Count), each at most $ChunkSizeMiB MiB
-- Source: canonical live client directory supplied to this command
+- Source: reviewed canonical client snapshot supplied to this command
 "@
 
     Get-ExpectedStagedAssets $signedManifest $stagedIdentity | Out-Null

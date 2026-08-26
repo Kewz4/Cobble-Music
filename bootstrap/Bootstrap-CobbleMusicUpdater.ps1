@@ -15,9 +15,9 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Repository = 'Kewz4/Cobble-Music'
-$UpdaterVersion = '1.2.2'
-# SHA-256 of CobbleMusicUpdater.exe from updater-v1.2.2.
-$ExpectedUpdaterSha256 = 'A4C378AAC034A5076FACBF740A777832F4CEE490C4A7FB60DA910FA8964F4A0E'
+$UpdaterVersion = '1.2.3'
+# SHA-256 of CobbleMusicUpdater.exe from updater-v1.2.3.
+$ExpectedUpdaterSha256 = '2DE9058F00955ACB970F673A6B6D325E5AF5F5D9F43288632EEA5560DC40F1FA'
 # Prism's QSettings INI parser requires escaped quotes in the physical
 # instance.cfg value. Without the backslashes it will later rewrite the command
 # and concatenate quoted arguments (notably paths under Program Files).
