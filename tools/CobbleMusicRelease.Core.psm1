@@ -4,6 +4,9 @@ $script:AllowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'k
 $script:Sha256Pattern = '^[0-9a-f]{64}$'
 $script:VersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
 $script:PinnedUpdaterVersion = '1.2.0'
+$script:MaximumReleaseAssetCount = 999
+$script:ReservedReleaseMetadataAssetCount = 2
+$script:MaximumPublicReleaseCount = 499
 
 function Get-CobbleOptionalPropertyValue {
     param(
@@ -328,6 +331,49 @@ function Assert-CobbleStagedPayloadParts {
         throw 'Ordered staged payload parts do not reconstruct the exact signed payload size and SHA-256.'
     }
     return @($identities)
+}
+
+function Assert-CobbleReleaseAssetCount {
+    param([Parameter(Mandatory)][int64]$PayloadPartCount)
+
+    $maximumPayloadPartCount = $script:MaximumReleaseAssetCount - $script:ReservedReleaseMetadataAssetCount
+    if ($PayloadPartCount -lt 0 -or $PayloadPartCount -gt $maximumPayloadPartCount) {
+        throw "A release may contain at most $maximumPayloadPartCount payload parts because the manifest and signature consume two of the $($script:MaximumReleaseAssetCount) safe asset slots; requested parts: $PayloadPartCount."
+    }
+    return $true
+}
+
+function Assert-CobblePublicReleaseCapacity {
+    param(
+        [AllowEmptyCollection()]
+        [Parameter(Mandatory)][object[]]$Releases,
+        [ValidateRange(0, 1)]
+        [int]$AdditionalPublicReleases = 1
+    )
+
+    $ids = [Collections.Generic.HashSet[int64]]::new()
+    [int]$publicCount = 0
+    foreach ($release in $Releases) {
+        $idProperty = $release.PSObject.Properties['id']
+        $draftProperty = $release.PSObject.Properties['draft']
+        [int64]$releaseId = 0
+        if ($null -eq $idProperty -or $null -eq $draftProperty -or -not ($draftProperty.Value -is [bool]) -or
+            -not [int64]::TryParse(
+                [Convert]::ToString($idProperty.Value, [Globalization.CultureInfo]::InvariantCulture),
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture,
+                [ref]$releaseId) -or $releaseId -le 0 -or -not $ids.Add($releaseId)) {
+            throw 'GitHub release index contains a missing, invalid, or duplicate release identity.'
+        }
+        # GitHub's unauthenticated release index omits drafts but includes
+        # prereleases, so every non-draft consumes one updater scan slot.
+        if (-not $draftProperty.Value) { $publicCount++ }
+    }
+
+    if ($publicCount + $AdditionalPublicReleases -gt $script:MaximumPublicReleaseCount) {
+        throw "Publishing would expose $($publicCount + $AdditionalPublicReleases) GitHub releases, exceeding the updater's safe maximum of $($script:MaximumPublicReleaseCount)."
+    }
+    return $true
 }
 
 function Assert-CobbleLegacyCleanup {
@@ -758,17 +804,21 @@ function Assert-CobbleReleaseIdentityState {
             throw "GitHub release identity is missing $requiredProperty for reserved tag $ExpectedTag."
         }
     }
+    $draftValue = Get-CobbleOptionalPropertyValue $Release 'draft'
+    $prereleaseValue = Get-CobbleOptionalPropertyValue $Release 'prerelease'
+    if (-not ($draftValue -is [bool]) -or -not ($prereleaseValue -is [bool])) {
+        throw "GitHub release identity has a non-Boolean draft/prerelease state for reserved tag $ExpectedTag."
+    }
     [int64]$actualId = 0
     if (-not [int64]::TryParse(
         [Convert]::ToString((Get-CobbleOptionalPropertyValue $Release 'id'), [Globalization.CultureInfo]::InvariantCulture),
         [Globalization.NumberStyles]::None,
         [Globalization.CultureInfo]::InvariantCulture,
         [ref]$actualId) -or $actualId -ne $ExpectedId -or
-        [string](Get-CobbleOptionalPropertyValue $Release 'tag_name') -cne $ExpectedTag -or
-        [bool](Get-CobbleOptionalPropertyValue $Release 'prerelease')) {
+        [string](Get-CobbleOptionalPropertyValue $Release 'tag_name') -cne $ExpectedTag -or $prereleaseValue) {
         throw "GitHub release identity/state changed for reserved tag $ExpectedTag."
     }
-    $isDraft = [bool](Get-CobbleOptionalPropertyValue $Release 'draft')
+    $isDraft = $draftValue
     if (($ExpectedState -ceq 'draft' -and -not $isDraft) -or ($ExpectedState -ceq 'public' -and $isDraft)) {
         throw "GitHub release is not in expected $ExpectedState state: $ExpectedTag"
     }
@@ -814,6 +864,7 @@ function Assert-CobbleRemoteAssetInventory {
 }
 
 Export-ModuleMember -Function @(
+    'Get-CobbleOptionalPropertyValue',
     'Assert-CobbleManagedPath',
     'Assert-CobblePrivateKeyIsolation',
     'Open-CobbleLockedFileSnapshot',
@@ -829,6 +880,8 @@ Export-ModuleMember -Function @(
     'Assert-CobblePublishedBaseAssets',
     'Assert-CobblePublishedUpdaterAsset',
     'Assert-CobbleStagedPayloadParts',
+    'Assert-CobbleReleaseAssetCount',
+    'Assert-CobblePublicReleaseCapacity',
     'Assert-CobblePayloadZipInventory',
     'Test-CobblePaginationHasNextPage',
     'Get-CobbleRepairableStarterAssets',

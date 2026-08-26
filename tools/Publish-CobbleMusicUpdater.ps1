@@ -534,11 +534,46 @@ function New-OrResumeDraft([string]$Tag, [string]$Version, [string]$Commit, [str
     return $created
 }
 
-function Assert-DraftReleaseIdentity($Release, [int64]$ExpectedReleaseId, [string]$Tag, [string]$Commit) {
-    if ([int64]$Release.id -ne $ExpectedReleaseId) { throw 'GitHub returned the wrong updater release identifier.' }
-    if ([string]$Release.tag_name -cne $Tag) { throw 'GitHub returned the wrong updater release tag.' }
-    if ([string]$Release.target_commitish -cne $Commit) {
+function Assert-UpdaterReleaseIdentity($Release, [int64]$ExpectedReleaseId, [string]$Tag, [string]$Commit) {
+    if ($null -eq $Release) { throw 'GitHub returned no updater release identity.' }
+    foreach ($requiredProperty in @('id', 'tag_name', 'target_commitish', 'draft', 'prerelease')) {
+        if ($null -eq $Release.PSObject.Properties[$requiredProperty]) {
+            throw "GitHub updater release identity is missing $requiredProperty."
+        }
+    }
+    $draftValue = $Release.PSObject.Properties['draft'].Value
+    $prereleaseValue = $Release.PSObject.Properties['prerelease'].Value
+    if (-not ($draftValue -is [bool]) -or -not ($prereleaseValue -is [bool])) {
+        throw 'GitHub updater release draft/prerelease state is not Boolean.'
+    }
+    [int64]$actualId = 0
+    if (-not [int64]::TryParse(
+        [Convert]::ToString($Release.PSObject.Properties['id'].Value, [Globalization.CultureInfo]::InvariantCulture),
+        [Globalization.NumberStyles]::None,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [ref]$actualId) -or $actualId -ne $ExpectedReleaseId) {
+        throw 'GitHub returned the wrong updater release identifier.'
+    }
+    if ([string]$Release.PSObject.Properties['tag_name'].Value -cne $Tag) { throw 'GitHub returned the wrong updater release tag.' }
+    if ([string]$Release.PSObject.Properties['target_commitish'].Value -cne $Commit) {
         throw "Updater draft $Tag no longer targets exact source commit $Commit."
+    }
+    if ($prereleaseValue) {
+        throw "Reserved stable updater release $Tag unexpectedly became a prerelease."
+    }
+}
+
+function Assert-DraftReleaseIdentity($Release, [int64]$ExpectedReleaseId, [string]$Tag, [string]$Commit) {
+    Assert-UpdaterReleaseIdentity $Release $ExpectedReleaseId $Tag $Commit
+    if (-not $Release.PSObject.Properties['draft'].Value) {
+        throw "Updater release is not the expected persistent draft: $Tag"
+    }
+}
+
+function Assert-PublishedReleaseIdentity($Release, [int64]$ExpectedReleaseId, [string]$Tag, [string]$Commit) {
+    Assert-UpdaterReleaseIdentity $Release $ExpectedReleaseId $Tag $Commit
+    if ($Release.PSObject.Properties['draft'].Value) {
+        throw "Updater release did not become public: $Tag"
     }
 }
 
@@ -546,12 +581,13 @@ function Sync-DraftAssets($Release, [hashtable]$ExpectedAssets, [string]$Tag, [s
     $releaseId = [int64]$Release.id
     Assert-ReservedUpdaterTagRef $Tag $Commit
     $Release = Get-Release $releaseId
-    Assert-DraftReleaseIdentity $Release $releaseId $Tag $Commit
     if (-not [bool]$Release.draft) {
+        Assert-PublishedReleaseIdentity $Release $releaseId $Tag $Commit
         Assert-ExactRemoteInventory $Release $ExpectedAssets
         Write-Host "$Tag is already published with the exact expected assets."
         return $Release
     }
+    Assert-DraftReleaseIdentity $Release $releaseId $Tag $Commit
 
     if ($RepairStaleUploads) {
         # Validate the complete draft and exact tag target before every
@@ -837,9 +873,16 @@ The bootstrap verifies the exact updater executable before installation. No priv
     $publishPayload = Join-Path $TemporaryRoot 'publish-release.json'
     [IO.File]::WriteAllText($publishPayload, '{"draft":false}', [Text.UTF8Encoding]::new($false))
     Assert-ReservedUpdaterTagRef $tag $commit
-    $published = Invoke-GhJson @('api', '--method', 'PATCH', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$Repository/releases/$($release.id)", '--input', $publishPayload)
-    if ([bool]$published.draft -or [string]$published.tag_name -cne $tag) { throw 'GitHub did not publish the exact validated updater draft.' }
+    # Fetch by immutable API ID again after every final source/version/tag
+    # check. Do not let a draft/prerelease/target or asset race during those
+    # checks reach the publication PATCH.
+    $release = Get-Release $validatedReleaseId
+    Assert-DraftReleaseIdentity $release $validatedReleaseId $tag $commit
+    Assert-ExactRemoteInventory $release $expectedAssets
+    Invoke-GhJson @('api', '--method', 'PATCH', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$Repository/releases/$validatedReleaseId", '--input', $publishPayload) | Out-Null
     Assert-ReservedUpdaterTagRef $tag $commit
+    $published = Get-Release $validatedReleaseId
+    Assert-PublishedReleaseIdentity $published $validatedReleaseId $tag $commit
     Assert-ExactRemoteInventory $published $expectedAssets
     Write-Host "Published validated updater release: $($published.html_url)"
 }

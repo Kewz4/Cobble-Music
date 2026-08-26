@@ -72,12 +72,25 @@ $patchCallIndex = $publisherText.LastIndexOf("Invoke-GhJson @('api', '--method',
 $reservedRefNeedle = 'Assert-ReservedUpdaterTagRef $tag $commit'
 $prePatchRefIndex = if ($patchCallIndex -ge 0) { $publisherText.LastIndexOf($reservedRefNeedle, $patchCallIndex, [StringComparison]::Ordinal) } else { -1 }
 $postPatchRefIndex = if ($patchCallIndex -ge 0) { $publisherText.IndexOf($reservedRefNeedle, $patchCallIndex, [StringComparison]::Ordinal) } else { -1 }
+$prePatchGetIndex = if ($patchCallIndex -ge 0) { $publisherText.LastIndexOf('$release = Get-Release $validatedReleaseId', $patchCallIndex, [StringComparison]::Ordinal) } else { -1 }
+$prePatchIdentityIndex = if ($patchCallIndex -ge 0) { $publisherText.LastIndexOf('Assert-DraftReleaseIdentity $release $validatedReleaseId $tag $commit', $patchCallIndex, [StringComparison]::Ordinal) } else { -1 }
+$postPatchGetIndex = if ($patchCallIndex -ge 0) { $publisherText.IndexOf('$published = Get-Release $validatedReleaseId', $patchCallIndex, [StringComparison]::Ordinal) } else { -1 }
+$postPatchIdentityIndex = if ($patchCallIndex -ge 0) { $publisherText.IndexOf('Assert-PublishedReleaseIdentity $published $validatedReleaseId $tag $commit', $patchCallIndex, [StringComparison]::Ordinal) } else { -1 }
+$postPatchInventoryIndex = if ($patchCallIndex -ge 0) { $publisherText.IndexOf('Assert-ExactRemoteInventory $published $expectedAssets', $patchCallIndex, [StringComparison]::Ordinal) } else { -1 }
+$prePatchInventoryIndex = if ($patchCallIndex -ge 0) { $publisherText.LastIndexOf('Assert-ExactRemoteInventory $release $expectedAssets', $patchCallIndex, [StringComparison]::Ordinal) } else { -1 }
+$finalSourceBindingIndex = if ($patchCallIndex -ge 0) { $publisherText.LastIndexOf('Assert-SourceStillBound $commit', $patchCallIndex, [StringComparison]::Ordinal) } else { -1 }
 if ($dryRunExitIndex -lt 0 -or $reservationCallIndex -le $dryRunExitIndex -or $draftCallIndex -le $reservationCallIndex) {
     throw 'Updater tag reservation is not confined to the post-DryRun mutation workflow before draft creation/upload.'
 }
 if ($patchCallIndex -lt 0 -or $prePatchRefIndex -lt 0 -or $prePatchRefIndex -ge $patchCallIndex `
     -or $postPatchRefIndex -le $patchCallIndex) {
     throw 'Updater publisher does not revalidate the exact reserved tag immediately around publication PATCH.'
+}
+if ($finalSourceBindingIndex -lt 0 -or $prePatchRefIndex -le $finalSourceBindingIndex -or $prePatchGetIndex -le $prePatchRefIndex `
+    -or $prePatchIdentityIndex -le $prePatchGetIndex -or $prePatchInventoryIndex -le $prePatchIdentityIndex -or $prePatchInventoryIndex -ge $patchCallIndex `
+    -or $postPatchGetIndex -le $patchCallIndex -or $postPatchIdentityIndex -le $postPatchGetIndex `
+    -or $postPatchInventoryIndex -le $postPatchIdentityIndex) {
+    throw 'Updater publisher does not fresh-fetch and fully validate exact release identity/state/assets on both sides of publication PATCH.'
 }
 $gitInvocations = @([regex]::Matches($publisherText, '(?m)&[ \t]+git\b[^\r\n]*') | ForEach-Object { $_.Value })
 if ($gitInvocations.Count -lt 1) { throw 'Updater publisher has no inspectable Git invocation.' }
@@ -321,6 +334,62 @@ foreach ($tagCase in @('existing', 'foreign', 'concurrent', 'create')) {
     }
 }
 
+# Exercise the exact identity/state predicates used by the fresh pre-PATCH and
+# post-PATCH GETs. Each remote mutation shape represents a release race that
+# must fail before or immediately after the one publication mutation.
+$releaseIdentityFunctions = @(
+    Get-PublisherFunctionText 'Assert-UpdaterReleaseIdentity'
+    Get-PublisherFunctionText 'Assert-DraftReleaseIdentity'
+    Get-PublisherFunctionText 'Assert-PublishedReleaseIdentity'
+) -join [Environment]::NewLine
+$releaseIdentityHarness = [scriptblock]::Create($releaseIdentityFunctions + [Environment]::NewLine + @'
+function Assert-Fails([scriptblock]$Action, [string]$Description) {
+    try { & $Action; throw "Expected race was accepted: $Description" }
+    catch {
+        if ($_.Exception.Message.StartsWith('Expected race was accepted:', [StringComparison]::Ordinal)) { throw }
+    }
+}
+$id = [int64]99
+$tag = 'updater-v1.2.0'
+$commit = 'c' * 40
+$draft = [pscustomobject]@{ id = $id; tag_name = $tag; target_commitish = $commit; draft = $true; prerelease = $false; assets = @() }
+Assert-DraftReleaseIdentity $draft $id $tag $commit
+foreach ($mutation in @('id', 'tag', 'target', 'published', 'prerelease', 'draft-string', 'prerelease-string')) {
+    $raced = $draft.PSObject.Copy()
+    switch ($mutation) {
+        'id' { $raced.id = 100 }
+        'tag' { $raced.tag_name = 'updater-v1.2.1' }
+        'target' { $raced.target_commitish = 'd' * 40 }
+        'published' { $raced.draft = $false }
+        'prerelease' { $raced.prerelease = $true }
+        'draft-string' { $raced.draft = 'true' }
+        'prerelease-string' { $raced.prerelease = 'false' }
+    }
+    Assert-Fails { Assert-DraftReleaseIdentity $raced $id $tag $commit } "pre-PATCH $mutation"
+}
+$published = $draft.PSObject.Copy()
+$published.draft = $false
+Assert-PublishedReleaseIdentity $published $id $tag $commit
+foreach ($mutation in @('id', 'tag', 'target', 'still-draft', 'prerelease', 'draft-string', 'prerelease-string')) {
+    $raced = $published.PSObject.Copy()
+    switch ($mutation) {
+        'id' { $raced.id = 100 }
+        'tag' { $raced.tag_name = 'updater-v1.2.1' }
+        'target' { $raced.target_commitish = 'd' * 40 }
+        'still-draft' { $raced.draft = $true }
+        'prerelease' { $raced.prerelease = $true }
+        'draft-string' { $raced.draft = 'false' }
+        'prerelease-string' { $raced.prerelease = 'false' }
+    }
+    Assert-Fails { Assert-PublishedReleaseIdentity $raced $id $tag $commit } "post-PATCH $mutation"
+}
+'release-identity-races-ok'
+'@)
+$releaseIdentityResult = @(& $releaseIdentityHarness)
+if ($releaseIdentityResult.Count -ne 1 -or [string]$releaseIdentityResult[0] -cne 'release-identity-races-ok') {
+    throw 'Updater pre/post publication identity-race fixture did not complete exactly.'
+}
+
 # Exercise Sync-DraftAssets with in-memory GitHub mocks. Ordinary resume must
 # not delete a starter; uploaded mismatch blocks repair before deletion; and a
 # starter that concurrently completes is retained rather than deleted.
@@ -329,7 +398,9 @@ $assetFunctionNames = @(
     'Test-RemoteAsset',
     'Assert-ExactRemoteInventory',
     'Get-ValidatedDraftAssetPlan',
+    'Assert-UpdaterReleaseIdentity',
     'Assert-DraftReleaseIdentity',
+    'Assert-PublishedReleaseIdentity',
     'Sync-DraftAssets'
 )
 $assetFunctions = @($assetFunctionNames | ForEach-Object { Get-PublisherFunctionText $_ }) -join [Environment]::NewLine
@@ -367,6 +438,7 @@ function Get-Release([int64]$ReleaseId) {
         tag_name = $tag
         target_commitish = $commit
         draft = $true
+        prerelease = $false
         assets = @($script:currentAssets)
     }
 }
@@ -386,7 +458,7 @@ function Invoke-GhCommand([string[]]$Arguments) {
     }
     throw "Unexpected mocked gh command: $($Arguments -join ' ')"
 }
-$initial = [pscustomobject]@{ id = 99; tag_name = $tag; target_commitish = $commit; draft = $true; assets = @($script:currentAssets) }
+$initial = [pscustomobject]@{ id = 99; tag_name = $tag; target_commitish = $commit; draft = $true; prerelease = $false; assets = @($script:currentAssets) }
 $failure = $null
 try { $null = Sync-DraftAssets $initial $expected $tag $commit }
 catch { $failure = $_.Exception.Message }

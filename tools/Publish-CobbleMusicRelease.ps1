@@ -50,6 +50,8 @@ $UpdaterBootstrap = Join-Path $Root 'bootstrap\Bootstrap-CobbleMusicUpdater.ps1'
 $PinnedUpdaterExe = Join-Path $Root 'updater\dist\win-x64\CobbleMusicUpdater.exe'
 $RequiredPinnedUpdaterVersion = '1.2.0'
 $AllowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
+$MaximumManifestSnapshotBytes = 8MB
+$MaximumSignatureSnapshotBytes = 64KB
 
 Import-Module $CoreModule -Force
 
@@ -178,8 +180,8 @@ function Open-ManifestSignatureIdentity([string]$ManifestPath, [string]$Signatur
     $manifestSnapshot = $null
     $signatureSnapshot = $null
     try {
-        $manifestSnapshot = Open-CobbleLockedFileSnapshot -Path $ManifestPath
-        $signatureSnapshot = Open-CobbleLockedFileSnapshot -Path $SignaturePath
+        $manifestSnapshot = Open-CobbleLockedFileSnapshot -Path $ManifestPath -MaximumBytes $MaximumManifestSnapshotBytes
+        $signatureSnapshot = Open-CobbleLockedFileSnapshot -Path $SignaturePath -MaximumBytes $MaximumSignatureSnapshotBytes
         return [pscustomobject]@{
             Manifest = $manifestSnapshot
             Signature = $signatureSnapshot
@@ -268,6 +270,7 @@ function Split-ReleaseFile([string]$Source, [string]$DestinationRoot, [int64]$Ch
 
 function New-PayloadParts([object[]]$PayloadFiles) {
     if ($PayloadFiles.Count -eq 0) {
+        Assert-CobbleReleaseAssetCount -PayloadPartCount 0 | Out-Null
         return [pscustomobject]@{ Payload = $null; Parts = @(); Size = 0 }
     }
 
@@ -306,6 +309,7 @@ function New-PayloadParts([object[]]$PayloadFiles) {
         }
     }
     if ($parts.Count -eq 0) { throw 'A non-empty payload produced no release parts.' }
+    Assert-CobbleReleaseAssetCount -PayloadPartCount $parts.Count | Out-Null
 
     return [pscustomobject]@{
         Payload = [ordered]@{
@@ -319,15 +323,18 @@ function New-PayloadParts([object[]]$PayloadFiles) {
     }
 }
 
-function Get-GitHubReleaseByTag([string]$Tag) {
-    $matches = [Collections.Generic.List[object]]::new()
+function Get-GitHubReleaseIndex {
+    $releases = [Collections.Generic.List[object]]::new()
     for ($page = 1; ; $page++) {
         $result = @(Invoke-GhJson -Arguments @('api', "repos/$Repository/releases?per_page=100&page=$page"))
-        foreach ($release in $result) {
-            if ([string]$release.tag_name -ceq $Tag) { $matches.Add($release) }
-        }
-        if (-not (Test-CobblePaginationHasNextPage -Page $page -ResultCount $result.Count -MaximumPages 10 -Context 'GitHub release index')) { break }
+        foreach ($release in $result) { $releases.Add($release) }
+        if (-not (Test-CobblePaginationHasNextPage -Page $page -ResultCount $result.Count -MaximumPages 100 -Context 'GitHub release index')) { break }
     }
+    return @($releases)
+}
+
+function Get-GitHubReleaseByTag([string]$Tag) {
+    $matches = @(Get-GitHubReleaseIndex | Where-Object { [string]$_.tag_name -ceq $Tag })
     if ($matches.Count -gt 1) { throw "GitHub contains multiple releases for reserved tag $Tag." }
     if ($matches.Count -eq 0) { return $null }
     return $matches[0]
@@ -463,7 +470,10 @@ function Get-ExpectedStagedAssets([object]$Manifest, [object]$StagedIdentity) {
         $expected.Add([pscustomobject]@{ name = $asset.name; path = $asset.path; size = $asset.size; sha256 = $asset.sha256 })
     }
 
-    foreach ($partIdentity in @(Assert-CobbleStagedPayloadParts -Payload $Manifest.payload -StagingRoot $OutputRoot)) {
+    $payload = Get-CobbleOptionalPropertyValue -Object $Manifest -Name 'payload'
+    $partIdentities = @(Assert-CobbleStagedPayloadParts -Payload $payload -StagingRoot $OutputRoot)
+    Assert-CobbleReleaseAssetCount -PayloadPartCount $partIdentities.Count | Out-Null
+    foreach ($partIdentity in $partIdentities) {
         $expected.Add($partIdentity)
     }
     return @($expected)
@@ -552,10 +562,16 @@ function Publish-StagedRelease(
     Assert-ManifestSignatureIdentity $StagedIdentity | Out-Null
     $finalDraft = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'draft'
     Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($finalDraft.Assets) -RequireComplete | Out-Null
+    # Updater 1.2 reads at most five 100-item release-index pages and rejects a
+    # full fifth page as ambiguous truncation. Perform the prospective count at
+    # the final mutation boundary and leave at most 499 non-draft releases;
+    # public prereleases consume slots too.
+    Assert-CobblePublicReleaseCapacity -Releases @(Get-GitHubReleaseIndex) -AdditionalPublicReleases 1 | Out-Null
     Invoke-GhJson -Arguments @('api', '--method', 'PATCH', "repos/$Repository/releases/$releaseId", '-F', 'draft=false') | Out-Null
 
     $published = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'public'
     Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($published.Assets) -RequireComplete | Out-Null
+    Assert-CobblePublicReleaseCapacity -Releases @(Get-GitHubReleaseIndex) -AdditionalPublicReleases 0 | Out-Null
     Write-Host "Published signed GitHub Release $tag to $Repository"
 }
 

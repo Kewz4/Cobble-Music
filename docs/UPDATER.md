@@ -229,9 +229,14 @@ Only after reviewing the exact draft, publish it with both explicit gates:
 ```
 
 The publisher re-reads and validates the draft immediately before changing
-`draft` to `false`. A failed upload or validation deliberately retains the
-draft so the next run can resume safely. Authentication comes only from the
-GitHub CLI credential store; the publisher accepts and emits no secrets.
+`draft` to `false`. That fresh exact-ID GET must still report the original tag
+and source commit with `draft=true` and `prerelease=false`, plus the complete
+two-asset inventory. The PATCH response is not trusted: another exact-ID GET
+must then report the same ID/tag/commit with `draft=false`,
+`prerelease=false`, and the same complete inventory. A failed upload or
+validation deliberately retains the draft so the next run can resume safely.
+Authentication comes only from the GitHub CLI credential store; the publisher
+accepts and emits no secrets.
 
 ## Install into one Prism instance
 
@@ -349,9 +354,10 @@ is the pair revalidated at the final publication boundary.
 A v2 manifest still carries the complete authoritative `files` state. Its
 `payloadFiles` contains only changed/new files, while `deletedFiles` contains
 the exact old path, size, and SHA-256 from the signed base. A deletion-only
-release is valid and has no ZIP or part assets. Case/Unicode-colliding paths,
-unsafe updater paths, stale or equal versions, incomplete differences, and
-case-only renames are rejected before signing.
+release is valid and has no ZIP or part assets; raw v2 JSON may omit the
+optional `payload` property entirely. Case/Unicode-colliding paths, unsafe
+updater paths, stale or equal versions, incomplete differences, and case-only
+renames are rejected before signing.
 The staging/resume validators mirror updater 1.2's schema rules: a v1 baseline
 must declare a canonical supported `minimumUpdaterVersion` and cannot carry
 delta-only fields, while v2 cannot use path-only `deletePaths`. Truly absent
@@ -362,7 +368,11 @@ rejected exactly as the distributed updater rejects it.
 Review `release-output\1.0.5\cobble-music-update.json`, its signature, and all
 generated part hashes. Staging makes no GitHub change. Payload parts default to
 256 MiB; the temporary combined ZIP is removed immediately after splitting so
-staging does not retain a second full copy.
+staging does not retain a second full copy. One release may contain at most 997
+payload parts: the manifest and detached signature consume the other two slots
+of the publisher's 999-asset safety ceiling. If splitting would produce 998
+parts, staging stops before signing; use a larger reviewed chunk size or reduce
+the payload.
 Before hashing or splitting that ZIP, the publisher streams every archive entry
 and requires its canonical path, uncompressed size, and SHA-256 to exactly
 match `payloadFiles`, with no duplicate, extra, or missing entries. This catches
@@ -374,6 +384,9 @@ The manifest and detached signature are opened as read-locked byte snapshots
 before signature verification. Those same exact bytes are parsed, hashed for
 the expected asset inventory, and held against replacement through upload;
 their signature and hashes are checked again at every remote mutation boundary.
+The manifest limit is exactly 8 MiB and the detached-signature limit is exactly
+64 KiB, inclusive, matching updater 1.2; one additional byte is rejected before
+verification, signing-resume, or upload.
 
 After review, publish that **exact existing staging**:
 
@@ -394,6 +407,15 @@ prerelease state, and complete exact asset inventory. It then postvalidates the
 same ID/tag in public state with the same inventory; a tag that was deleted,
 recreated, retargeted, or otherwise changed is never patched through stale
 state.
+
+Updater 1.2 reads at most five 100-item GitHub release-index pages and treats a
+full fifth page as unsafe truncation. Before publication, the publisher fully
+scans the authenticated release index and permits the new public release only
+when it would leave at most 499 non-draft releases in total; public prereleases
+consume slots too. It repeats the count after the exact-ID publication check.
+Drafts do not consume player-visible slots, but are still traversed so tag
+uniqueness checks cannot miss a reserved draft beyond the updater's public scan
+window.
 
 Before any GitHub mutation, the publisher additionally requires the local
 pinned updater EXE to match the exact `uploaded` size and GitHub SHA-256 digest

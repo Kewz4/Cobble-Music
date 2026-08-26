@@ -274,6 +274,16 @@ Assert-True (Test-CobblePaginationHasNextPage -Page 9 -ResultCount 100 -MaximumP
 Assert-True (-not (Test-CobblePaginationHasNextPage -Page 3 -ResultCount 99 -MaximumPages 10 -Context 'test release index')) 'A partial release-index page incorrectly continued.'
 Assert-Throws { Test-CobblePaginationHasNextPage -Page 10 -ResultCount 100 -MaximumPages 10 -Context 'test release index' | Out-Null } 'A full final release-index page was silently truncated.'
 
+Assert-True (Assert-CobbleReleaseAssetCount -PayloadPartCount 997) 'The safe 997-part / 999-total-asset boundary was rejected.'
+Assert-Throws { Assert-CobbleReleaseAssetCount -PayloadPartCount 998 | Out-Null } 'A release with 998 payload parts / 1,000 total assets was accepted.'
+
+$publicReleaseIndex498 = @(1..498 | ForEach-Object { [pscustomobject]@{ id = $_; draft = $false; prerelease = ($_ -eq 498) } })
+$publicReleaseIndex499 = @($publicReleaseIndex498) + @([pscustomobject]@{ id = 499; draft = $false; prerelease = $false })
+Assert-True (Assert-CobblePublicReleaseCapacity -Releases $publicReleaseIndex498 -AdditionalPublicReleases 1) 'Publishing the 499th public release was rejected.'
+Assert-True (Assert-CobblePublicReleaseCapacity -Releases $publicReleaseIndex499 -AdditionalPublicReleases 0) 'An existing 499-release public index was rejected.'
+Assert-Throws { Assert-CobblePublicReleaseCapacity -Releases $publicReleaseIndex499 -AdditionalPublicReleases 1 | Out-Null } 'Publishing a 500th public release was accepted.'
+Assert-Throws { Assert-CobblePublicReleaseCapacity -Releases @([pscustomobject]@{ id = 1; draft = 'false' }) -AdditionalPublicReleases 1 | Out-Null } 'String-valued draft=false undercounted the public release index.'
+
 $pathTestRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-key-isolation-$([Guid]::NewGuid().ToString('N'))"
 $sourceRoot = Join-Path $pathTestRoot 'minecraft'
 $releaseRoot = Join-Path $pathTestRoot 'release-output'
@@ -287,6 +297,7 @@ $lockTestRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-publisher-lock-test
 [IO.Directory]::CreateDirectory($lockTestRoot) | Out-Null
 $manifestLock = $null
 $signatureLock = $null
+$boundaryLock = $null
 try {
     $lockedManifestPath = Join-Path $lockTestRoot 'cobble-music-update.json'
     $lockedSignaturePath = Join-Path $lockTestRoot 'cobble-music-update.sig'
@@ -313,8 +324,29 @@ try {
     Assert-True (Assert-CobblePublishedBaseAssets -LocalAssets $lockedBaseAssets -RemoteAssets $lockedRemoteAssets) 'Exact locked base byte pair was not usable as its remote identity snapshot.'
     Assert-True (Assert-CobbleLockedFileSnapshot $manifestLock) 'Manifest lock identity changed after adversarial swap attempts.'
     Assert-True (Assert-CobbleLockedFileSnapshot $signatureLock) 'Signature lock identity changed after adversarial swap attempts.'
+
+    foreach ($boundary in @(
+        [pscustomobject]@{ Name = 'manifest'; MaximumBytes = [int64](8MB) },
+        [pscustomobject]@{ Name = 'signature'; MaximumBytes = [int64](64KB) }
+    )) {
+        $exactBoundaryPath = Join-Path $lockTestRoot "$($boundary.Name)-exact.bin"
+        $boundaryWriter = [IO.File]::Open($exactBoundaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $boundaryWriter.SetLength($boundary.MaximumBytes) }
+        finally { $boundaryWriter.Dispose() }
+        $boundaryLock = Open-CobbleLockedFileSnapshot -Path $exactBoundaryPath -MaximumBytes $boundary.MaximumBytes
+        Assert-True ($boundaryLock.size -eq $boundary.MaximumBytes) "Exact $($boundary.Name) snapshot boundary was rejected."
+        Close-CobbleLockedFileSnapshot $boundaryLock
+        $boundaryLock = $null
+
+        $oversizeBoundaryPath = Join-Path $lockTestRoot "$($boundary.Name)-oversize.bin"
+        $boundaryWriter = [IO.File]::Open($oversizeBoundaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $boundaryWriter.SetLength($boundary.MaximumBytes + 1) }
+        finally { $boundaryWriter.Dispose() }
+        Assert-Throws { Open-CobbleLockedFileSnapshot -Path $oversizeBoundaryPath -MaximumBytes $boundary.MaximumBytes | Out-Null } "Oversize $($boundary.Name) snapshot was accepted."
+    }
 }
 finally {
+    Close-CobbleLockedFileSnapshot $boundaryLock
     Close-CobbleLockedFileSnapshot $signatureLock
     Close-CobbleLockedFileSnapshot $manifestLock
     if ([IO.Directory]::Exists($lockTestRoot)) { [IO.Directory]::Delete($lockTestRoot, $true) }
@@ -365,6 +397,12 @@ Assert-Throws { Assert-CobbleReleaseIdentityState -Release $draftRelease -Expect
 $prereleaseDraft = $draftRelease.PSObject.Copy()
 $prereleaseDraft.prerelease = $true
 Assert-Throws { Assert-CobbleReleaseIdentityState -Release $prereleaseDraft -ExpectedId 1001 -ExpectedTag 'modpack-v1.0.5' -ExpectedState draft } 'Prerelease draft was accepted for mutation.'
+$stringDraftState = $draftRelease.PSObject.Copy()
+$stringDraftState.draft = 'true'
+Assert-Throws { Assert-CobbleReleaseIdentityState -Release $stringDraftState -ExpectedId 1001 -ExpectedTag 'modpack-v1.0.5' -ExpectedState draft } 'String-valued draft state was accepted for mutation.'
+$stringPrereleaseState = $draftRelease.PSObject.Copy()
+$stringPrereleaseState.prerelease = 'false'
+Assert-Throws { Assert-CobbleReleaseIdentityState -Release $stringPrereleaseState -ExpectedId 1001 -ExpectedTag 'modpack-v1.0.5' -ExpectedState draft } 'String-valued prerelease state was accepted for mutation.'
 $publicWithoutTimestamp = $publicRelease.PSObject.Copy()
 $publicWithoutTimestamp.published_at = $null
 Assert-Throws { Assert-CobbleReleaseIdentityState -Release $publicWithoutTimestamp -ExpectedId 1001 -ExpectedTag 'modpack-v1.0.5' -ExpectedState public } 'Post-publication state without published_at was accepted.'
@@ -459,6 +497,60 @@ $publisherText = [IO.File]::ReadAllText($Publisher)
 Assert-True ($publisherText -notmatch '(?i)\bdotnet\b|UpdaterProject|UpdaterDll|Build-UpdaterSigningTool') 'Modpack publisher still builds or executes a mutable working-tree updater.'
 Assert-True ($publisherText -match [regex]::Escape("updater\dist\win-x64\CobbleMusicUpdater.exe")) 'Modpack publisher does not use the distributed updater artifact.'
 Assert-True ($publisherText -match 'Get-SingleQuotedBootstrapAssignment[\s\S]+ExpectedUpdaterSha256') 'Modpack publisher does not bind the distributed updater to the bootstrap version/hash.'
+foreach ($snapshotLimitFragment in @(
+    '$MaximumManifestSnapshotBytes = 8MB',
+    '$MaximumSignatureSnapshotBytes = 64KB',
+    'Open-CobbleLockedFileSnapshot -Path $ManifestPath -MaximumBytes $MaximumManifestSnapshotBytes',
+    'Open-CobbleLockedFileSnapshot -Path $SignaturePath -MaximumBytes $MaximumSignatureSnapshotBytes'
+)) {
+    Assert-True ($publisherText.Contains($snapshotLimitFragment, [StringComparison]::Ordinal)) "Publisher lost an updater-parity snapshot limit: $snapshotLimitFragment"
+}
+
+$newPayloadFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-PayloadParts' }, $true)
+Assert-True ($newPayloadFunction.Extent.Text.Contains('Assert-CobbleReleaseAssetCount -PayloadPartCount $parts.Count', [StringComparison]::Ordinal)) 'Fresh staging does not enforce the payload-part asset ceiling before signing.'
+$getExpectedFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-ExpectedStagedAssets' }, $true)
+$getExpectedFunctionText = $getExpectedFunction.Extent.Text
+Assert-True ($getExpectedFunctionText.Contains("Get-CobbleOptionalPropertyValue -Object `$Manifest -Name 'payload'", [StringComparison]::Ordinal)) 'Staged resume directly dereferences optional payload under StrictMode.'
+Assert-True ($getExpectedFunctionText.Contains('Assert-CobbleReleaseAssetCount -PayloadPartCount $partIdentities.Count', [StringComparison]::Ordinal)) 'Staged resume does not enforce the payload-part asset ceiling.'
+
+# Execute the real expected-assets function against raw JSON that intentionally
+# omits optional payload. This is the deletion-only v2 shape produced by
+# System.Text.Json and must remain resumable under StrictMode.
+$missingPayloadFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-missing-payload-$([Guid]::NewGuid().ToString('N'))"
+$missingPayloadManifestLock = $null
+$missingPayloadSignatureLock = $null
+try {
+    [IO.Directory]::CreateDirectory($missingPayloadFixtureRoot) | Out-Null
+    $missingPayloadManifestPath = Join-Path $missingPayloadFixtureRoot 'cobble-music-update.json'
+    $missingPayloadSignaturePath = Join-Path $missingPayloadFixtureRoot 'cobble-music-update.sig'
+    [IO.File]::WriteAllText($missingPayloadManifestPath, '{"schemaVersion":2,"payloadFiles":[],"deletedFiles":[{"path":"mods/old.jar","size":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}')
+    [IO.File]::WriteAllBytes($missingPayloadSignaturePath, [byte[]](1..64))
+    $rawDeletionOnlyManifest = [IO.File]::ReadAllText($missingPayloadManifestPath) | ConvertFrom-Json
+    Assert-True ($null -eq $rawDeletionOnlyManifest.PSObject.Properties['payload']) 'Deletion-only raw manifest fixture unexpectedly contains payload.'
+    $missingPayloadManifestLock = Open-CobbleLockedFileSnapshot $missingPayloadManifestPath
+    $missingPayloadSignatureLock = Open-CobbleLockedFileSnapshot $missingPayloadSignaturePath
+    $missingPayloadIdentity = [pscustomobject]@{
+        Manifest = $missingPayloadManifestLock
+        Signature = $missingPayloadSignatureLock
+        Assets = @(
+            [pscustomobject]@{ name = 'cobble-music-update.json'; path = $missingPayloadManifestLock.path; size = $missingPayloadManifestLock.size; sha256 = $missingPayloadManifestLock.sha256 },
+            [pscustomobject]@{ name = 'cobble-music-update.sig'; path = $missingPayloadSignatureLock.path; size = $missingPayloadSignatureLock.size; sha256 = $missingPayloadSignatureLock.sha256 }
+        )
+    }
+    $missingPayloadHarness = [scriptblock]::Create(
+        'param($Manifest, $StagedIdentity, [string]$FixtureRoot)' + [Environment]::NewLine +
+        'Set-StrictMode -Version Latest' + [Environment]::NewLine +
+        $getExpectedFunctionText + [Environment]::NewLine +
+        '$OutputRoot = $FixtureRoot' + [Environment]::NewLine +
+        'Get-ExpectedStagedAssets $Manifest $StagedIdentity')
+    $missingPayloadAssets = @(& $missingPayloadHarness $rawDeletionOnlyManifest $missingPayloadIdentity $missingPayloadFixtureRoot)
+    Assert-True ($missingPayloadAssets.Count -eq 2 -and $missingPayloadAssets[0].name -ceq 'cobble-music-update.json' -and $missingPayloadAssets[1].name -ceq 'cobble-music-update.sig') 'Deletion-only raw manifest without payload did not resume to exactly its two metadata assets.'
+}
+finally {
+    Close-CobbleLockedFileSnapshot $missingPayloadSignatureLock
+    Close-CobbleLockedFileSnapshot $missingPayloadManifestLock
+    if ([IO.Directory]::Exists($missingPayloadFixtureRoot)) { [IO.Directory]::Delete($missingPayloadFixtureRoot, $true) }
+}
 
 $publishFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Publish-StagedRelease' }, $true)
 $publishFunctionText = $publishFunction.Extent.Text
@@ -471,6 +563,10 @@ $finalDraftIndex = $publishFunctionText.LastIndexOf("Get-ExactReleaseSnapshotByI
 $postPublicIndex = $publishFunctionText.IndexOf("Get-ExactReleaseSnapshotById -ReleaseId `$releaseId -Tag `$tag -State 'public'", [StringComparison]::Ordinal)
 Assert-True ($finalDraftIndex -gt $finalBaseCheckIndex -and $finalDraftIndex -lt $patchIndex) 'Final PATCH does not immediately refetch and validate the exact draft ID/tag/assets.'
 Assert-True ($postPublicIndex -gt $patchIndex) 'Publication does not postvalidate the same release ID/tag/public state.'
+$preCapacityIndex = $publishFunctionText.LastIndexOf('Assert-CobblePublicReleaseCapacity -Releases @(Get-GitHubReleaseIndex) -AdditionalPublicReleases 1', $patchIndex, [StringComparison]::Ordinal)
+$postCapacityIndex = $publishFunctionText.IndexOf('Assert-CobblePublicReleaseCapacity -Releases @(Get-GitHubReleaseIndex) -AdditionalPublicReleases 0', $patchIndex, [StringComparison]::Ordinal)
+Assert-True ($preCapacityIndex -gt $finalDraftIndex -and $preCapacityIndex -lt $patchIndex) 'Publication does not gate the prospective public release index after final draft/inventory validation and directly before PATCH.'
+Assert-True ($postCapacityIndex -gt $postPublicIndex) 'Publication does not postvalidate the updater-safe public release count.'
 $deleteIndex = $publishFunctionText.IndexOf("'DELETE'", [StringComparison]::Ordinal)
 $deleteRefetchIndex = $publishFunctionText.LastIndexOf("Get-ExactReleaseSnapshotById -ReleaseId `$releaseId -Tag `$tag -State 'draft'", $deleteIndex, [StringComparison]::Ordinal)
 $deleteCandidateIndex = $publishFunctionText.LastIndexOf('Get-CobbleStarterAssetForDeletion', $deleteIndex, [StringComparison]::Ordinal)
