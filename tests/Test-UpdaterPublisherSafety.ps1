@@ -251,13 +251,13 @@ foreach ($invalid in @('01.2.3', '1.02.3', '1.2.03', '1.2', '1.2.3.4')) {
     Assert-Throws { $null = ConvertTo-CanonicalUpdaterVersion $invalid 'Fixture version' } 'canonical three-part'
 }
 $olderStable = @([pscustomobject]@{ tag_name = 'updater-v1.3.0'; draft = $false; prerelease = $false })
-Assert-Throws { Assert-UpdaterVersionReservation $olderStable '1.2.0' 'updater-v1.2.0' } 'strictly newer'
-$semanticDuplicate = @([pscustomobject]@{ tag_name = 'updater-v01.2.0'; draft = $false; prerelease = $false })
-Assert-Throws { Assert-UpdaterVersionReservation $semanticDuplicate '1.2.0' 'updater-v1.2.0' } 'semantic duplicate'
-$exactPublished = @([pscustomobject]@{ tag_name = 'updater-v1.2.0'; draft = $false; prerelease = $false })
-Assert-UpdaterVersionReservation $exactPublished '1.2.0' 'updater-v1.2.0'
+Assert-Throws { Assert-UpdaterVersionReservation $olderStable '1.2.1' 'updater-v1.2.1' } 'strictly newer'
+$semanticDuplicate = @([pscustomobject]@{ tag_name = 'updater-v01.2.1'; draft = $false; prerelease = $false })
+Assert-Throws { Assert-UpdaterVersionReservation $semanticDuplicate '1.2.1' 'updater-v1.2.1' } 'semantic duplicate'
+$exactPublished = @([pscustomobject]@{ tag_name = 'updater-v1.2.1'; draft = $false; prerelease = $false })
+Assert-UpdaterVersionReservation $exactPublished '1.2.1' 'updater-v1.2.1'
 $validUpgrade = @([pscustomobject]@{ tag_name = 'updater-v1.1.9'; draft = $false; prerelease = $false })
-Assert-UpdaterVersionReservation $validUpgrade '1.2.0' 'updater-v1.2.0'
+Assert-UpdaterVersionReservation $validUpgrade '1.2.1' 'updater-v1.2.1'
 'version-policy-ok'
 '@)
 $versionPolicyResult = @(& $versionPolicyHarness)
@@ -270,7 +270,7 @@ $tagReservationFunctions = @(
     Get-PublisherFunctionText 'Reserve-UpdaterTagRef'
 ) -join [Environment]::NewLine
 $tagReservationHarness = [scriptblock]::Create('param([string]$Case)' + [Environment]::NewLine + $tagReservationFunctions + [Environment]::NewLine + @'
-$Tag = 'updater-v1.2.0'
+$Tag = 'updater-v1.2.1'
 $Commit = 'a' * 40
 $ForeignCommit = 'b' * 40
 $Repository = 'fixture/repository'
@@ -354,7 +354,7 @@ function Assert-Fails([scriptblock]$Action, [string]$Description) {
     }
 }
 $id = [int64]99
-$tag = 'updater-v1.2.0'
+$tag = 'updater-v1.2.1'
 $commit = 'c' * 40
 $draft = [pscustomobject]@{ id = $id; tag_name = $tag; target_commitish = $commit; draft = $true; prerelease = $false; assets = @() }
 Assert-DraftReleaseIdentity $draft $id $tag $commit
@@ -362,7 +362,7 @@ foreach ($mutation in @('id', 'tag', 'target', 'published', 'prerelease', 'draft
     $raced = $draft.PSObject.Copy()
     switch ($mutation) {
         'id' { $raced.id = 100 }
-        'tag' { $raced.tag_name = 'updater-v1.2.1' }
+        'tag' { $raced.tag_name = 'updater-v1.2.2' }
         'target' { $raced.target_commitish = 'd' * 40 }
         'published' { $raced.draft = $false }
         'prerelease' { $raced.prerelease = $true }
@@ -378,7 +378,7 @@ foreach ($mutation in @('id', 'tag', 'target', 'still-draft', 'prerelease', 'dra
     $raced = $published.PSObject.Copy()
     switch ($mutation) {
         'id' { $raced.id = 100 }
-        'tag' { $raced.tag_name = 'updater-v1.2.1' }
+        'tag' { $raced.tag_name = 'updater-v1.2.2' }
         'target' { $raced.target_commitish = 'd' * 40 }
         'still-draft' { $raced.draft = $true }
         'prerelease' { $raced.prerelease = $true }
@@ -412,7 +412,7 @@ $assetHarness = [scriptblock]::Create('param([string]$Case)' + [Environment]::Ne
 $hashA = 'a' * 64
 $hashB = 'b' * 64
 $commit = 'c' * 40
-$tag = 'updater-v1.2.0'
+$tag = 'updater-v1.2.1'
 $Repository = 'fixture/repository'
 $expected = @{
     'CobbleMusicUpdater.exe' = [pscustomobject]@{ Path = 'exe'; Size = [int64]7; Sha256 = $hashA }
