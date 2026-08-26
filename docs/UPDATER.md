@@ -127,6 +127,57 @@ updater\dist\win-x64\CobbleMusicUpdater.exe
 Use `-Runtime win-arm64` on an ARM Windows machine, and pass the same runtime
 to the installer.
 
+## Publish an updater-binary release
+
+Updater binaries use their own `updater-v*` releases and are completely
+separate from signed `modpack-v*` payload releases. The updater publisher
+derives the release version from the single `BuildInfo.Version` constant,
+requires the project version to match it, builds self-contained `win-x64`,
+computes the EXE's SHA-256, and tests a proposed bootstrap containing that
+exact version/hash. Its deterministic build excludes Git's changing commit
+suffix from assembly metadata, avoiding a checksum cycle when that bootstrap
+pin is committed; GitHub upload still requires every input to be committed.
+
+First stage locally. This runs every `tests/Test-*.ps1` plus every updater
+`*.Tests.csproj`, atomically refreshes the tracked bootstrap only after they
+pass, and makes no GitHub change:
+
+```powershell
+.\tools\Publish-CobbleMusicUpdater.ps1
+```
+
+Use `-DryRun` to build and test the proposed release without changing either
+the tracked bootstrap or GitHub. After a normal staging run, review and commit
+the updater source, publisher, tests, documentation, and refreshed bootstrap.
+The GitHub modes deliberately refuse dirty release inputs.
+
+Create or resume the release as a persistent draft:
+
+```powershell
+.\tools\Publish-CobbleMusicUpdater.ps1 -UploadDraft
+```
+
+Rerunning that command retains already verified assets, replaces only an
+incomplete or mismatched asset with one of the two exact expected names, and
+leaves the validated release as a draft. Unexpected assets are never deleted
+automatically and block publication. The exact remote inventory is:
+
+- `CobbleMusicUpdater.exe`
+- `Bootstrap-CobbleMusicUpdater.ps1`
+
+For each asset, GitHub must report `uploaded`, the exact local byte length,
+and the exact SHA-256 digest. Only after reviewing that draft, publish it with
+both explicit gates:
+
+```powershell
+.\tools\Publish-CobbleMusicUpdater.ps1 -Publish -ConfirmPublish
+```
+
+The publisher re-reads and validates the draft immediately before changing
+`draft` to `false`. A failed upload or validation deliberately retains the
+draft so the next run can resume safely. Authentication comes only from the
+GitHub CLI credential store; the publisher accepts and emits no secrets.
+
 ## Install into one Prism instance
 
 ```powershell
@@ -160,7 +211,7 @@ one-time setup action—nothing exists on their PC yet that could check GitHub
 when they press Play. The published bootstrap performs that setup safely:
 
 1. verifies the selected Prism instance has `instance.cfg` and `minecraft/`;
-2. downloads the exact `updater-v1.1.0` EXE and checks its SHA-256;
+2. downloads the exact `updater-v1.2.0` EXE and checks its SHA-256;
 3. installs it at `minecraft/cobble-music-updater/CobbleMusicUpdater.exe`;
 4. writes only the updater's own `updater.json` (backing up an existing one);
    and
@@ -172,13 +223,13 @@ unless the player deliberately reruns it with `-Force`. It does not touch
 saves, `options.txt`, `servers.dat`, logs, or resource-pack selections.
 
 After the bootstrap asset has been downloaded from
-[updater-v1.1.0](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.1.0),
+[updater-v1.2.0](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.0),
 the player can paste this into PowerShell, replacing the example instance path:
 
 ```powershell
-$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.1.0/Bootstrap-CobbleMusicUpdater.ps1'
+$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.0/Bootstrap-CobbleMusicUpdater.ps1'
 $path = Join-Path $env:TEMP 'Bootstrap-CobbleMusicUpdater.ps1'
-$expected = '733B41BFF9CA6E48D7228214C44E511DB7BE4E7BC3A3A79697D66414BA267DFC'
+$expected = '4F12B9BA8FE1A5193C99D290649943499C4E7A8D99B1D75412985293B0142A62'
 Invoke-WebRequest -Uri $uri -OutFile $path
 if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $expected) { throw 'Bootstrap checksum mismatch.' }
 Unblock-File -LiteralPath $path
