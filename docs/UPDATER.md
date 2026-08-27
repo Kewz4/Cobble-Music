@@ -471,13 +471,17 @@ an explicit JSON `null` for any required collection is different and is
 rejected exactly as the distributed updater rejects it.
 
 The publisher inventories immutable `files` separately from create-only
-`seedFiles`. Mutable live configs are sourced from the canonical client unless
-a reviewed file under `release-defaults/` overrides them; this is used to
-remove per-player Reactive Music home coordinates and stale Iris timestamps.
-Every current top-level Axiom JAR is automatically removed from the immutable
-inventory and added to the create-only inventory. A release with seeds requires
-updater 1.2.6 or newer, and the payload ZIP is checked against the exact union of its
-managed payload files and seed files before signing.
+`seedFiles`. Player ownership is intentionally narrow: `options.txt` covers
+vanilla keybind/video/sound settings; Reactive Music, Music Notification, and
+the music bridge cover sound behavior; and Sodium, Sodium Extra, and Voxy cover
+their video settings. Reviewed files under `release-defaults/` can sanitize a
+seed, such as removing per-player Reactive Music home coordinates. Other
+particle, fog, Iris, camera, resource-pack policy, and utility configs remain
+managed pack configuration. Every current top-level Axiom JAR is automatically
+removed from the immutable inventory and added to the create-only inventory. A
+release with seeds requires updater 1.2.6 or newer, and the payload ZIP is
+checked against the exact union of its managed payload files and seed files
+before signing.
 
 Review `release-output\1.0.5\cobble-music-update.json`, its signature, and all
 generated part hashes. Staging makes no GitHub change. Payload parts default to
