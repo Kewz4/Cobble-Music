@@ -12,6 +12,7 @@ internal sealed class TransactionJournal
     public string Phase { get; set; } = "applying";
     public InstalledState? PreviousState { get; set; }
     public InstalledState? NextState { get; set; }
+    public List<ManagedFileState> SeedFiles { get; set; } = [];
     public List<TransactionOperation> Operations { get; set; } = [];
 }
 
@@ -80,7 +81,10 @@ internal static class TransactionStore
         {
             throw new TransactionRecoveryException("The updater transaction journal is unreadable. Prism will not launch until it is repaired.", exception);
         }
-        if (journal is null || journal.SchemaVersion is not (1 or 2) || journal.Operations is null)
+        if (journal is null
+            || journal.SchemaVersion is not (1 or 2)
+            || journal.Operations is null
+            || journal.SeedFiles is null)
         {
             throw new TransactionRecoveryException("The updater transaction journal has an unsupported format. Prism will not launch until it is repaired.");
         }
@@ -181,7 +185,7 @@ internal static class TransactionStore
         TransactionJournal journal,
         CancellationToken cancellationToken)
     {
-        var nextFiles = journal.NextState!.ManagedFiles.ToDictionary(
+        var nextFiles = journal.NextState!.ManagedFiles.Concat(journal.SeedFiles).ToDictionary(
             file => file.Path,
             StringComparer.OrdinalIgnoreCase);
         string rollbackRoot = Path.Combine(paths.LocalDataDirectory, "rollback");
@@ -238,14 +242,47 @@ internal static class TransactionStore
             ValidateJournalState(journal.NextState, allowedRoots);
         }
 
+        var seedPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (ManagedFileState seed in journal.SeedFiles)
+        {
+            if (seed is null)
+            {
+                throw new TransactionRecoveryException("The updater transaction journal contains an empty create-only default entry.");
+            }
+            string path = PathSafety.NormalizeRelativePath(seed.Path);
+            if (!PathSafety.IsSeedAllowed(path)
+                || seed.Size < 0
+                || string.IsNullOrWhiteSpace(seed.Sha256)
+                || seed.Sha256.Length != 64
+                || seed.Sha256.Any(character => !Uri.IsHexDigit(character))
+                || !seedPaths.Add(path))
+            {
+                throw new TransactionRecoveryException("The updater transaction journal contains an unsafe create-only default.");
+            }
+            seed.Path = path;
+        }
+        if (journal.SchemaVersion == 1 && seedPaths.Count != 0)
+        {
+            throw new TransactionRecoveryException("A legacy updater transaction journal cannot contain create-only defaults.");
+        }
+        if (journal.NextState is not null && journal.NextState.ManagedFiles.Any(file => seedPaths.Contains(file.Path)))
+        {
+            throw new TransactionRecoveryException("The updater transaction journal overlaps managed files and created defaults.");
+        }
+
         string rollbackRoot = Path.Combine(paths.LocalDataDirectory, "rollback");
         foreach (TransactionOperation operation in journal.Operations)
         {
+            bool targetIsCreatedSeed = operation is not null
+                && !string.IsNullOrWhiteSpace(operation.TargetPath)
+                && PathSafety.TryGetRelativePathUnder(paths.MinecraftDirectory, operation.TargetPath, out string seedTargetRelative)
+                && seedPaths.Contains(seedTargetRelative);
             if (operation is null
                 || operation.Kind is not ("create" or "replace" or "delete")
                 || string.IsNullOrWhiteSpace(operation.TargetPath)
                 || !PathSafety.TryGetRelativePathUnder(paths.MinecraftDirectory, operation.TargetPath, out string targetRelative)
-                || !PathSafety.IsAllowed(targetRelative, allowedRoots))
+                || (!PathSafety.IsAllowed(targetRelative, allowedRoots)
+                    && (!targetIsCreatedSeed || operation.Kind != "create")))
             {
                 throw new TransactionRecoveryException("The updater transaction journal contains an unsafe target path.");
             }
@@ -274,6 +311,7 @@ internal static class TransactionStore
                 operation.TargetPath,
                 paths.MinecraftDirectory,
                 allowedRoots,
+                seedPaths,
                 "target");
             if (needsBackup)
             {
@@ -282,6 +320,7 @@ internal static class TransactionStore
                     operation.BackupPath,
                     rollbackRoot,
                     allowedRoots: null,
+                    allowedRelativePaths: null,
                     "backup");
             }
             else if (!string.IsNullOrWhiteSpace(operation.BackupTemporaryPath))
@@ -296,6 +335,7 @@ internal static class TransactionStore
         string destinationPath,
         string containmentRoot,
         IReadOnlyCollection<string>? allowedRoots,
+        IReadOnlySet<string>? allowedRelativePaths,
         string description)
     {
         // Empty values are accepted for journals written by earlier updater
@@ -307,13 +347,18 @@ internal static class TransactionStore
         string temporaryFullPath = Path.GetFullPath(temporaryPath);
         string destinationParent = Path.GetDirectoryName(Path.GetFullPath(destinationPath))!;
         string name = Path.GetFileName(temporaryFullPath);
+        bool explicitDestinationAllowed = allowedRelativePaths is not null
+            && PathSafety.TryGetRelativePathUnder(containmentRoot, destinationPath, out string destinationRelative)
+            && allowedRelativePaths.Contains(destinationRelative);
         if (!string.Equals(Path.GetDirectoryName(temporaryFullPath), destinationParent, StringComparison.OrdinalIgnoreCase)
             || !name.StartsWith(".cobble-music-txn-", StringComparison.Ordinal)
             || !name.EndsWith(".tmp", StringComparison.Ordinal)
             || name.Length != ".cobble-music-txn-".Length + 32 + ".tmp".Length
             || name[".cobble-music-txn-".Length..^".tmp".Length].Any(character => !Uri.IsHexDigit(character))
             || !PathSafety.TryGetRelativePathUnder(containmentRoot, temporaryFullPath, out string relative)
-            || (allowedRoots is not null && !PathSafety.IsAllowed(relative, allowedRoots)))
+            || (allowedRoots is not null
+                && !PathSafety.IsAllowed(relative, allowedRoots)
+                && !explicitDestinationAllowed))
         {
             throw new TransactionRecoveryException($"The updater transaction journal contains an unsafe {description} temporary path.");
         }
@@ -496,7 +541,7 @@ internal static class TransactionStore
         {
             return false;
         }
-        expected = journal.NextState!.ManagedFiles.FirstOrDefault(
+        expected = journal.NextState!.ManagedFiles.Concat(journal.SeedFiles).FirstOrDefault(
             file => string.Equals(file.Path, relative, StringComparison.OrdinalIgnoreCase));
         return expected is not null;
     }

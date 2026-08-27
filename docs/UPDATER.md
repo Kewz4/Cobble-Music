@@ -30,9 +30,20 @@ Only these areas of the instance’s `minecraft` directory are ever eligible:
 - `kubejs/`
 - `scripts/`
 
-The compiled allowlist cannot be widened by `updater.json`. The updater never
-manages saves, logs, screenshots, `options.txt`, servers, accounts, or
-arbitrary remote paths. It refuses junctions/symlinks in target paths.
+The compiled allowlist cannot be widened by `updater.json`. Saves, logs,
+screenshots, servers, accounts, and arbitrary remote paths are never managed.
+The updater refuses junctions/symlinks in target paths.
+
+Updater 1.2.6 adds a separate signed `seedFiles` inventory for reviewed
+first-install defaults. A seed may be `options.txt`, a reviewed `config/`
+file, or a top-level Axiom JAR. Seeds are copied only into a pristine install;
+they are never written into installed updater state, size-checked, repaired,
+deleted, or reapplied. Existing settings and existing absence both win. This
+lets a new client start with the canonical keybinds, video settings, music UI,
+Atmospherics selection, and particle/performance configuration while every
+player remains free to change or remove them afterward. Axiom is likewise an
+optional player-owned mod: removing, disabling, or replacing any Axiom JAR
+does not trigger pack validation or a payload download.
 
 Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
@@ -304,7 +315,7 @@ bootstrap has its final checksum:
 
 ```powershell
 .\tools\New-CobbleMusicPrismBootstrapCommand.ps1 `
-  -UpdaterVersion 1.2.5 `
+  -UpdaterVersion 1.2.6 `
   -ExpectedBootstrapSha256 '<SHA-256 of the published Bootstrap-CobbleMusicUpdater.ps1>'
 ```
 
@@ -318,7 +329,7 @@ an owner who wants to close Prism and replace the field with the short direct
 EXE command. In manual mode it:
 
 1. verifies the selected Prism instance has `instance.cfg` and `minecraft/`;
-2. downloads the exact `updater-v1.2.5` EXE and checks its SHA-256;
+2. downloads the exact `updater-v1.2.6` EXE and checks its SHA-256;
 3. installs it at `minecraft/cobble-music-updater/CobbleMusicUpdater.exe`;
 4. writes only the updater's own `updater.json` (backing up an existing one);
    and
@@ -330,11 +341,11 @@ unless the player deliberately reruns it with `-Force`. It does not touch
 saves, `options.txt`, `servers.dat`, logs, or resource-pack selections.
 
 For that optional manual path, after the bootstrap asset has been downloaded from
-[updater-v1.2.5](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.5),
+[updater-v1.2.6](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.6),
 the player can paste this into PowerShell, replacing the example instance path:
 
 ```powershell
-$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.5/Bootstrap-CobbleMusicUpdater.ps1'
+$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.6/Bootstrap-CobbleMusicUpdater.ps1'
 $path = Join-Path $env:TEMP 'Bootstrap-CobbleMusicUpdater.ps1'
 $expected = 'E3EF3FB5881265838EA04EE26F89B94938BA7DE37458B2FDDFBF2C3455E453DB'
 Invoke-WebRequest -Uri $uri -OutFile $path
@@ -359,7 +370,7 @@ zeroes (for example, `1.0.5`); four-component variants are rejected.
 The modpack publisher never builds or loads the updater from the current C#
 working tree. Signing and verification use only
 `updater\dist\win-x64\CobbleMusicUpdater.exe`, whose version, ProductVersion,
-and SHA-256 must exactly match the committed `updater-v1.2.5` bootstrap pin.
+and SHA-256 must exactly match the committed `updater-v1.2.6` bootstrap pin.
 The EXE is held read-locked from checksum verification through each signer or
 verifier process. Keep the private signing key outside the Minecraft source,
 every managed source root, and `release-output`; the publisher rejects those
@@ -427,6 +438,15 @@ legacy collection properties receive the runtime model's empty-list defaults;
 an explicit JSON `null` for any required collection is different and is
 rejected exactly as the distributed updater rejects it.
 
+The publisher inventories immutable `files` separately from create-only
+`seedFiles`. Mutable live configs are sourced from the canonical client unless
+a reviewed file under `release-defaults/` overrides them; this is used to
+remove per-player Reactive Music home coordinates and stale Iris timestamps.
+Every current top-level Axiom JAR is automatically removed from the immutable
+inventory and added to the create-only inventory. A release with seeds requires
+updater 1.2.6, and the payload ZIP is checked against the exact union of its
+managed payload files and seed files before signing.
+
 Review `release-output\1.0.5\cobble-music-update.json`, its signature, and all
 generated part hashes. Staging makes no GitHub change. Payload parts default to
 256 MiB; the temporary combined ZIP is removed immediately after splitting so
@@ -483,7 +503,7 @@ window.
 
 Before any GitHub mutation, the publisher additionally requires the local
 pinned updater EXE to match the exact `uploaded` size and GitHub SHA-256 digest
-on the currently published, non-prerelease `updater-v1.2.5` release. It checks
+on the currently published, non-prerelease `updater-v1.2.6` release. It checks
 that dependency again immediately before making the modpack draft public. For
 a v2 delta it also re-fetches the stable base release at that final boundary
 and requires both base manifest and signature to match the identity captured

@@ -214,7 +214,7 @@ internal sealed class UpdateEngine
         && string.Equals(state.ManifestSha256, manifestHash, StringComparison.OrdinalIgnoreCase)
         && StateMatchesManifestAndSizes(state, manifest);
 
-    private bool StateMatchesManifestAndSizes(InstalledState state, UpdateManifest manifest)
+    internal bool StateMatchesManifestAndSizes(InstalledState state, UpdateManifest manifest)
     {
         if (state.ManagedFiles.Count != manifest.Files.Count)
         {
@@ -237,7 +237,8 @@ internal sealed class UpdateEngine
                 return false;
             }
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, manifestFile.Path);
-            if (!File.Exists(target) || new FileInfo(target).Length != manifestFile.Size)
+            if (!PathSafety.IsOptionalPlayerMod(manifestFile.Path)
+                && (!File.Exists(target) || new FileInfo(target).Length != manifestFile.Size))
             {
                 return false;
             }
@@ -521,12 +522,12 @@ internal sealed class UpdateEngine
 
         try
         {
-            IReadOnlyCollection<ManifestFile> payloadFiles = ManifestParser.PayloadContents(manifest);
+            IReadOnlyCollection<ManifestFile> payloadFiles = ManifestParser.ManagedPayloadContents(manifest);
             Dictionary<string, ManifestFile>? signedBaseFiles = signedBase?.Files.ToDictionary(
                 file => file.Path,
                 StringComparer.OrdinalIgnoreCase);
             int appliedFiles = 0;
-            int totalFiles = payloadFiles.Count + manifest.DeletedFiles.Count;
+            int totalFiles = payloadFiles.Count + manifest.SeedFiles.Count + manifest.DeletedFiles.Count;
             foreach (ManifestFile file in payloadFiles)
             {
                 Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
@@ -583,6 +584,65 @@ internal sealed class UpdateEngine
                 Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
             }
 
+            bool pristineInstall = string.IsNullOrWhiteSpace(previousState.Version)
+                && string.IsNullOrWhiteSpace(previousState.ManifestSha256)
+                && previousState.ManagedFiles.Count == 0;
+            foreach (ManifestFile seedFile in manifest.SeedFiles)
+            {
+                Report(UpdatePhase.Applying, "Installing first-run defaults", 0, 0, appliedFiles, totalFiles);
+                string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, seedFile.Path);
+                string source = PathSafety.CombineUnder(extractDirectory, seedFile.Path);
+                PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+                if (File.Exists(target))
+                {
+                    _log($"Keeping player-owned setting: {seedFile.Path}");
+                    appliedFiles++;
+                    continue;
+                }
+                if (Directory.Exists(target))
+                {
+                    if (pristineInstall)
+                    {
+                        throw new InvalidDataException($"Create-only default target is a directory: {seedFile.Path}");
+                    }
+                    _log($"Keeping player-owned path: {seedFile.Path}");
+                    appliedFiles++;
+                    continue;
+                }
+                if (!pristineInstall)
+                {
+                    _log($"Keeping player-owned absence: {seedFile.Path}");
+                    appliedFiles++;
+                    continue;
+                }
+
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                journal.SeedFiles.Add(new ManagedFileState
+                {
+                    Path = seedFile.Path,
+                    Size = seedFile.Size,
+                    Sha256 = seedFile.Sha256
+                });
+                var operation = new TransactionOperation
+                {
+                    Kind = "create",
+                    TargetPath = target,
+                    TargetTemporaryPath = TransactionStore.CreateSiblingTemporaryPath(target)
+                };
+                journal.Operations.Add(operation);
+                await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
+                await TransactionStore.MoveOrCopyNewAsync(
+                    source,
+                    target,
+                    operation.TargetTemporaryPath,
+                    seedFile.Size,
+                    seedFile.Sha256,
+                    cancellationToken);
+                await VerifyFileAsync(target, seedFile.Size, seedFile.Sha256, seedFile.Path, cancellationToken);
+                _log($"Initialized player-owned setting: {seedFile.Path}");
+                appliedFiles++;
+            }
+
             if (manifest.SchemaVersion == 1)
             {
                 await ApplySchemaOneDeletesAsync(manifest, previousState, backupDirectory, journal, cancellationToken);
@@ -635,8 +695,10 @@ internal sealed class UpdateEngine
             .Select(file => PathSafety.NormalizeRelativePath(file.Path))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var newManagedPaths = manifest.Files.Select(file => file.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var seedPaths = manifest.SeedFiles.Select(file => file.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var requestedDeletes = manifest.DeletePaths
             .Concat(oldManagedPaths.Except(newManagedPaths, StringComparer.OrdinalIgnoreCase))
+            .Where(path => !seedPaths.Contains(path) && !PathSafety.IsOptionalPlayerMod(path))
             .Distinct(StringComparer.OrdinalIgnoreCase);
         foreach (string requestedDeletePath in requestedDeletes)
         {
@@ -828,9 +890,12 @@ internal sealed class UpdateEngine
             else
             {
                 HashSet<string> newPaths = manifest.Files.Select(file => file.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                HashSet<string> seedPaths = manifest.SeedFiles.Select(file => file.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
                 backupPaths.UnionWith(previousState.ManagedFiles
                     .Select(file => PathSafety.NormalizeRelativePath(file.Path))
-                    .Where(path => !newPaths.Contains(path)));
+                    .Where(path => !newPaths.Contains(path)
+                        && !seedPaths.Contains(path)
+                        && !PathSafety.IsOptionalPlayerMod(path)));
                 backupPaths.UnionWith(manifest.DeletePaths);
             }
             backupPaths.UnionWith(manifest.LegacyCleanup.Select(file => file.Path));

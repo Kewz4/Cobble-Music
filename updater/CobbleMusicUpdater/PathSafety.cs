@@ -35,6 +35,42 @@ internal static class PathSafety
         return allowedRoots.Contains(root, StringComparer.OrdinalIgnoreCase);
     }
 
+    public static bool IsSeedAllowed(string normalizedRelativePath)
+    {
+        if (string.Equals(normalizedRelativePath, "options.txt", StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        if (IsOptionalPlayerMod(normalizedRelativePath))
+        {
+            return true;
+        }
+        if (!normalizedRelativePath.StartsWith("config/", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        // MCBrowser persists per-user browser state here. It must never be
+        // copied into another player's instance, even as a create-only file.
+        return !string.Equals(
+            normalizedRelativePath,
+            "config/MCBrowser/tabs.json",
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    public static bool IsOptionalPlayerMod(string normalizedRelativePath)
+    {
+        if (normalizedRelativePath.StartsWith("mods/", StringComparison.OrdinalIgnoreCase))
+        {
+            string fileName = normalizedRelativePath["mods/".Length..];
+            return !fileName.Contains('/')
+                && fileName.StartsWith("axiom", StringComparison.OrdinalIgnoreCase)
+                && (fileName.EndsWith(".jar", StringComparison.OrdinalIgnoreCase)
+                    || fileName.EndsWith(".jar.disabled", StringComparison.OrdinalIgnoreCase));
+        }
+        return false;
+    }
+
     public static string CombineUnder(string root, string normalizedRelativePath)
     {
         string rootFullPath = Path.GetFullPath(root);

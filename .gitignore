@@ -21,9 +21,6 @@ publish-staging/
 updater/packages/
 __pycache__/
 
-# Local-only music/pack workflow helpers are not updater release inputs.
-tests/test_normalize_loudness.py
-
 # Never commit private keys, Claude exports, hosting credentials, or local data.
 .secrets/
 *.key

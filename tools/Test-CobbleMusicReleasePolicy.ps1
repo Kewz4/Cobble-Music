@@ -40,6 +40,10 @@ try {
     Write-DummyFile (Join-Path $testRoot 'resourcepacks\.index\generated.json')
     Write-DummyFile (Join-Path $testRoot 'config\ReactiveMusic.json5')
     Write-DummyFile (Join-Path $testRoot 'config\MCBrowser\tabs.json')
+    Write-DummyFile (Join-Path $testRoot 'options.txt')
+    Write-DummyFile (Join-Path $testRoot 'mods\Axiom-5.4.2-for-MC1.21.1.jar')
+    $templateRoot = Join-Path $testRoot 'reviewed-templates'
+    Write-DummyFile (Join-Path $templateRoot 'config\ReactiveMusic.json5') ([byte[]](9, 8, 7))
 
     $files = @(Get-CobbleManagedSourceFiles -SourceMinecraftDir $testRoot `
         -IncludeRoots @('mods', 'resourcepacks') `
@@ -50,6 +54,7 @@ try {
         'config/ReactiveMusic.json5',
         'mods/approved.jar',
         'mods/approved.jar.disabled',
+        'mods/Axiom-5.4.2-for-MC1.21.1.jar',
         'resourcepacks/approved.zip',
         'resourcepacks/reviewed.zip.rpo'
     )
@@ -72,6 +77,19 @@ try {
         Assert-Rejected { Assert-CobbleSourcePathPolicy -Path $unsafe | Out-Null } $unsafe
     }
     Assert-CobbleSourcePathPolicy -Path 'resourcepacks/reviewed.zip.rpo' -ExplicitSourceFile | Out-Null
+
+    $seedSources = @(Get-CobbleSeedSourceFiles -SourceMinecraftDir $testRoot `
+        -SeedFiles @('options.txt', 'config/ReactiveMusic.json5', 'mods/Axiom-5.4.2-for-MC1.21.1.jar') `
+        -SeedTemplateDir $templateRoot)
+    if (($seedSources.path -join "`n") -cne (@('config/ReactiveMusic.json5', 'mods/Axiom-5.4.2-for-MC1.21.1.jar', 'options.txt') -join "`n")) {
+        throw 'Create-only source inventory was incomplete or unstable.'
+    }
+    $reactiveSeed = @($seedSources | Where-Object path -ceq 'config/ReactiveMusic.json5')
+    if ($reactiveSeed.Count -ne 1 -or [IO.Path]::GetFullPath($reactiveSeed[0].full) -cne [IO.Path]::GetFullPath((Join-Path $templateRoot 'config\ReactiveMusic.json5'))) {
+        throw 'Reviewed create-only template did not override the live mutable config.'
+    }
+    Assert-Rejected { Assert-CobbleSeedPathPolicy -Path 'mods/required.jar' | Out-Null } 'a non-Axiom optional mod'
+    Assert-Rejected { Assert-CobbleSeedPathPolicy -Path 'servers.dat' | Out-Null } 'private server state as a default'
 
     Assert-Rejected {
         Get-CobbleManagedSourceFiles -SourceMinecraftDir $testRoot `

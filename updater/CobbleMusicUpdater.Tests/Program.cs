@@ -22,6 +22,7 @@ internal static class Program
             TestUpdaterWindowLayout();
             TestAggregateDownloadProgressAndTransferMetrics();
             TestManifestSchemaTwoValidation();
+            TestCreateOnlyDefaultManifestValidation();
             TestSequentialReleaseChain();
             TestInstanceIdentityNormalization(Path.Combine(tempRoot, "identity"));
             TestOfflineLaunchPolicy();
@@ -34,6 +35,7 @@ internal static class Program
             await TestExactDeltaBaseValidationAsync(Path.Combine(tempRoot, "delta"));
             await TestDeltaApplyTimeValidationAsync(Path.Combine(tempRoot, "delta-toctou"));
             await TestSchemaOneSanitizedRecoveryAsync(Path.Combine(tempRoot, "sanitized-baseline"));
+            await TestCreateOnlyDefaultsAsync(Path.Combine(tempRoot, "create-only-defaults"));
             await TestJournalCommitBoundaryAsync(Path.Combine(tempRoot, "journal"));
             await TestCrossVolumeTransactionRecoveryAsync(Path.Combine(tempRoot, "cross-volume"));
             Console.WriteLine("Schema-v2 delta, release-chain, exact-baseline adoption, base-integrity, and journal commit-boundary checks passed.");
@@ -349,6 +351,42 @@ internal static class Program
         Equal(false, VersionPolicy.TryParseCanonical("1.2", out _), "two-component version rejected");
         Equal(false, VersionPolicy.TryParseCanonical("1.2.3.4", out _), "four-component version rejected");
         Equal(false, VersionPolicy.TryParseCanonical("1.02.3", out _), "leading zero version rejected");
+    }
+
+    private static void TestCreateOnlyDefaultManifestValidation()
+    {
+        UpdaterConfiguration configuration = Configuration();
+        UpdateManifest valid = DeltaManifest();
+        valid.MinimumUpdaterVersion = BuildInfo.Version;
+        valid.SeedFiles =
+        [
+            FileEntry("options.txt", "video-and-keybind-defaults"),
+            FileEntry("config/musicnotification.json", "notification-defaults"),
+            FileEntry("mods/Axiom-5.4.2-for-MC1.21.1.jar", "optional-builder-mod")
+        ];
+        ManifestParser.Validate(valid, configuration, AssetUrls());
+        Equal(5, ManifestParser.PayloadContents(valid).Count, "managed payload plus create-only defaults");
+        Equal(2, ManifestParser.ManagedPayloadContents(valid).Count, "managed payload excludes defaults");
+
+        UpdateManifest nonOptionalMod = DeltaManifest();
+        nonOptionalMod.SeedFiles = [FileEntry("mods/required-mod.jar", "not-optional")];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(nonOptionalMod, configuration, AssetUrls()));
+
+        UpdateManifest unsafeRoot = DeltaManifest();
+        unsafeRoot.SeedFiles = [FileEntry("servers.dat", "private-server-list")];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(unsafeRoot, configuration, AssetUrls()));
+
+        UpdateManifest browserState = DeltaManifest();
+        browserState.SeedFiles = [FileEntry("config/MCBrowser/tabs.json", "private-browser-state")];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(browserState, configuration, AssetUrls()));
+
+        UpdateManifest overlap = DeltaManifest();
+        overlap.SeedFiles = [Copy(overlap.Files[0])];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(overlap, configuration, AssetUrls()));
+
+        UpdateManifest deletedOverlap = DeltaManifest();
+        deletedOverlap.SeedFiles = [Copy(deletedOverlap.DeletedFiles[0])];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(deletedOverlap, configuration, AssetUrls()));
     }
 
     private static void TestSequentialReleaseChain()
@@ -1030,6 +1068,198 @@ internal static class Program
         Equal(true, logs.Any(line => line.Contains("Keeping changed legacy file", StringComparison.Ordinal)), "changed legacy preservation logged");
         Equal("1.0.5", LocalStateStore.LoadState(paths).Version, "sanitized baseline state committed");
         Equal(false, File.Exists(TransactionStore.JournalPath(paths)), "sanitized baseline left no transaction journal");
+    }
+
+    private static async Task TestCreateOnlyDefaultsAsync(string root)
+    {
+        UpdaterPaths paths = Paths(Path.Combine(root, "apply"));
+        Directory.CreateDirectory(paths.MinecraftDirectory);
+        const string mutableConfigPath = "config/musicnotification.json";
+        const string optionsPath = "options.txt";
+        const string axiomPath = "mods/Axiom-5.4.2-for-MC1.21.1.jar";
+        const string oldAxiomPath = "mods/Axiom-5.3.0-for-MC1.21.1.jar";
+        const string managedPath = "mods/current.jar";
+        const string playerConfig = "player-custom-notification-settings";
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, mutableConfigPath, playerConfig);
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, oldAxiomPath, "player-kept-or-replaced-axiom");
+
+        var previousState = new InstalledState
+        {
+            Version = "1.0.5",
+            ManifestSha256 = HashText("old-baseline"),
+            ManagedFiles =
+            [
+                new ManagedFileState
+                {
+                    Path = mutableConfigPath,
+                    Size = "old-managed-default".Length,
+                    Sha256 = HashText("old-managed-default")
+                },
+                new ManagedFileState
+                {
+                    Path = oldAxiomPath,
+                    Size = "old-managed-axiom".Length,
+                    Sha256 = HashText("old-managed-axiom")
+                }
+            ]
+        };
+        await LocalStateStore.SaveStateAsync(paths, previousState, NoCancellation);
+
+        ManifestFile managed = FileEntry(managedPath, "managed-content");
+        ManifestFile configSeed = FileEntry(mutableConfigPath, "new-friend-default");
+        ManifestFile optionsSeed = FileEntry(optionsPath, "keybind-and-video-defaults");
+        ManifestFile axiomSeed = FileEntry(axiomPath, "optional-builder-mod");
+        var baseline = new UpdateManifest
+        {
+            SchemaVersion = 1,
+            Version = "1.0.6",
+            Files = [managed],
+            SeedFiles = [configSeed, optionsSeed, axiomSeed]
+        };
+        string extract = Path.Combine(root, "extract");
+        await WriteRelativeTextAsync(extract, managedPath, "managed-content");
+        await WriteRelativeTextAsync(extract, mutableConfigPath, "new-friend-default");
+        await WriteRelativeTextAsync(extract, optionsPath, "keybind-and-video-defaults");
+        await WriteRelativeTextAsync(extract, axiomPath, "optional-builder-mod");
+
+        var logs = new List<string>();
+        var engine = new UpdateEngine(paths, Configuration(), logs.Add);
+        await engine.ApplyTransactionAsync(
+            baseline,
+            HashText("new-baseline"),
+            extract,
+            previousState,
+            signedBase: null,
+            NoCancellation);
+
+        Equal(playerConfig, await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, mutableConfigPath)), "existing player config preserved during ownership transfer");
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, optionsPath)), "an existing install's missing options remain player-owned absence");
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, axiomPath)), "an existing install's removed optional Axiom remains absent");
+        Equal("player-kept-or-replaced-axiom", await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, oldAxiomPath)), "an older or locally replaced Axiom is preserved while leaving updater ownership");
+        InstalledState installed = LocalStateStore.LoadState(paths);
+        Equal(1, installed.ManagedFiles.Count, "create-only defaults absent from managed state");
+        Equal(managedPath, installed.ManagedFiles.Single().Path, "only immutable file remains managed");
+        Equal(true, logs.Any(line => line.Contains("Keeping player-owned setting", StringComparison.Ordinal)), "player-owned preservation logged");
+        Equal(true, logs.Any(line => line.Contains("Keeping player-owned absence", StringComparison.Ordinal)), "player-owned absence logged");
+
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, optionsPath, "player-changed-keybinds-and-video");
+        await File.WriteAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, mutableConfigPath), "player-moved-toast");
+        await WriteRelativeTextAsync(extract, managedPath, "managed-content");
+        await WriteRelativeTextAsync(extract, mutableConfigPath, "new-friend-default");
+        await WriteRelativeTextAsync(extract, optionsPath, "keybind-and-video-defaults");
+        await WriteRelativeTextAsync(extract, axiomPath, "optional-builder-mod");
+        await engine.ApplyTransactionAsync(
+            baseline,
+            HashText("same-defaults-reapplied-for-test"),
+            extract,
+            installed,
+            signedBase: null,
+            NoCancellation);
+        Equal("player-changed-keybinds-and-video", await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, optionsPath)), "later options edits survive another release application");
+        Equal("player-moved-toast", await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, mutableConfigPath)), "later mod config edits survive another release application");
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, axiomPath)), "removed optional Axiom stays absent on another release application");
+
+        UpdaterPaths freshPaths = Paths(Path.Combine(root, "fresh"));
+        Directory.CreateDirectory(freshPaths.MinecraftDirectory);
+        string freshExtract = Path.Combine(root, "fresh-extract");
+        await WriteRelativeTextAsync(freshExtract, managedPath, "managed-content");
+        await WriteRelativeTextAsync(freshExtract, mutableConfigPath, "new-friend-default");
+        await WriteRelativeTextAsync(freshExtract, optionsPath, "keybind-and-video-defaults");
+        await WriteRelativeTextAsync(freshExtract, axiomPath, "optional-builder-mod");
+        var freshEngine = new UpdateEngine(freshPaths, Configuration(), _ => { });
+        await freshEngine.ApplyTransactionAsync(
+            baseline,
+            HashText("fresh-baseline"),
+            freshExtract,
+            new InstalledState(),
+            signedBase: null,
+            NoCancellation);
+        Equal("keybind-and-video-defaults", await File.ReadAllTextAsync(PathSafety.CombineUnder(freshPaths.MinecraftDirectory, optionsPath)), "fresh install receives keybind and video defaults");
+        Equal("new-friend-default", await File.ReadAllTextAsync(PathSafety.CombineUnder(freshPaths.MinecraftDirectory, mutableConfigPath)), "fresh install receives mutable config defaults");
+        Equal("optional-builder-mod", await File.ReadAllTextAsync(PathSafety.CombineUnder(freshPaths.MinecraftDirectory, axiomPath)), "fresh install receives optional Axiom when supplied");
+        InstalledState freshState = LocalStateStore.LoadState(freshPaths);
+        Equal(1, freshState.ManagedFiles.Count, "fresh create-only defaults are not recorded as managed");
+
+        File.Delete(PathSafety.CombineUnder(freshPaths.MinecraftDirectory, axiomPath));
+        await WriteRelativeTextAsync(freshExtract, managedPath, "managed-content");
+        await WriteRelativeTextAsync(freshExtract, mutableConfigPath, "new-friend-default");
+        await WriteRelativeTextAsync(freshExtract, optionsPath, "keybind-and-video-defaults");
+        await WriteRelativeTextAsync(freshExtract, axiomPath, "optional-builder-mod");
+        await freshEngine.ApplyTransactionAsync(
+            baseline,
+            HashText("fresh-baseline-reapplied"),
+            freshExtract,
+            freshState,
+            signedBase: null,
+            NoCancellation);
+        Equal(false, File.Exists(PathSafety.CombineUnder(freshPaths.MinecraftDirectory, axiomPath)), "optional Axiom is never re-seeded after removal");
+
+        UpdaterPaths integrityPaths = Paths(Path.Combine(root, "optional-integrity"));
+        await WriteRelativeTextAsync(integrityPaths.MinecraftDirectory, managedPath, "managed-content");
+        var oldBaseline = new UpdateManifest
+        {
+            SchemaVersion = 1,
+            Version = "1.0.5",
+            Files = [managed, FileEntry(oldAxiomPath, "old-managed-axiom")]
+        };
+        InstalledState oldState = StateFrom(oldBaseline, HashText("old-axiom-baseline"));
+        var integrityEngine = new UpdateEngine(integrityPaths, Configuration(), _ => { });
+        Equal(true, integrityEngine.StateMatchesManifestAndSizes(oldState, oldBaseline), "missing formerly managed Axiom does not trigger baseline repair");
+        await WriteRelativeTextAsync(integrityPaths.MinecraftDirectory, oldAxiomPath, "a-different-local-axiom-build");
+        Equal(true, integrityEngine.StateMatchesManifestAndSizes(oldState, oldBaseline), "replaced formerly managed Axiom does not trigger baseline repair");
+        await File.WriteAllTextAsync(PathSafety.CombineUnder(integrityPaths.MinecraftDirectory, managedPath), "changed-required-content");
+        Equal(false, integrityEngine.StateMatchesManifestAndSizes(oldState, oldBaseline), "a changed required mod still triggers baseline repair");
+
+        UpdaterPaths adoptionPaths = Paths(Path.Combine(root, "adoption"));
+        await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, managedPath, "managed-content");
+        var adoptionEngine = new UpdateEngine(adoptionPaths, Configuration(), _ => { });
+        Equal(true, await adoptionEngine.TryAdoptExistingBaselineAsync(
+            baseline, HashText("adoption"), new InstalledState(), NoCancellation), "baseline adoption ignores missing player-owned defaults and optional mods");
+        adoptionPaths = Paths(Path.Combine(root, "adoption-with-defaults"));
+        await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, managedPath, "managed-content");
+        adoptionEngine = new UpdateEngine(adoptionPaths, Configuration(), _ => { });
+        await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, optionsPath, "custom-existing-options");
+        await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, mutableConfigPath, "custom-existing-config");
+        Equal(true, await adoptionEngine.TryAdoptExistingBaselineAsync(
+            baseline, HashText("adoption"), new InstalledState(), NoCancellation), "baseline adoption accepts existing player-owned defaults without comparing content");
+        Equal(1, LocalStateStore.LoadState(adoptionPaths).ManagedFiles.Count, "adoption excludes create-only defaults from state");
+
+        UpdaterPaths rollbackPaths = Paths(Path.Combine(root, "rollback"));
+        Directory.CreateDirectory(rollbackPaths.MinecraftDirectory);
+        string rollbackTarget = PathSafety.CombineUnder(rollbackPaths.MinecraftDirectory, optionsPath);
+        await File.WriteAllTextAsync(rollbackTarget, "keybind-and-video-defaults");
+        var rollbackPrevious = new InstalledState();
+        var rollbackNext = new InstalledState
+        {
+            Version = "1.0.6",
+            ManifestSha256 = HashText("rollback-next")
+        };
+        await LocalStateStore.SaveStateAsync(rollbackPaths, rollbackPrevious, NoCancellation);
+        await TransactionStore.SaveAsync(rollbackPaths, new TransactionJournal
+        {
+            PreviousState = rollbackPrevious,
+            NextState = rollbackNext,
+            SeedFiles =
+            [
+                new ManagedFileState
+                {
+                    Path = optionsPath,
+                    Size = "keybind-and-video-defaults".Length,
+                    Sha256 = HashText("keybind-and-video-defaults")
+                }
+            ],
+            Operations =
+            [
+                new TransactionOperation
+                {
+                    Kind = "create",
+                    TargetPath = rollbackTarget,
+                    TargetTemporaryPath = TransactionStore.CreateSiblingTemporaryPath(rollbackTarget)
+                }
+            ]
+        }, NoCancellation);
+        await TransactionStore.RecoverIfNeededAsync(rollbackPaths, BuildInfo.SupportedRoots, _ => { });
+        Equal(false, File.Exists(rollbackTarget), "interrupted first-run default creation rolls back safely");
     }
 
     private static async Task WriteRelativeTextAsync(string root, string relativePath, string content)

@@ -74,7 +74,7 @@ Assert-True (Assert-CobbleDeltaManifest -Manifest $manifest -BaseManifest $baseM
 $rawDeltaMissingDeletePaths = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 Assert-True ($null -eq $rawDeltaMissingDeletePaths.PSObject.Properties['deletePaths']) 'Raw delta fixture unexpectedly contains deletePaths.'
 Assert-True (Assert-CobbleDeltaManifest -Manifest $rawDeltaMissingDeletePaths -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash) 'Missing v2 deletePaths did not preserve the runtime initialized empty list.'
-foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'deletePaths', 'legacyCleanup')) {
+foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'seedFiles', 'deletePaths', 'legacyCleanup')) {
     $deltaExplicitNull = $manifest.PSObject.Copy()
     if ($null -eq $deltaExplicitNull.PSObject.Properties[$nullCollection]) {
         $deltaExplicitNull | Add-Member -NotePropertyName $nullCollection -NotePropertyValue $null
@@ -112,7 +112,7 @@ $legacyExplicitNullBase = $baselineManifest.PSObject.Copy()
 $legacyExplicitNullBase | Add-Member -NotePropertyName base -NotePropertyValue $null
 $legacyExplicitNullBase = ($legacyExplicitNullBase | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 Assert-True (Assert-CobbleV1Manifest -Manifest $legacyExplicitNullBase) 'Explicit null v1 base did not match the runtime nullable base model.'
-foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'deletePaths', 'legacyCleanup')) {
+foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'seedFiles', 'deletePaths', 'legacyCleanup')) {
     $legacyExplicitNull = $baselineManifest.PSObject.Copy()
     if ($null -eq $legacyExplicitNull.PSObject.Properties[$nullCollection]) {
         $legacyExplicitNull | Add-Member -NotePropertyName $nullCollection -NotePropertyValue $null
@@ -129,8 +129,27 @@ $badMinimumBaseline = $baselineManifest.PSObject.Copy()
 $badMinimumBaseline.minimumUpdaterVersion = '1.02.0'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $badMinimumBaseline } 'Non-canonical v1 minimumUpdaterVersion was accepted for staged resume.'
 $futureMinimumBaseline = $baselineManifest.PSObject.Copy()
-$futureMinimumBaseline.minimumUpdaterVersion = '1.2.6'
+$futureMinimumBaseline.minimumUpdaterVersion = '1.2.7'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $futureMinimumBaseline } 'V1 requiring a newer-than-pinned updater was accepted for staged resume.'
+
+$seed = New-Record 'config/ReactiveMusic.json5' 42 '9'
+$seedBaseline = $baselineManifest.PSObject.Copy()
+$seedBaseline.minimumUpdaterVersion = '1.2.6'
+$seedBaseline | Add-Member -NotePropertyName seedFiles -NotePropertyValue @($seed)
+Assert-True (Assert-CobbleV1Manifest -Manifest $seedBaseline) 'Valid create-only defaults in a schema-v1 baseline were rejected.'
+$oldUpdaterSeedBaseline = $seedBaseline.PSObject.Copy()
+$oldUpdaterSeedBaseline.minimumUpdaterVersion = '1.2.5'
+Assert-Throws { Assert-CobbleV1Manifest -Manifest $oldUpdaterSeedBaseline } 'Create-only defaults accepted an updater older than 1.2.6.'
+$overlappingSeedBaseline = $seedBaseline.PSObject.Copy()
+$overlappingSeedBaseline.seedFiles = @($base[0])
+Assert-Throws { Assert-CobbleV1Manifest -Manifest $overlappingSeedBaseline } 'Create-only defaults overlapped managed files.'
+
+Assert-True (Assert-CobbleSeedPathPolicy -Path 'options.txt') 'options.txt was not accepted as a player-owned default.'
+Assert-True (Assert-CobbleSeedPathPolicy -Path 'config/asyncparticles/asyncparticles.json') 'A reviewed config path was not accepted as a player-owned default.'
+Assert-True (Assert-CobbleSeedPathPolicy -Path 'mods/Axiom-5.4.2-for-MC1.21.1.jar') 'Axiom was not accepted as an optional player-owned mod.'
+Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'mods/required-mod.jar' } 'A non-Axiom mod was accepted as optional.'
+Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'servers.dat' } 'servers.dat was accepted as a create-only default.'
+Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'config/MCBrowser/tabs.json' } 'Browser state was accepted as a create-only default.'
 $deltaBaseInV1 = $baselineManifest.PSObject.Copy()
 $deltaBaseInV1 | Add-Member -NotePropertyName base -NotePropertyValue ([pscustomobject]@{ version = '1.0.3'; manifestSha256 = (New-Hash 'a') })
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $deltaBaseInV1 } 'V1 staged resume accepted a delta-only base.'

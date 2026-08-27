@@ -94,6 +94,9 @@ internal sealed class UpdateManifest
     public List<ManifestFile> PayloadFiles { get; set; } = [];
     // Schema 2 removals carry the exact metadata from the signed base state.
     public List<ManifestFile> DeletedFiles { get; set; } = [];
+    // Signed create-only defaults are carried in the payload but are never
+    // recorded as managed state. Existing player files always win.
+    public List<ManifestFile> SeedFiles { get; set; } = [];
     public List<ManifestFile> Files { get; set; } = [];
     public List<string> DeletePaths { get; set; } = [];
     public List<LegacyCleanupFile> LegacyCleanup { get; set; } = [];

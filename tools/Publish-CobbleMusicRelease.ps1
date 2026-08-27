@@ -17,12 +17,7 @@ param(
     [string]$PrivateKeyPath = (Join-Path $env:USERPROFILE '.cobble-music\keys\cobble-music-release-private.key'),
     [string[]]$IncludeRoots = @('mods', 'resourcepacks', 'defaultconfigs', 'kubejs', 'scripts'),
     [string[]]$IncludeFiles = @(
-        'config/cobble-music-bridge.json',
         'config/cobble-music-pack-version.json',
-        'config/logbegone.json',
-        'config/ReactiveMusic.json5',
-        'config/musicnotification.json',
-        'config/resourcepackoverrides.json',
         'resourcepacks/[Chilli´s] punchy! cobblemon (2).zip.rpo',
         'resourcepacks/Cobblemon Interface Modded.zip.rpo',
         'resourcepacks/Cobblemon Interface.zip.rpo',
@@ -31,6 +26,30 @@ param(
         'resourcepacks/Punchy refined.zip.rpo',
         'resourcepacks/refined torches 2.1.zip.rpo'
     ),
+    [string[]]$SeedFiles = @(
+        'options.txt',
+        'config/cobble-music-bridge.json',
+        'config/logbegone.json',
+        'config/ReactiveMusic.json5',
+        'config/musicnotification.json',
+        'config/resourcepackoverrides.json',
+        'config/asyncparticles/asyncparticles-mixin.properties',
+        'config/asyncparticles/asyncparticles.json',
+        'config/particle_core_config.toml',
+        'config/particle_core_disabled_optimizations_v2.json',
+        'config/particlerain/config.json',
+        'config/particlerain/particles.json',
+        'config/particletweaks/config.json',
+        'config/ambientfog/biome_fog.json',
+        'config/sodium-options.json',
+        'config/sodium-extra-options.json',
+        'config/iris.properties',
+        'config/voxy-config.json',
+        'config/cameraoverhaul.toml',
+        'config/ok_zoomer/config.json5',
+        'config/shouldersurfing-client.toml'
+    ),
+    [string]$SeedTemplateDir,
     [string]$LegacyCleanupManifest,
 
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
@@ -50,12 +69,13 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $Root = Split-Path -Parent $PSScriptRoot
+$SeedTemplateDir = if ([string]::IsNullOrWhiteSpace($SeedTemplateDir)) { Join-Path $Root 'release-defaults' } else { $SeedTemplateDir }
 $OutputRoot = Join-Path $Root "release-output\$Version"
 $ReleaseOutputRoot = Join-Path $Root 'release-output'
 $CoreModule = Join-Path $PSScriptRoot 'CobbleMusicRelease.Core.psm1'
 $UpdaterBootstrap = Join-Path $Root 'bootstrap\Bootstrap-CobbleMusicUpdater.ps1'
 $PinnedUpdaterExe = Join-Path $Root 'updater\dist\win-x64\CobbleMusicUpdater.exe'
-$RequiredPinnedUpdaterVersion = '1.2.5'
+$RequiredPinnedUpdaterVersion = '1.2.6'
 $AllowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $MaximumManifestSnapshotBytes = 8MB
 $MaximumSignatureSnapshotBytes = 64KB
@@ -310,25 +330,51 @@ function New-PayloadParts([object[]]$PayloadFiles) {
         return [pscustomobject]@{ Payload = $null; Parts = @(); Size = 0 }
     }
 
-    $fileList = Join-Path $OutputRoot 'payload-files.txt'
-    Write-Utf8 $fileList (($PayloadFiles.path | ForEach-Object { $_.Replace('/', '\') }) -join [Environment]::NewLine)
+    $payloadSourceRoot = Join-Path $OutputRoot 'payload-source'
     $payloadPath = Join-Path $OutputRoot 'cobble-music-payload.zip'
+    Assert-Under $payloadSourceRoot $OutputRoot
     Assert-Under $payloadPath $OutputRoot
-    $sevenZip = (Get-Command 7z -ErrorAction Stop).Source
-    Push-Location $SourceMinecraftDir
+    if (Test-Path -LiteralPath $payloadSourceRoot) { throw "Payload staging root already exists: $payloadSourceRoot" }
     try {
-        & $sevenZip a -tzip $payloadPath "@$fileList" '-mx=0' | Out-Host
-        if ($LASTEXITCODE -ne 0) { throw "7-Zip failed with exit code $LASTEXITCODE" }
-    }
-    finally { Pop-Location }
+        New-Item -ItemType Directory -Path $payloadSourceRoot | Out-Null
+        foreach ($payloadFile in $PayloadFiles) {
+            if ($null -eq $payloadFile.PSObject.Properties['full']) {
+                throw "Payload entry is not bound to a canonical source file: $($payloadFile.path)"
+            }
+            $source = [IO.Path]::GetFullPath([string]$payloadFile.full)
+            if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+                throw "Payload source disappeared before archiving: $($payloadFile.path)"
+            }
+            $target = Join-Path $payloadSourceRoot ([string]$payloadFile.path).Replace('/', [IO.Path]::DirectorySeparatorChar)
+            Assert-Under $target $payloadSourceRoot
+            New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
+            try { New-Item -ItemType HardLink -Path $target -Target $source -ErrorAction Stop | Out-Null }
+            catch { Copy-Item -LiteralPath $source -Destination $target }
+        }
 
-    try { Assert-CobblePayloadZipInventory -ZipPath $payloadPath -ExpectedFiles $PayloadFiles | Out-Null }
+        $fileList = Join-Path $OutputRoot 'payload-files.txt'
+        Write-Utf8 $fileList (($PayloadFiles.path | ForEach-Object { $_.Replace('/', '\') }) -join [Environment]::NewLine)
+        $sevenZip = (Get-Command 7z -ErrorAction Stop).Source
+        Push-Location $payloadSourceRoot
+        try {
+            & $sevenZip a -tzip $payloadPath "@$fileList" '-mx=0' | Out-Host
+            if ($LASTEXITCODE -ne 0) { throw "7-Zip failed with exit code $LASTEXITCODE" }
+        }
+        finally { Pop-Location }
+        Assert-CobblePayloadZipInventory -ZipPath $payloadPath -ExpectedFiles $PayloadFiles | Out-Null
+    }
     catch {
         if (Test-Path -LiteralPath $payloadPath -PathType Leaf) {
             Assert-Under $payloadPath $OutputRoot
             Remove-Item -LiteralPath $payloadPath -Force
         }
         throw
+    }
+    finally {
+        if (Test-Path -LiteralPath $payloadSourceRoot -PathType Container) {
+            Assert-Under $payloadSourceRoot $OutputRoot
+            Remove-Item -LiteralPath $payloadSourceRoot -Recurse -Force
+        }
     }
 
     $payloadSize = (Get-Item -LiteralPath $payloadPath).Length
@@ -743,7 +789,7 @@ try {
     }
 
     Write-Host "Building authoritative file manifest from $SourceMinecraftDir"
-    $sourceFiles = @(
+    $allManagedSourceFiles = @(
         Get-CobbleManagedSourceFiles -SourceMinecraftDir $SourceMinecraftDir -IncludeRoots $IncludeRoots `
             -IncludeFiles $IncludeFiles -AllowedRoots $AllowedRoots |
             ForEach-Object {
@@ -751,10 +797,38 @@ try {
                 [pscustomobject]@{ full = $_.full; path = $_.path; size = $item.Length; sha256 = (Get-Sha256 $_.full) }
             }
     )
+    $optionalAxiomSources = @($allManagedSourceFiles | Where-Object {
+        $path = [string]$_.path
+        $path.StartsWith('mods/', [StringComparison]::OrdinalIgnoreCase) -and
+            $path.Substring('mods/'.Length).StartsWith('axiom', [StringComparison]::OrdinalIgnoreCase) -and
+            $path.Substring('mods/'.Length) -imatch '\.jar(?:\.disabled)?$'
+    })
+    $sourceFiles = @($allManagedSourceFiles | Where-Object {
+        $candidate = $_
+        -not ($optionalAxiomSources | Where-Object { $_.path -ieq $candidate.path })
+    })
+
+    $effectiveSeedPaths = @($SeedFiles) + @($optionalAxiomSources | ForEach-Object { $_.path })
+    $seedSourceFiles = @(
+        Get-CobbleSeedSourceFiles -SourceMinecraftDir $SourceMinecraftDir -SeedFiles $effectiveSeedPaths `
+            -SeedTemplateDir $SeedTemplateDir |
+            ForEach-Object {
+                $item = Get-Item -LiteralPath $_.full
+                [pscustomobject]@{ full = $_.full; path = $_.path; size = $item.Length; sha256 = (Get-Sha256 $_.full) }
+            }
+    )
 
     $currentSet = ConvertTo-CobbleFileRecordSet -Entries @($sourceFiles) -Context 'current authoritative files'
+    $seedSet = ConvertTo-CobbleSeedFileRecordSet -Entries @($seedSourceFiles) -Context 'current create-only defaults'
+    foreach ($seed in $seedSet.Entries) {
+        if ($currentSet.ByKey.ContainsKey($seed.path.Normalize([Text.NormalizationForm]::FormC).ToUpperInvariant())) {
+            throw "Create-only default overlaps an authoritative managed file: $($seed.path)"
+        }
+    }
     $sourcePathByKey = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($source in $sourceFiles) { $sourcePathByKey.Add($source.path.Normalize([Text.NormalizationForm]::FormC), $source.full) }
+    $seedSourcePathByKey = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($source in $seedSourceFiles) { $seedSourcePathByKey.Add($source.path.Normalize([Text.NormalizationForm]::FormC), $source.full) }
 
     if ($FullBaseline) {
         $authoritativeFiles = @($currentSet.Entries)
@@ -789,11 +863,34 @@ try {
         if (-not $sourcePathByKey.ContainsKey($key)) { throw "Payload file is not backed by a hashed canonical source: $($payloadFile.path)" }
     }
 
-    $forbiddenCleanupPaths = @($authoritativeFiles | ForEach-Object { $_.path }) + @($baseFiles | ForEach-Object { $_.path })
+    $archiveFiles = @(
+        foreach ($payloadFile in $payloadFiles) {
+            $key = $payloadFile.path.Normalize([Text.NormalizationForm]::FormC)
+            [pscustomobject]@{
+                full = $sourcePathByKey[$key]
+                path = $payloadFile.path
+                size = $payloadFile.size
+                sha256 = $payloadFile.sha256
+            }
+        }
+        foreach ($seedFile in $seedSet.Entries) {
+            $key = $seedFile.path.Normalize([Text.NormalizationForm]::FormC)
+            if (-not $seedSourcePathByKey.ContainsKey($key)) { throw "Create-only default is not backed by a hashed source: $($seedFile.path)" }
+            [pscustomobject]@{
+                full = $seedSourcePathByKey[$key]
+                path = $seedFile.path
+                size = $seedFile.size
+                sha256 = $seedFile.sha256
+            }
+        }
+    )
+
+    $forbiddenCleanupPaths = @($authoritativeFiles | ForEach-Object { $_.path }) +
+        @($baseFiles | ForEach-Object { $_.path }) + @($seedSet.Entries | ForEach-Object { $_.path })
     $legacyCleanup = Read-LegacyCleanupManifest $LegacyCleanupManifest $forbiddenCleanupPaths
     New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
     Assert-Under $OutputRoot $ReleaseOutputRoot
-    $payloadResult = New-PayloadParts $payloadFiles
+    $payloadResult = New-PayloadParts $archiveFiles
 
     $manifest = if ($FullBaseline) {
         [ordered]@{
@@ -802,10 +899,11 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.0.0'
+            minimumUpdaterVersion = '1.2.6'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             payload = $payloadResult.Payload
             files = @($authoritativeFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
+            seedFiles = @($seedSet.Entries | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
             deletePaths = @()
             legacyCleanup = @($legacyCleanup)
         }
@@ -817,12 +915,13 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.0'
+            minimumUpdaterVersion = '1.2.6'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             base = [ordered]@{ version = $BaseVersion; manifestSha256 = $baseHash }
             payload = $payloadResult.Payload
             files = @($authoritativeFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
             payloadFiles = @($payloadFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
+            seedFiles = @($seedSet.Entries | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
             deletedFiles = @($deletedFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
             legacyCleanup = @($legacyCleanup)
         }
@@ -860,6 +959,8 @@ This release is a signed update payload for the Kewz's Cobblemon Prism updater.
 - Mode: $modeDescription
 - Authoritative files after install: $($authoritativeFiles.Count)
 - Changed/new payload files: $($payloadFiles.Count)
+- First-install player-owned defaults: $($seedSet.Entries.Count)
+- Optional Axiom artifacts: $($optionalAxiomSources.Count)
 - Exact signed-base deletions: $($deletedFiles.Count)
 - Payload size: $($payloadResult.Size) bytes
 - Parts: $($payloadResult.Parts.Count), each at most $ChunkSizeMiB MiB
@@ -868,7 +969,7 @@ This release is a signed update payload for the Kewz's Cobblemon Prism updater.
 
     Get-ExpectedStagedAssets $signedManifest $stagedIdentity | Out-Null
     Write-Host "Staged signed release at $OutputRoot"
-    Write-Host "Authoritative files: $($authoritativeFiles.Count); payload files: $($payloadFiles.Count); chunks: $($payloadResult.Parts.Count)"
+    Write-Host "Authoritative files: $($authoritativeFiles.Count); managed payload files: $($payloadFiles.Count); player-owned defaults: $($seedSet.Entries.Count); chunks: $($payloadResult.Parts.Count)"
     if (-not $Publish) {
         Write-Host 'No GitHub mutation was made. Review the staged manifest, then rerun with -ResumePublish -ConfirmDistributionRights to upload this exact signed staging through a persistent draft.'
         exit 0

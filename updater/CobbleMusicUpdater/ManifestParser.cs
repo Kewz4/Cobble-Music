@@ -35,6 +35,7 @@ internal static class ManifestParser
             || manifest.Files is null
             || manifest.PayloadFiles is null
             || manifest.DeletedFiles is null
+            || manifest.SeedFiles is null
             || manifest.DeletePaths is null
             || manifest.LegacyCleanup is null
             || manifest.Files.Count == 0)
@@ -60,6 +61,11 @@ internal static class ManifestParser
         }
 
         Dictionary<string, ManifestFile> files = ValidateFileSet(manifest.Files, configuration, "managed file");
+        Dictionary<string, ManifestFile> seedFiles = ValidateSeedFileSet(manifest.SeedFiles);
+        if (seedFiles.Keys.Any(files.ContainsKey))
+        {
+            throw new InvalidDataException("Signed release manifest overlaps managed files and create-only defaults.");
+        }
 
         if (manifest.SchemaVersion == 1)
         {
@@ -68,16 +74,19 @@ internal static class ManifestParser
                 throw new InvalidDataException("Schema 1 release is missing its full payload.");
             }
             ValidatePayload(manifest.Payload, assetUrls);
-            ValidateSchemaOne(manifest, configuration, files);
+            ValidateSchemaOne(manifest, configuration, files, seedFiles);
         }
         else
         {
-            ValidateSchemaTwo(manifest, configuration, files, releaseVersion!, assetUrls);
+            ValidateSchemaTwo(manifest, configuration, files, seedFiles, releaseVersion!, assetUrls);
         }
     }
 
-    public static IReadOnlyCollection<ManifestFile> PayloadContents(UpdateManifest manifest) =>
+    public static IReadOnlyCollection<ManifestFile> ManagedPayloadContents(UpdateManifest manifest) =>
         manifest.SchemaVersion == 1 ? manifest.Files : manifest.PayloadFiles;
+
+    public static IReadOnlyCollection<ManifestFile> PayloadContents(UpdateManifest manifest) =>
+        ManagedPayloadContents(manifest).Concat(manifest.SeedFiles).ToArray();
 
     private static void ValidatePayload(UpdatePayload payload, IReadOnlyDictionary<string, Uri> assetUrls)
     {
@@ -150,10 +159,33 @@ internal static class ManifestParser
         return files;
     }
 
+    private static Dictionary<string, ManifestFile> ValidateSeedFileSet(
+        IEnumerable<ManifestFile> entries)
+    {
+        var files = new Dictionary<string, ManifestFile>(StringComparer.OrdinalIgnoreCase);
+        foreach (ManifestFile file in entries)
+        {
+            if (file is null)
+            {
+                throw new InvalidDataException("Release manifest contains an empty create-only default entry.");
+            }
+            file.Path = PathSafety.NormalizeRelativePath(file.Path);
+            if (!PathSafety.IsSeedAllowed(file.Path)
+                || file.Size < 0
+                || !files.TryAdd(file.Path, file))
+            {
+                throw new InvalidDataException($"Release manifest contains an unsafe or duplicate create-only default path: {file.Path}");
+            }
+            ValidateHash(file.Sha256, $"create-only default {file.Path}");
+        }
+        return files;
+    }
+
     private static void ValidateSchemaOne(
         UpdateManifest manifest,
         UpdaterConfiguration configuration,
-        IReadOnlyDictionary<string, ManifestFile> files)
+        IReadOnlyDictionary<string, ManifestFile> files,
+        IReadOnlyDictionary<string, ManifestFile> seedFiles)
     {
         if (manifest.Base is not null || manifest.PayloadFiles.Count != 0 || manifest.DeletedFiles.Count != 0)
         {
@@ -167,14 +199,15 @@ internal static class ManifestParser
             manifest.DeletePaths[index] = normalized;
             if (!PathSafety.IsAllowed(normalized, configuration.AllowedRoots)
                 || !seenDeletes.Add(normalized)
-                || files.ContainsKey(normalized))
+                || files.ContainsKey(normalized)
+                || seedFiles.ContainsKey(normalized))
             {
                 throw new InvalidDataException($"Release manifest contains an unsafe, duplicate, or overlapping deletion path: {normalized}");
             }
         }
 
         Dictionary<string, LegacyCleanupFile> legacy = ValidateLegacyCleanup(manifest.LegacyCleanup, configuration);
-        if (legacy.Keys.Any(files.ContainsKey))
+        if (legacy.Keys.Any(files.ContainsKey) || legacy.Keys.Any(seedFiles.ContainsKey))
         {
             throw new InvalidDataException("Release manifest contains a legacy cleanup path that overlaps a managed file.");
         }
@@ -184,6 +217,7 @@ internal static class ManifestParser
         UpdateManifest manifest,
         UpdaterConfiguration configuration,
         IReadOnlyDictionary<string, ManifestFile> files,
+        IReadOnlyDictionary<string, ManifestFile> seedFiles,
         Version releaseVersion,
         IReadOnlyDictionary<string, Uri> assetUrls)
     {
@@ -201,12 +235,13 @@ internal static class ManifestParser
 
         Dictionary<string, ManifestFile> payloadFiles = ValidateFileSet(manifest.PayloadFiles, configuration, "payload file");
         Dictionary<string, ManifestFile> deletedFiles = ValidateFileSet(manifest.DeletedFiles, configuration, "deleted file");
-        if (payloadFiles.Count == 0 && deletedFiles.Count == 0)
+        if (payloadFiles.Count == 0 && deletedFiles.Count == 0 && seedFiles.Count == 0)
         {
             throw new InvalidDataException("Schema 2 release contains no changes.");
         }
 
-        if (payloadFiles.Count == 0)
+        bool hasPayloadEntries = payloadFiles.Count != 0 || seedFiles.Count != 0;
+        if (!hasPayloadEntries)
         {
             if (manifest.Payload is not null)
             {
@@ -229,12 +264,16 @@ internal static class ManifestParser
                 throw new InvalidDataException($"Delta payload file does not exactly match the authoritative post-state: {path}");
             }
         }
-        if (deletedFiles.Keys.Any(files.ContainsKey))
+        if (deletedFiles.Keys.Any(files.ContainsKey)
+            || deletedFiles.Keys.Any(seedFiles.ContainsKey)
+            || payloadFiles.Keys.Any(seedFiles.ContainsKey))
         {
             throw new InvalidDataException("Delta deletedFiles overlap the authoritative post-state.");
         }
         Dictionary<string, LegacyCleanupFile> legacy = ValidateLegacyCleanup(manifest.LegacyCleanup, configuration);
-        if (legacy.Keys.Any(files.ContainsKey) || legacy.Keys.Any(deletedFiles.ContainsKey))
+        if (legacy.Keys.Any(files.ContainsKey)
+            || legacy.Keys.Any(seedFiles.ContainsKey)
+            || legacy.Keys.Any(deletedFiles.ContainsKey))
         {
             throw new InvalidDataException("Delta legacy cleanup overlaps its signed managed file sets.");
         }

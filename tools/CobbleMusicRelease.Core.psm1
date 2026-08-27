@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 $script:AllowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $script:Sha256Pattern = '^[0-9a-f]{64}$'
 $script:VersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-$script:PinnedUpdaterVersion = '1.2.5'
+$script:PinnedUpdaterVersion = '1.2.6'
 $script:MaximumReleaseAssetCount = 999
 $script:ReservedReleaseMetadataAssetCount = 2
 $script:MaximumPublicReleaseCount = 499
@@ -146,6 +146,31 @@ function Assert-CobbleSourcePathPolicy {
     return $true
 }
 
+function Assert-CobbleSeedPathPolicy {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$Context = 'create-only default'
+    )
+
+    $normalized = $Path.Replace('\', '/')
+    if ($normalized -ceq 'options.txt') { return $true }
+    if ($normalized.StartsWith('mods/', [StringComparison]::OrdinalIgnoreCase)) {
+        $underMods = $normalized.Substring('mods/'.Length)
+        if (-not $underMods.Contains('/') -and
+            $underMods.StartsWith('axiom', [StringComparison]::OrdinalIgnoreCase) -and
+            $underMods -imatch '\.jar(?:\.disabled)?$') {
+            Assert-CobbleSourcePathPolicy -Path $normalized -Context $Context -ExplicitSourceFile | Out-Null
+            return $true
+        }
+        throw "$Context is not an optional top-level Axiom artifact: $normalized"
+    }
+    if (-not $normalized.StartsWith('config/', [StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Context is outside the create-only allowlist: $normalized"
+    }
+    Assert-CobbleSourcePathPolicy -Path $normalized -Context $Context -ExplicitSourceFile | Out-Null
+    return $true
+}
+
 function Get-CobbleManagedSourceFiles {
     param(
         [Parameter(Mandatory)][string]$SourceMinecraftDir,
@@ -216,6 +241,43 @@ function Get-CobbleManagedSourceFiles {
         }
     }
 
+    return @($byPath.Values | Sort-Object path)
+}
+
+function Get-CobbleSeedSourceFiles {
+    param(
+        [Parameter(Mandatory)][string]$SourceMinecraftDir,
+        [Parameter(Mandatory)][string[]]$SeedFiles,
+        [AllowEmptyString()][string]$SeedTemplateDir = ''
+    )
+
+    $sourceRoot = [IO.Path]::GetFullPath($SourceMinecraftDir)
+    $templateRoot = if ([string]::IsNullOrWhiteSpace($SeedTemplateDir)) { $null } else { [IO.Path]::GetFullPath($SeedTemplateDir) }
+    $byPath = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($relativeInput in $SeedFiles | Sort-Object -Unique) {
+        $relative = $relativeInput.Replace('\', '/')
+        Assert-CobbleSeedPathPolicy -Path $relative | Out-Null
+
+        $full = $null
+        if ($null -ne $templateRoot) {
+            $template = Join-Path $templateRoot $relative.Replace('/', [IO.Path]::DirectorySeparatorChar)
+            if (Test-Path -LiteralPath $template -PathType Leaf) { $full = $template }
+        }
+        if ($null -eq $full) {
+            $full = Join-Path $sourceRoot $relative.Replace('/', [IO.Path]::DirectorySeparatorChar)
+        }
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+            throw "Required create-only default is missing from both the template and canonical instance: $relative"
+        }
+        $item = Get-Item -LiteralPath $full
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Create-only default may not be a reparse point: $($item.FullName)"
+        }
+        $key = $relative.Normalize([Text.NormalizationForm]::FormC)
+        if (-not $byPath.TryAdd($key, [pscustomobject]@{ full = $item.FullName; path = $relative })) {
+            throw "Create-only defaults contain a duplicate path: $relative"
+        }
+    }
     return @($byPath.Values | Sort-Object path)
 }
 
@@ -366,6 +428,45 @@ function ConvertTo-CobbleFileRecordSet {
         $result.Add($record)
     }
 
+    $ordered = @($result | Sort-Object -Property @{ Expression = { Get-CobblePathKey $_.path }; Ascending = $true })
+    return [pscustomobject]@{ Entries = $ordered; ByKey = $byKey }
+}
+
+function ConvertTo-CobbleSeedFileRecordSet {
+    param(
+        [AllowEmptyCollection()]
+        [Parameter(Mandatory)][object[]]$Entries,
+        [Parameter(Mandatory)][string]$Context
+    )
+
+    $byKey = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $result = [Collections.Generic.List[object]]::new()
+    foreach ($entry in $Entries) {
+        if ($null -eq $entry) { throw "$Context contains a null file entry." }
+        $path = [string]$entry.path
+        Assert-CobbleSeedPathPolicy -Path $path -Context $Context | Out-Null
+
+        [int64]$size = 0
+        if ($null -eq $entry.size -or -not [int64]::TryParse(
+            [Convert]::ToString($entry.size, [Globalization.CultureInfo]::InvariantCulture),
+            [Globalization.NumberStyles]::None,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$size) -or $size -lt 0) {
+            throw "$Context contains an invalid size for $path."
+        }
+        $sha256 = [string]$entry.sha256
+        if ($sha256 -cnotmatch $script:Sha256Pattern) {
+            throw "$Context contains a non-canonical SHA-256 for $path."
+        }
+
+        $key = Get-CobblePathKey $path
+        if ($byKey.ContainsKey($key)) {
+            throw "$Context contains a duplicate or Windows/Unicode-colliding path: $($byKey[$key].path) / $path"
+        }
+        $record = [pscustomobject]@{ path = $path; size = $size; sha256 = $sha256 }
+        $byKey.Add($key, $record)
+        $result.Add($record)
+    }
     $ordered = @($result | Sort-Object -Property @{ Expression = { Get-CobblePathKey $_.path }; Ascending = $true })
     return [pscustomobject]@{ Entries = $ordered; ByKey = $byKey }
 }
@@ -535,6 +636,7 @@ function Assert-CobbleV1Manifest {
     $payloadFiles = Get-CobbleRuntimeCollectionState $Manifest 'payloadFiles' 'Baseline payloadFiles'
     $deletedFiles = Get-CobbleRuntimeCollectionState $Manifest 'deletedFiles' 'Baseline deletedFiles'
     $filesState = Get-CobbleRuntimeCollectionState $Manifest 'files' 'Baseline files'
+    $seedFilesState = Get-CobbleRuntimeCollectionState $Manifest 'seedFiles' 'Baseline seedFiles'
     $deletePaths = Get-CobbleRuntimeCollectionState $Manifest 'deletePaths' 'Baseline deletePaths'
     $legacyCleanup = Get-CobbleRuntimeCollectionState $Manifest 'legacyCleanup' 'Baseline legacyCleanup'
     if ($null -ne $base -or $payloadFiles.Entries.Count -ne 0 -or $deletedFiles.Entries.Count -ne 0) {
@@ -542,6 +644,15 @@ function Assert-CobbleV1Manifest {
     }
 
     $files = ConvertTo-CobbleFileRecordSet -Entries @($filesState.Entries) -Context 'baseline authoritative files'
+    $seedFiles = ConvertTo-CobbleSeedFileRecordSet -Entries @($seedFilesState.Entries) -Context 'baseline create-only defaults'
+    foreach ($seed in $seedFiles.Entries) {
+        if ($files.ByKey.ContainsKey((Get-CobblePathKey $seed.path))) {
+            throw "Baseline create-only default overlaps a managed file: $($seed.path)"
+        }
+    }
+    if ($seedFiles.Entries.Count -gt 0 -and [string]$Manifest.minimumUpdaterVersion -cne '1.2.6') {
+        throw 'Baselines with create-only defaults must require updater 1.2.6.'
+    }
     $payload = Get-CobbleOptionalPropertyValue $Manifest 'payload'
     Assert-CobblePayloadMetadata $payload
 
@@ -550,11 +661,11 @@ function Assert-CobbleV1Manifest {
         $path = [string]$pathValue
         Assert-CobbleManagedPath -Path $path -Context 'baseline deletePaths' | Out-Null
         $key = Get-CobblePathKey $path
-        if (-not $deleteKeys.Add($key) -or $files.ByKey.ContainsKey($key)) {
-            throw "Baseline deletePaths is duplicate or overlaps files: $path"
+        if (-not $deleteKeys.Add($key) -or $files.ByKey.ContainsKey($key) -or $seedFiles.ByKey.ContainsKey($key)) {
+            throw "Baseline deletePaths is duplicate or overlaps files/defaults: $path"
         }
     }
-    Assert-CobbleLegacyCleanup -Entries @($legacyCleanup.Entries) -ForbiddenSets @($files) | Out-Null
+    Assert-CobbleLegacyCleanup -Entries @($legacyCleanup.Entries) -ForbiddenSets @($files, $seedFiles) | Out-Null
     return $true
 }
 
@@ -594,6 +705,13 @@ function Assert-CobbleBaseManifest {
 
     $files = @($Manifest.files)
     $fileSet = ConvertTo-CobbleFileRecordSet -Entries $files -Context 'signed base manifest files'
+    $seedFilesState = Get-CobbleRuntimeCollectionState $Manifest 'seedFiles' 'Signed base seedFiles'
+    $seedSet = ConvertTo-CobbleSeedFileRecordSet -Entries @($seedFilesState.Entries) -Context 'signed base create-only defaults'
+    foreach ($seed in $seedSet.Entries) {
+        if ($fileSet.ByKey.ContainsKey((Get-CobblePathKey $seed.path))) {
+            throw "Signed base overlaps managed files and create-only defaults: $($seed.path)"
+        }
+    }
     return $fileSet
 }
 
@@ -650,16 +768,19 @@ function Assert-CobbleDeltaManifest {
     if ([int]$Manifest.schemaVersion -ne 2 -or [string]$Manifest.modpackId -cne 'cobble-music' -or [string]$Manifest.channel -cne 'stable') {
         throw 'Delta manifest identity or schema is invalid.'
     }
-    if ([string]$Manifest.minimumUpdaterVersion -cne '1.2.0') {
-        throw 'Delta manifests must require updater 1.2.0.'
-    }
     $filesState = Get-CobbleRuntimeCollectionState $Manifest 'files' 'Delta files'
     $payloadFilesState = Get-CobbleRuntimeCollectionState $Manifest 'payloadFiles' 'Delta payloadFiles'
     $deletedFilesState = Get-CobbleRuntimeCollectionState $Manifest 'deletedFiles' 'Delta deletedFiles'
+    $seedFilesState = Get-CobbleRuntimeCollectionState $Manifest 'seedFiles' 'Delta seedFiles'
     $deletePaths = Get-CobbleRuntimeCollectionState $Manifest 'deletePaths' 'Delta deletePaths'
     $legacyCleanup = Get-CobbleRuntimeCollectionState $Manifest 'legacyCleanup' 'Delta legacyCleanup'
     if ($deletePaths.Entries.Count -ne 0) {
         throw 'Delta manifests must use exact deletedFiles entries instead of path-only deletePaths.'
+    }
+    $seedFiles = ConvertTo-CobbleSeedFileRecordSet -Entries @($seedFilesState.Entries) -Context 'delta create-only defaults'
+    $requiredUpdater = if ($seedFiles.Entries.Count -gt 0) { '1.2.6' } else { '1.2.0' }
+    if ([string]$Manifest.minimumUpdaterVersion -cne $requiredUpdater) {
+        throw "Delta manifest must require updater $requiredUpdater for its feature set."
     }
     if ($null -eq $Manifest.base -or [string]$Manifest.base.version -cne [string]$BaseManifest.version -or
         [string]$Manifest.base.manifestSha256 -cne $ExpectedBaseManifestSha256 -or
@@ -676,6 +797,15 @@ function Assert-CobbleDeltaManifest {
     $actualDeleted = ConvertTo-CobbleFileRecordSet -Entries @($deletedFilesState.Entries) -Context 'delta deletedFiles' -AllowEmpty
     $expectedPayload = ConvertTo-CobbleFileRecordSet -Entries @($expected.PayloadFiles) -Context 'expected delta payloadFiles' -AllowEmpty
     $expectedDeleted = ConvertTo-CobbleFileRecordSet -Entries @($expected.DeletedFiles) -Context 'expected delta deletedFiles' -AllowEmpty
+    $fullSet = ConvertTo-CobbleFileRecordSet -Entries @($filesState.Entries) -Context 'delta authoritative files'
+
+    foreach ($seed in $seedFiles.Entries) {
+        $key = Get-CobblePathKey $seed.path
+        if ($actualPayload.ByKey.ContainsKey($key) -or $actualDeleted.ByKey.ContainsKey($key) -or
+            $fullSet.ByKey.ContainsKey($key)) {
+            throw "Delta create-only default overlaps a managed, changed, or deleted file: $($seed.path)"
+        }
+    }
 
     foreach ($comparison in @(
         [pscustomobject]@{ Name = 'payloadFiles'; Actual = $actualPayload; Expected = $expectedPayload },
@@ -696,7 +826,7 @@ function Assert-CobbleDeltaManifest {
         }
     }
 
-    if ($actualPayload.Entries.Count -eq 0) {
+    if ($actualPayload.Entries.Count -eq 0 -and $seedFiles.Entries.Count -eq 0) {
         if ($null -ne (Get-CobbleOptionalPropertyValue $Manifest 'payload')) { throw 'A deletion-only delta must have a null payload.' }
         if ($actualDeleted.Entries.Count -eq 0) { throw 'A delta must change or delete at least one file.' }
     }
@@ -707,9 +837,8 @@ function Assert-CobbleDeltaManifest {
         Assert-CobblePayloadMetadata (Get-CobbleOptionalPropertyValue $Manifest 'payload')
     }
 
-    $fullSet = ConvertTo-CobbleFileRecordSet -Entries @($filesState.Entries) -Context 'delta authoritative files'
     $baseSet = ConvertTo-CobbleFileRecordSet -Entries @($BaseManifest.files) -Context 'delta signed-base files'
-    Assert-CobbleLegacyCleanup -Entries @($legacyCleanup.Entries) -ForbiddenSets @($fullSet, $baseSet) | Out-Null
+    Assert-CobbleLegacyCleanup -Entries @($legacyCleanup.Entries) -ForbiddenSets @($fullSet, $baseSet, $seedFiles) | Out-Null
 
     return $true
 }
@@ -990,12 +1119,15 @@ Export-ModuleMember -Function @(
     'Get-CobbleOptionalPropertyValue',
     'Assert-CobbleManagedPath',
     'Assert-CobbleSourcePathPolicy',
+    'Assert-CobbleSeedPathPolicy',
     'Get-CobbleManagedSourceFiles',
+    'Get-CobbleSeedSourceFiles',
     'Assert-CobblePrivateKeyIsolation',
     'Open-CobbleLockedFileSnapshot',
     'Assert-CobbleLockedFileSnapshot',
     'Close-CobbleLockedFileSnapshot',
     'ConvertTo-CobbleFileRecordSet',
+    'ConvertTo-CobbleSeedFileRecordSet',
     'Assert-CobbleSupportedMinimumUpdaterVersion',
     'Assert-CobbleVersionAdvance',
     'Assert-CobbleBaseManifest',
