@@ -1,9 +1,11 @@
 <#
-Installs the checksum-pinned Kewz's Cobblemon updater into one Prism instance.
-Manual setup rewrites the instance-specific command only while Prism is closed.
-PrismPreLaunch mode is used by the permanent one-command bootstrap hook: it
-never edits instance.cfg, reuses an exact installed updater, and runs the
-updater during the same launch.
+Installs and runs the Kewz's Cobblemon updater for one Prism instance.
+
+The friend-facing Prism command pins this bootstrap by SHA-256. This script in
+turn keeps one immutable, checksum-pinned verifier and uses it to authenticate
+the signed stable updater channel before replacing CobbleMusicUpdater.exe.
+Neither an untrusted branch pointer nor a GitHub release asset can authorize an
+executable by itself.
 #>
 [CmdletBinding()]
 param(
@@ -18,22 +20,26 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Repository = 'Kewz4/Cobble-Music'
-$UpdaterVersion = '1.2.6'
-# SHA-256 of CobbleMusicUpdater.exe from updater-v1.2.6.
-$ExpectedUpdaterSha256 = '3ACECCCA0723273A0B5E0EEE00A58D85D5D69A8959AFDBE1D6993E483BF4EEEC'
-# Keep first-time bootstrap and updater install quick and non-hanging on bad networks.
+$VerifierVersion = '1.2.7'
+# SHA-256 of CobbleMusicUpdater.exe from updater-v1.2.7. The release publisher
+# replaces this placeholder only when staging the verifier generation.
+$ExpectedVerifierSha256 = '18FCEB47A948632B3AA5C0C44D3E532C88253AD3989ED52567CB2E55FF85AE44'
 $DownloadTimeoutSeconds = 30
-# Prism's QSettings INI parser requires escaped quotes in the physical
-# instance.cfg value. Without the backslashes it will later rewrite the command
-# and concatenate quoted arguments (notably paths under Program Files).
+$MaximumChannelBytes = 16KB
+$MaximumSignatureBytes = 4KB
 $preLaunch = '\"$INST_MC_DIR/cobble-music-updater/CobbleMusicUpdater.exe\" --instance-dir \"$INST_DIR\" --minecraft-dir \"$INST_MC_DIR\" --prism-prelaunch'
 $instance = [IO.Path]::GetFullPath($InstanceDirectory)
 $minecraft = Join-Path $instance 'minecraft'
 $instanceConfig = Join-Path $instance 'instance.cfg'
 $targetDirectory = Join-Path $minecraft 'cobble-music-updater'
 $targetExe = Join-Path $targetDirectory 'CobbleMusicUpdater.exe'
+$verifierExe = Join-Path $targetDirectory "CobbleMusicUpdaterVerifier-$VerifierVersion.exe"
+$cachedChannelPath = Join-Path $targetDirectory 'installed-updater-channel.json'
+$cachedSignaturePath = Join-Path $targetDirectory 'installed-updater-channel.sig'
 $configPath = Join-Path $targetDirectory 'updater.json'
-$assetUri = "https://github.com/$Repository/releases/download/updater-v$UpdaterVersion/CobbleMusicUpdater.exe"
+$verifierAssetUri = "https://github.com/$Repository/releases/download/updater-v$VerifierVersion/CobbleMusicUpdater.exe"
+$channelUri = "https://raw.githubusercontent.com/$Repository/main/updater/channel/stable.json"
+$channelSignatureUri = "https://raw.githubusercontent.com/$Repository/main/updater/channel/stable.sig"
 
 function Move-FileAtomically([string]$Source, [string]$Destination) {
     $replacementBackup = $null
@@ -61,6 +67,18 @@ function Write-Utf8Atomically([string]$Path, [string]$Text) {
     }
     finally {
         if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
+}
+
+function Copy-FileAtomically([string]$Source, [string]$Destination) {
+    $temporary = "$Destination.new-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        [IO.File]::Copy($Source, $temporary, $true)
+        Move-FileAtomically $temporary $Destination
+        $temporary = $null
+    }
+    finally {
+        if ($temporary -and (Test-Path -LiteralPath $temporary)) { Remove-Item -LiteralPath $temporary -Force }
     }
 }
 
@@ -126,6 +144,7 @@ function Assert-WritableDirectory([string]$Path) {
 }
 
 function Test-WindowsExecutable([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
     $stream = [IO.File]::OpenRead($Path)
     try {
         if ($stream.Length -lt 2) { return $false }
@@ -136,48 +155,189 @@ function Test-WindowsExecutable([string]$Path) {
     }
 }
 
-function Install-VerifiedUpdater(
-    [string]$AssetUri,
-    [string]$ExpectedSha256,
-    [string]$Destination
-) {
-    if (Test-Path -LiteralPath $Destination -PathType Leaf) {
-        $installedHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
-        if ($installedHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase) `
-            -and (Test-WindowsExecutable $Destination)) {
-            Write-Host 'Using the already verified Kewz''s Cobblemon updater.'
-            return
-        }
+function Get-CanonicalVersion([string]$Value, [string]$Context) {
+    if ($Value -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        throw "$Context is not a canonical three-part version: $Value"
+    }
+    try { $parsed = [Version]::new($Value) }
+    catch { throw "$Context is outside the supported version range: $Value" }
+    if ($parsed.ToString(3) -cne $Value) { throw "$Context is not canonical: $Value" }
+    return $parsed
+}
+
+function Test-ExactExecutable([string]$Path, [int64]$ExpectedSize, [string]$ExpectedSha256) {
+    if (-not (Test-WindowsExecutable $Path)) { return $false }
+    $item = Get-Item -LiteralPath $Path
+    if ($item.Length -ne $ExpectedSize) { return $false }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.Equals(
+        $ExpectedSha256,
+        [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Install-PinnedVerifier {
+    if ((Test-Path -LiteralPath $verifierExe -PathType Leaf) `
+        -and (Get-FileHash -LiteralPath $verifierExe -Algorithm SHA256).Hash.Equals($ExpectedVerifierSha256, [StringComparison]::OrdinalIgnoreCase) `
+        -and (Test-WindowsExecutable $verifierExe)) {
+        return
     }
 
-    $download = Join-Path ([IO.Path]::GetTempPath()) ("CobbleMusicUpdater-" + [Guid]::NewGuid().ToString('N') + '.download')
-    $temporaryExe = $null
-    try {
-        Write-Host "Downloading the verified Kewz's Cobblemon updater..."
-        Invoke-WebRequest -UseBasicParsing -Uri $AssetUri -OutFile $download -TimeoutSec $DownloadTimeoutSeconds
-        $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
-        if (-not $actualHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Updater checksum mismatch. Expected $ExpectedSha256 but downloaded $actualHash. Nothing was installed."
-        }
-        if (-not (Test-WindowsExecutable $download)) {
-            throw 'The verified updater asset is not a Windows executable. Nothing was installed.'
-        }
+    if ((Test-Path -LiteralPath $targetExe -PathType Leaf) `
+        -and (Get-FileHash -LiteralPath $targetExe -Algorithm SHA256).Hash.Equals($ExpectedVerifierSha256, [StringComparison]::OrdinalIgnoreCase) `
+        -and (Test-WindowsExecutable $targetExe)) {
+        Copy-FileAtomically $targetExe $verifierExe
+        return
+    }
 
-        $destinationDirectory = Split-Path -Parent $Destination
-        New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
-        Assert-WritableDirectory $destinationDirectory
-        $temporaryExe = "$Destination.new-$([Guid]::NewGuid().ToString('N'))"
-        [IO.File]::Copy($download, $temporaryExe, $true)
-        $copiedHash = (Get-FileHash -LiteralPath $temporaryExe -Algorithm SHA256).Hash
-        if (-not $copiedHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'The updater copy failed checksum verification. Nothing was installed.'
+    $download = "$verifierExe.download-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        Write-Host "Downloading the pinned updater verifier v$VerifierVersion..."
+        Invoke-WebRequest -UseBasicParsing -Uri $verifierAssetUri -OutFile $download -TimeoutSec $DownloadTimeoutSeconds
+        $actualHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
+        if (-not $actualHash.Equals($ExpectedVerifierSha256, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Pinned updater verifier checksum mismatch. Expected $ExpectedVerifierSha256 but downloaded $actualHash."
         }
-        Move-FileAtomically $temporaryExe $Destination
-        $temporaryExe = $null
+        if (-not (Test-WindowsExecutable $download)) { throw 'The pinned updater verifier is not a Windows executable.' }
+        Move-FileAtomically $download $verifierExe
+        $download = $null
     }
     finally {
-        if ($temporaryExe -and (Test-Path -LiteralPath $temporaryExe)) { Remove-Item -LiteralPath $temporaryExe -Force }
-        if (Test-Path -LiteralPath $download) { Remove-Item -LiteralPath $download -Force }
+        if ($download -and (Test-Path -LiteralPath $download)) { Remove-Item -LiteralPath $download -Force }
+    }
+}
+
+function Invoke-ChannelVerifier([string]$DescriptorPath, [string]$SignaturePath) {
+    $verifiedOutput = Join-Path $targetDirectory ('.verified-updater-channel-' + [Guid]::NewGuid().ToString('N') + '.json')
+    try {
+        $arguments = '--verify-updater-channel "{0}" --signature-file "{1}" --verified-output "{2}"' -f `
+            $DescriptorPath.Replace('"', '""'), $SignaturePath.Replace('"', '""'), $verifiedOutput.Replace('"', '""')
+        $process = Start-Process -FilePath $verifierExe -ArgumentList $arguments -PassThru -Wait -WindowStyle Hidden
+        if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $verifiedOutput -PathType Leaf)) {
+            throw 'The pinned verifier rejected the updater channel signature or metadata.'
+        }
+        $verifiedText = [IO.File]::ReadAllText($verifiedOutput)
+        $channel = $verifiedText | ConvertFrom-Json
+        $null = Get-CanonicalVersion ([string]$channel.updaterVersion) 'Verified updater channel version'
+        return $channel
+    }
+    finally {
+        if (Test-Path -LiteralPath $verifiedOutput) { Remove-Item -LiteralPath $verifiedOutput -Force }
+    }
+}
+
+function Test-UpdaterMatchesChannel([object]$Channel) {
+    if ($null -eq $Channel -or $null -eq $Channel.updater) { return $false }
+    return Test-ExactExecutable $targetExe ([int64]$Channel.updater.size) ([string]$Channel.updater.sha256)
+}
+
+function Get-CachedChannel {
+    if (-not (Test-Path -LiteralPath $cachedChannelPath -PathType Leaf) `
+        -or -not (Test-Path -LiteralPath $cachedSignaturePath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $channel = Invoke-ChannelVerifier $cachedChannelPath $cachedSignaturePath
+        if (Test-UpdaterMatchesChannel $channel) { return $channel }
+    }
+    catch {
+        Write-Host "Ignoring an invalid cached updater channel: $($_.Exception.Message)"
+    }
+    return $null
+}
+
+function Install-UpdaterFromChannel([object]$Channel) {
+    $expectedSize = [int64]$Channel.updater.size
+    $expectedHash = [string]$Channel.updater.sha256
+    if ($expectedHash.Equals($ExpectedVerifierSha256, [StringComparison]::OrdinalIgnoreCase) `
+        -and (Get-Item -LiteralPath $verifierExe).Length -eq $expectedSize) {
+        Copy-FileAtomically $verifierExe $targetExe
+        return
+    }
+
+    $assetUri = "https://github.com/$Repository/releases/download/$($Channel.releaseTag)/$($Channel.updater.name)"
+    $download = "$targetExe.download-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        Write-Host "Downloading verified updater v$($Channel.updaterVersion)..."
+        Invoke-WebRequest -UseBasicParsing -Uri $assetUri -OutFile $download -TimeoutSec $DownloadTimeoutSeconds
+        if (-not (Test-ExactExecutable $download $expectedSize $expectedHash)) {
+            throw 'Downloaded updater does not match the signed channel size, SHA-256, or executable format.'
+        }
+        Move-FileAtomically $download $targetExe
+        $download = $null
+    }
+    finally {
+        if ($download -and (Test-Path -LiteralPath $download)) { Remove-Item -LiteralPath $download -Force }
+    }
+}
+
+function Save-ChannelCache([string]$DescriptorPath, [string]$SignaturePath) {
+    Copy-FileAtomically $DescriptorPath $cachedChannelPath
+    Copy-FileAtomically $SignaturePath $cachedSignaturePath
+}
+
+function Get-CurrentUpdater {
+    Install-PinnedVerifier
+    $floorVersion = Get-CanonicalVersion $VerifierVersion 'Pinned verifier version'
+    $currentChannel = Get-CachedChannel
+    $currentVersion = if ($null -ne $currentChannel) {
+        Get-CanonicalVersion ([string]$currentChannel.updaterVersion) 'Cached updater channel version'
+    }
+    else { $floorVersion }
+
+    $remoteDescriptor = Join-Path $targetDirectory ('.updater-channel-' + [Guid]::NewGuid().ToString('N') + '.json')
+    $remoteSignature = Join-Path $targetDirectory ('.updater-channel-' + [Guid]::NewGuid().ToString('N') + '.sig')
+    try {
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $channelUri -OutFile $remoteDescriptor -TimeoutSec $DownloadTimeoutSeconds
+            Invoke-WebRequest -UseBasicParsing -Uri $channelSignatureUri -OutFile $remoteSignature -TimeoutSec $DownloadTimeoutSeconds
+            if ((Get-Item -LiteralPath $remoteDescriptor).Length -gt $MaximumChannelBytes `
+                -or (Get-Item -LiteralPath $remoteSignature).Length -gt $MaximumSignatureBytes) {
+                throw 'Downloaded updater channel metadata exceeds its size limit.'
+            }
+            $remoteChannel = Invoke-ChannelVerifier $remoteDescriptor $remoteSignature
+            $remoteVersion = Get-CanonicalVersion ([string]$remoteChannel.updaterVersion) 'Remote updater channel version'
+            if ($remoteVersion -lt $floorVersion) {
+                throw "Signed updater channel is older than the pinned verifier floor v$VerifierVersion."
+            }
+            if ($remoteVersion -lt $currentVersion) {
+                Write-Host "Ignoring replayed updater channel v$remoteVersion; v$currentVersion is already trusted."
+            }
+            elseif ($remoteVersion -eq $currentVersion -and $null -ne $currentChannel -and (
+                ([string]$remoteChannel.updater.sha256 -cne [string]$currentChannel.updater.sha256) -or
+                ([int64]$remoteChannel.updater.size -ne [int64]$currentChannel.updater.size))) {
+                throw "Signed updater channel reused version $remoteVersion with different executable metadata."
+            }
+            else {
+                if (-not (Test-UpdaterMatchesChannel $remoteChannel)) {
+                    Install-UpdaterFromChannel $remoteChannel
+                }
+                if (-not (Test-UpdaterMatchesChannel $remoteChannel)) {
+                    throw 'Installed updater failed verification after atomic replacement.'
+                }
+                Save-ChannelCache $remoteDescriptor $remoteSignature
+                $currentChannel = $remoteChannel
+                $currentVersion = $remoteVersion
+            }
+        }
+        catch {
+            Write-Host "Could not adopt a newer updater; retaining the last verified version: $($_.Exception.Message)"
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $remoteDescriptor) { Remove-Item -LiteralPath $remoteDescriptor -Force }
+        if (Test-Path -LiteralPath $remoteSignature) { Remove-Item -LiteralPath $remoteSignature -Force }
+    }
+
+    if ($null -ne $currentChannel -and (Test-UpdaterMatchesChannel $currentChannel)) {
+        return
+    }
+    if ((Test-Path -LiteralPath $targetExe -PathType Leaf) `
+        -and (Get-FileHash -LiteralPath $targetExe -Algorithm SHA256).Hash.Equals($ExpectedVerifierSha256, [StringComparison]::OrdinalIgnoreCase) `
+        -and (Test-WindowsExecutable $targetExe)) {
+        return
+    }
+    Copy-FileAtomically $verifierExe $targetExe
+    if (-not (Get-FileHash -LiteralPath $targetExe -Algorithm SHA256).Hash.Equals($ExpectedVerifierSha256, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Pinned updater fallback failed checksum verification.'
     }
 }
 
@@ -232,11 +392,14 @@ function Ensure-UpdaterConfiguration {
     }
 }
 
+New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
+Assert-WritableDirectory $targetDirectory
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
 if ($PrismPreLaunch) {
     Write-Host "Running the verified Kewz's Cobblemon updater for this launch..."
     try {
-        Assert-WritableDirectory $minecraft
-        Install-VerifiedUpdater $assetUri $ExpectedUpdaterSha256 $targetExe
+        Get-CurrentUpdater
         Ensure-UpdaterConfiguration
         $quotedInstance = $instance.Replace('"', '""')
         $quotedMinecraft = $minecraft.Replace('"', '""')
@@ -244,7 +407,7 @@ if ($PrismPreLaunch) {
         $updaterProcess = Start-Process -FilePath $targetExe -ArgumentList $updaterArguments -PassThru -Wait
         if ($updaterProcess.ExitCode -ne 0) {
             Write-Host "The Kewz's Cobblemon updater returned code $($updaterProcess.ExitCode)."
-            Write-Host "Continuing launch and letting Minecraft start with current pack contents."
+            Write-Host 'Continuing launch and letting Minecraft start with current pack contents.'
         }
     }
     catch {
@@ -254,8 +417,7 @@ if ($PrismPreLaunch) {
     return
 }
 
-Assert-WritableDirectory $minecraft
-Install-VerifiedUpdater $assetUri $ExpectedUpdaterSha256 $targetExe
+Get-CurrentUpdater
 Ensure-UpdaterConfiguration
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'

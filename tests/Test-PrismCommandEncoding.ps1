@@ -43,7 +43,7 @@ foreach ($relativePath in @(
         'Copy-Item -LiteralPath $SourceExe -Destination $TargetExe -Force'
     }
     else {
-        'Install-VerifiedUpdater $assetUri $ExpectedUpdaterSha256 $targetExe'
+        'New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null'
     }
     $instanceWriteNeedle = if ($relativePath.StartsWith('tools', [StringComparison]::Ordinal)) {
         'Write-Utf8 $InstanceConfig'

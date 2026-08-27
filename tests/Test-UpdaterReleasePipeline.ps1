@@ -85,14 +85,20 @@ if ($actualFileVersion.Major -ne $expectedAssemblyVersion.Major `
 $exeHash = (Get-FileHash -LiteralPath $exe.FullName -Algorithm SHA256).Hash
 $bootstrap = [IO.File]::ReadAllText($BootstrapPath)
 $bootstrapRepository = Get-SingleQuotedAssignment $bootstrap 'Repository'
-$bootstrapVersion = Get-SingleQuotedAssignment $bootstrap 'UpdaterVersion'
-$bootstrapHash = Get-SingleQuotedAssignment $bootstrap 'ExpectedUpdaterSha256'
+$bootstrapVersion = Get-SingleQuotedAssignment $bootstrap 'VerifierVersion'
+$bootstrapHash = Get-SingleQuotedAssignment $bootstrap 'ExpectedVerifierSha256'
 if ($bootstrapRepository -cne $ExpectedRepository) { throw "Bootstrap repository mismatch: $bootstrapRepository" }
-if ($bootstrapVersion -cne $ExpectedVersion) { throw "Bootstrap version mismatch: $bootstrapVersion" }
-if (-not $bootstrapHash.Equals($exeHash, [StringComparison]::OrdinalIgnoreCase)) {
-    throw "Bootstrap updater hash does not match the built EXE. Bootstrap=$bootstrapHash EXE=$exeHash"
-}
 if ($bootstrapHash -cnotmatch '^[0-9A-F]{64}$') { throw 'Bootstrap updater checksum must be canonical uppercase SHA-256.' }
+Assert-CanonicalVersion $bootstrapVersion 'Bootstrap verifier version'
+$parsedBootstrapVersion = [Version]$bootstrapVersion
+$parsedExpectedVersion = [Version]$ExpectedVersion
+if ($parsedBootstrapVersion -gt $parsedExpectedVersion) {
+    throw "Bootstrap verifier version $bootstrapVersion is newer than the built updater $ExpectedVersion."
+}
+if ($parsedBootstrapVersion -eq $parsedExpectedVersion `
+    -and -not $bootstrapHash.Equals($exeHash, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "Verifier-generation bootstrap hash does not match the built EXE. Bootstrap=$bootstrapHash EXE=$exeHash"
+}
 
 $bootstrapAssetHash = (Get-FileHash -LiteralPath $BootstrapPath -Algorithm SHA256).Hash
 $updaterDocsPath = Join-Path $Root 'docs\UPDATER.md'
@@ -107,8 +113,8 @@ if (-not $docsBootstrapHash.Equals($bootstrapAssetHash, [StringComparison]::Ordi
     throw "Updater documentation bootstrap checksum is stale. Docs=$docsBootstrapHash Bootstrap=$bootstrapAssetHash"
 }
 
-$expectedAssetUri = 'https://github.com/$Repository/releases/download/updater-v$UpdaterVersion/CobbleMusicUpdater.exe'
-$assetUriPattern = '(?m)^[ \t]*\$assetUri[ \t]*=[ \t]*"(?<uri>[^"]+)"[ \t]*\r?$'
+$expectedAssetUri = 'https://github.com/$Repository/releases/download/updater-v$VerifierVersion/CobbleMusicUpdater.exe'
+$assetUriPattern = '(?m)^[ \t]*\$verifierAssetUri[ \t]*=[ \t]*"(?<uri>[^"]+)"[ \t]*\r?$'
 $expectedCommand = '\"$INST_MC_DIR/cobble-music-updater/CobbleMusicUpdater.exe\" --instance-dir \"$INST_DIR\" --minecraft-dir \"$INST_MC_DIR\" --prism-prelaunch'
 $preLaunchPattern = '(?m)^\$preLaunch = ''(?<command>[^''\r\n]*)''[ \t]*\r?$'
 $lfBootstrap = [regex]::Replace($bootstrap, '\r\n?|\n', "`n")
@@ -118,8 +124,8 @@ $bootstrapLineEndingFixtures = [ordered]@{
 }
 foreach ($fixture in $bootstrapLineEndingFixtures.GetEnumerator()) {
     if ((Get-SingleQuotedAssignment $fixture.Value 'Repository') -cne $ExpectedRepository `
-        -or (Get-SingleQuotedAssignment $fixture.Value 'UpdaterVersion') -cne $ExpectedVersion `
-        -or -not (Get-SingleQuotedAssignment $fixture.Value 'ExpectedUpdaterSha256').Equals($exeHash, [StringComparison]::OrdinalIgnoreCase)) {
+        -or (Get-SingleQuotedAssignment $fixture.Value 'VerifierVersion') -cne $bootstrapVersion `
+        -or -not (Get-SingleQuotedAssignment $fixture.Value 'ExpectedVerifierSha256').Equals($bootstrapHash, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Bootstrap assignments do not parse safely with $($fixture.Key) line endings."
     }
     $assetMatches = [regex]::Matches($fixture.Value, $assetUriPattern)
@@ -130,6 +136,19 @@ foreach ($fixture in $bootstrapLineEndingFixtures.GetEnumerator()) {
     if ($preLaunchMatches.Count -ne 1 -or $preLaunchMatches[0].Groups['command'].Value -cne $expectedCommand) {
         throw "Bootstrap Prism pre-launch command is invalid with $($fixture.Key) line endings."
     }
+}
+
+$commandGenerator = Join-Path $Root 'tools\New-CobbleMusicPrismBootstrapCommand.ps1'
+$friendCommandPath = Join-Path $Root 'docs\FRIEND-PRELAUNCH-COMMAND.txt'
+foreach ($required in @($commandGenerator, $friendCommandPath)) {
+    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Friend-command release input is missing: $required" }
+}
+$generatedFriendCommand = @(& $commandGenerator `
+    -BootstrapVersion $bootstrapVersion `
+    -ExpectedBootstrapSha256 $bootstrapAssetHash)
+if ($generatedFriendCommand.Count -ne 1 `
+    -or [IO.File]::ReadAllText($friendCommandPath).TrimEnd("`r", "`n") -cne [string]$generatedFriendCommand[0]) {
+    throw 'Committed friend-facing Prism command is stale relative to the immutable bootstrap version/hash.'
 }
 
 Write-Host "Updater release pipeline checks passed for updater-v$ExpectedVersion ($exeHash), including LF/CRLF bootstrap fixtures."

@@ -515,7 +515,7 @@ Assert-True ($null -ne $chunkParameter -and $chunkParameter.DefaultValue.Extent.
 $publisherText = [IO.File]::ReadAllText($Publisher)
 Assert-True ($publisherText -notmatch '(?i)\bdotnet\b|UpdaterProject|UpdaterDll|Build-UpdaterSigningTool') 'Modpack publisher still builds or executes a mutable working-tree updater.'
 Assert-True ($publisherText -match [regex]::Escape("updater\dist\win-x64\CobbleMusicUpdater.exe")) 'Modpack publisher does not use the distributed updater artifact.'
-Assert-True ($publisherText -match 'Get-SingleQuotedBootstrapAssignment[\s\S]+ExpectedUpdaterSha256') 'Modpack publisher does not bind the distributed updater to the bootstrap version/hash.'
+Assert-True ($publisherText -match 'Get-SingleQuotedBootstrapAssignment[\s\S]+ExpectedVerifierSha256') 'Modpack publisher does not bind the distributed updater to the stable bootstrap verifier version/hash.'
 foreach ($snapshotLimitFragment in @(
     '$MaximumManifestSnapshotBytes = 8MB',
     '$MaximumSignatureSnapshotBytes = 64KB',

@@ -30,6 +30,10 @@ internal static class Program
             {
                 return VerifyManifest(args);
             }
+            if (args.Contains("--verify-updater-channel", StringComparer.Ordinal))
+            {
+                return VerifyUpdaterChannel(args);
+            }
             if (args.Contains("--help", StringComparer.Ordinal) || args.Contains("-h", StringComparer.Ordinal))
             {
                 PrintUsage();
@@ -228,6 +232,30 @@ internal static class Program
         return 0;
     }
 
+    private static int VerifyUpdaterChannel(string[] args)
+    {
+        string descriptorPath = RequiredValue(args, "--verify-updater-channel");
+        string signaturePath = RequiredValue(args, "--signature-file");
+        string verifiedOutputPath = RequiredValue(args, "--verified-output");
+        if (File.Exists(verifiedOutputPath))
+        {
+            throw new IOException("Refusing to overwrite an existing verified channel output.");
+        }
+
+        UpdaterChannelDescriptor descriptor = UpdaterChannelParser.VerifyAndParse(
+            File.ReadAllBytes(descriptorPath),
+            File.ReadAllBytes(signaturePath));
+        byte[] canonical = UpdaterChannelParser.SerializeCanonical(descriptor);
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(verifiedOutputPath))!);
+        using (var output = new FileStream(verifiedOutputPath, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+        {
+            output.Write(canonical);
+            output.Flush(flushToDisk: true);
+        }
+        Console.WriteLine($"Kewz's Cobblemon Updater: verified signed updater channel {descriptor.UpdaterVersion}.");
+        return 0;
+    }
+
     private static string RequiredValue(string[] args, string key)
     {
         int index = Array.FindIndex(args, argument => string.Equals(argument, key, StringComparison.Ordinal));
@@ -273,6 +301,7 @@ internal static class Program
         Console.WriteLine("  CobbleMusicUpdater.exe --generate-keypair --private-key-file <path> --public-key-file <path>");
         Console.WriteLine("  CobbleMusicUpdater.exe --sign-manifest <manifest.json> --private-key-file <path> --signature-output <manifest.sig>");
         Console.WriteLine("  CobbleMusicUpdater.exe --verify-manifest <manifest.json> --signature-file <manifest.sig>");
+        Console.WriteLine("  CobbleMusicUpdater.exe --verify-updater-channel <channel.json> --signature-file <channel.sig> --verified-output <validated.json>");
     }
 }
 

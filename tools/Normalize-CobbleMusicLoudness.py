@@ -172,7 +172,15 @@ def analyze_one(
         "target_offset": number(raw.get("target_offset")),
     }
     missing = [name for name, value in required.items() if value is None]
-    if missing or sample_rate is None or duration is None:
+    # FFmpeg reports -inf integrated loudness and no target offset for a few
+    # sub-second transition stingers. They are safe to admit only when the
+    # path deterministically pairs with a measurable battle main theme; that
+    # group is normalized with one shared gain and verified by true-peak delta.
+    allowed_unmeasurable_segment = (
+        paired_main(relative) is not None
+        and set(missing).issubset({"input_i", "target_offset"})
+    )
+    if (missing and not allowed_unmeasurable_segment) or sample_rate is None or duration is None:
         fail(f"Incomplete loudness/stream analysis for {relative}: {', '.join(missing)}")
     return {
         "path": relative,
@@ -658,7 +666,10 @@ def verify_outputs(
             if abs(error) > 0.50:
                 failures.append(f"integrated loudness missed target: {relative} ({after['input_i']} LUFS)")
         else:
-            observed_gain = float(after["input_i"]) - float(before["input_i"])
+            if before.get("input_i") is not None and after.get("input_i") is not None:
+                observed_gain = float(after["input_i"]) - float(before["input_i"])
+            else:
+                observed_gain = float(after["input_tp"]) - float(before["input_tp"])
             error = observed_gain - float(method["appliedGainDb"])
             group_gain_errors.append(error)
             if abs(error) > 0.50:

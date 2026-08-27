@@ -23,6 +23,7 @@ internal static class Program
             TestAggregateDownloadProgressAndTransferMetrics();
             TestManifestSchemaTwoValidation();
             TestCreateOnlyDefaultManifestValidation();
+            TestUpdaterChannelValidation();
             TestSequentialReleaseChain();
             TestInstanceIdentityNormalization(Path.Combine(tempRoot, "identity"));
             TestOfflineLaunchPolicy();
@@ -387,6 +388,38 @@ internal static class Program
         UpdateManifest deletedOverlap = DeltaManifest();
         deletedOverlap.SeedFiles = [Copy(deletedOverlap.DeletedFiles[0])];
         Throws<InvalidDataException>(() => ManifestParser.Validate(deletedOverlap, configuration, AssetUrls()));
+    }
+
+    private static void TestUpdaterChannelValidation()
+    {
+        UpdaterChannelDescriptor valid = ChannelDescriptor();
+        UpdaterChannelParser.Validate(valid);
+        string canonical = System.Text.Encoding.UTF8.GetString(UpdaterChannelParser.SerializeCanonical(valid));
+        Equal(
+            "{\"schemaVersion\":1,\"productId\":\"cobble-music-updater\",\"repository\":\"Kewz4/Cobble-Music\",\"channel\":\"stable\",\"updaterVersion\":\"1.2.7\",\"releaseTag\":\"updater-v1.2.7\",\"updater\":{\"name\":\"CobbleMusicUpdater.exe\",\"size\":1048576,\"sha256\":\"" + new string('a', 64) + "\"}}",
+            canonical,
+            "canonical updater channel serialization");
+
+        UpdaterChannelDescriptor leadingZero = ChannelDescriptor();
+        leadingZero.UpdaterVersion = "1.02.7";
+        leadingZero.ReleaseTag = "updater-v1.02.7";
+        Throws<InvalidDataException>(() => UpdaterChannelParser.Validate(leadingZero));
+
+        UpdaterChannelDescriptor mismatchedTag = ChannelDescriptor();
+        mismatchedTag.ReleaseTag = "updater-v1.2.8";
+        Throws<InvalidDataException>(() => UpdaterChannelParser.Validate(mismatchedTag));
+
+        UpdaterChannelDescriptor arbitraryRepository = ChannelDescriptor();
+        arbitraryRepository.Repository = "attacker/repository";
+        Throws<InvalidDataException>(() => UpdaterChannelParser.Validate(arbitraryRepository));
+
+        UpdaterChannelDescriptor arbitraryAsset = ChannelDescriptor();
+        arbitraryAsset.Updater!.Name = "different.exe";
+        Throws<InvalidDataException>(() => UpdaterChannelParser.Validate(arbitraryAsset));
+
+        UpdaterChannelDescriptor uppercaseHash = ChannelDescriptor();
+        uppercaseHash.Updater!.Sha256 = new string('A', 64);
+        Throws<InvalidDataException>(() => UpdaterChannelParser.Validate(uppercaseHash));
     }
 
     private static void TestSequentialReleaseChain()
@@ -1671,6 +1704,22 @@ internal static class Program
         Path = file.Path,
         Size = file.Size,
         Sha256 = file.Sha256
+    };
+
+    private static UpdaterChannelDescriptor ChannelDescriptor() => new()
+    {
+        SchemaVersion = 1,
+        ProductId = UpdaterChannelParser.ProductId,
+        Repository = BuildInfo.DefaultRepository,
+        Channel = UpdaterChannelParser.StableChannel,
+        UpdaterVersion = "1.2.7",
+        ReleaseTag = "updater-v1.2.7",
+        Updater = new UpdaterChannelAsset
+        {
+            Name = UpdaterChannelParser.UpdaterAssetName,
+            Size = UpdaterChannelParser.MinimumUpdaterBytes,
+            Sha256 = new string('a', 64)
+        }
     };
 
     private static UpdaterConfiguration Configuration() => new()

@@ -45,6 +45,15 @@ player remains free to change or remove them afterward. Axiom is likewise an
 optional player-owned mod: removing, disabling, or replacing any Axiom JAR
 does not trigger pack validation or a payload download.
 
+Updater 1.2.7 adds a signed stable updater channel. The friend-facing Prism
+command remains checksum-pinned to one immutable bootstrap generation. That
+bootstrap retains a separately named, checksum-pinned 1.2.7 verifier and uses
+the compiled Ed25519 release key to authenticate the current updater version,
+release tag, byte length, and SHA-256 before atomically replacing the runnable
+EXE. The unsigned branch pointer and GitHub asset URL provide availability,
+not trust. A cached signed descriptor supports offline launch, and a replayed
+older descriptor cannot downgrade an already trusted updater.
+
 Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
 An **unrecoverable local transaction** is the sole fail-closed case: Prism is
@@ -175,14 +184,18 @@ The publisher resolves Git only through its own repository root, captures one
 clean commit, exports the complete tree without reading live working-tree
 bytes, and uses the builder, source, tests, bootstrap, SDK pin, package lock,
 and NuGet configuration from that export. It builds self-contained `win-x64`,
-computes the EXE's SHA-256, tests a proposed bootstrap containing that exact
-version/hash, and proves that the staged EXE is byte-identical to independent
-builds of the same commit. The eventual Git tag and release target that exact
-commit.
+computes the EXE's SHA-256, pins the bootstrap only when staging its immutable
+verifier generation, and proves that the staged EXE is byte-identical to
+independent builds of the same commit. It also creates the canonical
+`updater/channel/stable.json`, signs those exact bytes with the offline release
+key, and verifies the descriptor through the staged EXE. The eventual Git tag
+and release target that exact commit.
 
 First stage locally. This runs every `tests/Test-*.ps1` plus every updater
-`*.Tests.csproj`, atomically refreshes the tracked bootstrap only after they
-pass, and makes no GitHub change. Console-style test projects are executed
+`*.Tests.csproj`, atomically refreshes the tracked bootstrap (when applicable)
+and signed stable channel only after they pass, and makes no GitHub change.
+The private key is read only from the maintainer-selected offline path and is
+never copied into staging. Console-style test projects are executed
 with `dotnet run` and must print their exact success marker; test-SDK projects
 use `dotnet test`. A project that only builds without proving execution blocks
 the release.
@@ -252,8 +265,9 @@ validation deliberately retains the draft so the next run can resume safely.
 After the final draft/assets GET, the publisher rechecks the bound local source
 commit and reserved lightweight tag, with the tag check directly adjacent to
 the PATCH.
-Authentication comes only from the GitHub CLI credential store; the publisher
-accepts and emits no secrets.
+GitHub authentication comes only from the GitHub CLI credential store; no
+access token is accepted or emitted. GitHub mutation modes validate the
+already committed public channel/signature and do not need the private seed.
 
 ## Install into one Prism instance
 
@@ -298,11 +312,11 @@ contains spaces or apostrophes.
 
 On the first Play, that command creates `minecraft/cobble-music-updater/`,
 downloads the exact release bootstrap, verifies its pinned SHA-256, installs
-the exact updater EXE, and runs the updater before Minecraft starts. Later
-Plays checksum and reuse both cached files, so there is no redundant bootstrap
-or updater download. If either cached file is missing, stale, or corrupt, only
-that component is downloaded again and is not installed until its checksum
-matches.
+the checksum-pinned verifier, resolves the signed stable updater channel, and
+runs the verified updater before Minecraft starts. Later Plays reuse the
+immutable bootstrap and verifier, check the small signed channel documents,
+and download an updater EXE only when its authenticated version advances or
+the installed copy needs repair. Offline checks retain the last verified EXE.
 
 The permanent command deliberately leaves `instance.cfg` alone while Prism is
 running. The bootstrap's `-PrismPreLaunch` mode writes only its own
@@ -315,7 +329,7 @@ bootstrap has its final checksum:
 
 ```powershell
 .\tools\New-CobbleMusicPrismBootstrapCommand.ps1 `
-  -UpdaterVersion 1.2.6 `
+  -BootstrapVersion 1.2.7 `
   -ExpectedBootstrapSha256 '<SHA-256 of the published Bootstrap-CobbleMusicUpdater.ps1>'
 ```
 
@@ -329,7 +343,7 @@ an owner who wants to close Prism and replace the field with the short direct
 EXE command. In manual mode it:
 
 1. verifies the selected Prism instance has `instance.cfg` and `minecraft/`;
-2. downloads the exact `updater-v1.2.6` EXE and checks its SHA-256;
+2. downloads the exact `updater-v1.2.7` verifier and checks its SHA-256;
 3. installs it at `minecraft/cobble-music-updater/CobbleMusicUpdater.exe`;
 4. writes only the updater's own `updater.json` (backing up an existing one);
    and
@@ -341,13 +355,13 @@ unless the player deliberately reruns it with `-Force`. It does not touch
 saves, `options.txt`, `servers.dat`, logs, or resource-pack selections.
 
 For that optional manual path, after the bootstrap asset has been downloaded from
-[updater-v1.2.6](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.6),
+[updater-v1.2.7](https://github.com/Kewz4/Cobble-Music/releases/tag/updater-v1.2.7),
 the player can paste this into PowerShell, replacing the example instance path:
 
 ```powershell
-$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.6/Bootstrap-CobbleMusicUpdater.ps1'
+$uri = 'https://github.com/Kewz4/Cobble-Music/releases/download/updater-v1.2.7/Bootstrap-CobbleMusicUpdater.ps1'
 $path = Join-Path $env:TEMP 'Bootstrap-CobbleMusicUpdater.ps1'
-$expected = '657D3FB1CF9E3B3359988F8D0C0526ADF02EA1D5713F2170BC385599A07BAB92'
+$expected = '56E39784A1470E5BF2923820AB9D96D6E88474FD679540B85C2B65387CD4301A'
 Invoke-WebRequest -Uri $uri -OutFile $path
 if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $expected) { throw 'Bootstrap checksum mismatch.' }
 Unblock-File -LiteralPath $path
@@ -369,12 +383,14 @@ zeroes (for example, `1.0.5`); four-component variants are rejected.
 
 The modpack publisher never builds or loads the updater from the current C#
 working tree. Signing and verification use only
-`updater\dist\win-x64\CobbleMusicUpdater.exe`, whose version, ProductVersion,
-and SHA-256 must exactly match the committed `updater-v1.2.6` bootstrap pin.
-The EXE is held read-locked from checksum verification through each signer or
-verifier process. Keep the private signing key outside the Minecraft source,
-every managed source root, and `release-output`; the publisher rejects those
-locations before it inventories a single source file.
+`updater\dist\win-x64\CobbleMusicUpdater.exe`. A separate immutable local
+verifier must match the committed 1.2.7 bootstrap pin; it authenticates the
+public stable channel, whose signed version, byte length, and SHA-256 must then
+match the distributed EXE. The EXE is held read-locked from checksum
+verification through each signer or verifier process. Keep the private signing
+key outside the Minecraft source, every managed source root, and
+`release-output`; the publisher rejects those locations before it inventories
+a single source file.
 
 Release `1.0.5` is a sanitized recovery baseline: it replaces the unsafe 1.0.4
 inventory, excludes generated browser/cache/index data, and performs the
@@ -444,7 +460,7 @@ a reviewed file under `release-defaults/` overrides them; this is used to
 remove per-player Reactive Music home coordinates and stale Iris timestamps.
 Every current top-level Axiom JAR is automatically removed from the immutable
 inventory and added to the create-only inventory. A release with seeds requires
-updater 1.2.6, and the payload ZIP is checked against the exact union of its
+updater 1.2.6 or newer, and the payload ZIP is checked against the exact union of its
 managed payload files and seed files before signing.
 
 Review `release-output\1.0.5\cobble-music-update.json`, its signature, and all
@@ -503,7 +519,7 @@ window.
 
 Before any GitHub mutation, the publisher additionally requires the local
 pinned updater EXE to match the exact `uploaded` size and GitHub SHA-256 digest
-on the currently published, non-prerelease `updater-v1.2.6` release. It checks
+on the currently published, non-prerelease `updater-v1.2.7` release. It checks
 that dependency again immediately before making the modpack draft public. For
 a v2 delta it also re-fetches the stable base release at that final boundary
 and requires both base manifest and signature to match the identity captured

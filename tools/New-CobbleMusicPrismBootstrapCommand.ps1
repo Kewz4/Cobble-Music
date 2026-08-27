@@ -6,8 +6,9 @@ so the payload is UTF-16LE/Base64 encoded for deterministic argument handling.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
+    [Alias('UpdaterVersion')]
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
-    [string]$UpdaterVersion,
+    [string]$BootstrapVersion,
 
     [Parameter(Mandatory)]
     [ValidatePattern('^[0-9A-Fa-f]{64}$')]
@@ -51,7 +52,7 @@ Unblock-File -LiteralPath $b
 '@
 
 $payload = $payload.Replace('__REPOSITORY__', $Repository)
-$payload = $payload.Replace('__UPDATER_VERSION__', $UpdaterVersion)
+$payload = $payload.Replace('__UPDATER_VERSION__', $BootstrapVersion)
 $payload = $payload.Replace('__BOOTSTRAP_SHA256__', $hash)
 if ($payload.IndexOf('__', [StringComparison]::Ordinal) -ge 0) {
     throw 'The Prism bootstrap payload still contains an unreplaced template token.'

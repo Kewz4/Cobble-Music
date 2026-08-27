@@ -29,6 +29,13 @@ function Set-SingleQuotedAssignment([string]$Text, [string]$Name, [string]$Value
     return [regex]::Replace($Text, $pattern, '${prefix}''' + $Value + '''${suffix}', 1)
 }
 
+function Get-SingleQuotedAssignment([string]$Text, [string]$Name) {
+    $pattern = '(?m)^[ \t]*' + [regex]::Escape('$' + $Name) + '[ \t]*=[ \t]*''(?<value>[^''\r\n]*)''[ \t]*\r?$'
+    $matches = [regex]::Matches($Text, $pattern)
+    if ($matches.Count -ne 1) { throw "Expected one `$${Name} assignment, found $($matches.Count)." }
+    return $matches[0].Groups['value'].Value
+}
+
 foreach ($required in @($GeneratorPath, $BootstrapPath)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw "Required test input is missing: $required" }
 }
@@ -121,19 +128,44 @@ param([string]$InstanceDirectory, [switch]$PrismPreLaunch)
     Assert-True ((Get-Sha256 $cachedBootstrap) -ceq $corruptCacheHash) 'A failed bootstrap download replaced the prior cache before verification.'
 
     $bootstrap = [IO.File]::ReadAllText($BootstrapPath)
-    $fakeUpdater = Join-Path $updaterDirectory 'CobbleMusicUpdater.exe'
-    [IO.File]::WriteAllBytes($fakeUpdater, [byte[]](0x4d, 0x5a, 0x01, 0x02, 0x03, 0x04))
-    $fakeUpdaterHash = Get-Sha256 $fakeUpdater
-    $bootstrap = Set-SingleQuotedAssignment $bootstrap 'ExpectedUpdaterSha256' $fakeUpdaterHash
-    $downloadNeedle = '        Invoke-WebRequest -UseBasicParsing -Uri $AssetUri -OutFile $download -TimeoutSec $DownloadTimeoutSeconds'
-    $downloadReplacement = "        throw 'NETWORK_CALLED_DURING_EXACT_UPDATER_REUSE'"
-    Assert-True ([regex]::Matches($bootstrap, [regex]::Escape($downloadNeedle)).Count -eq 1) 'Bootstrap download call fixture was not unique.'
-    $bootstrap = $bootstrap.Replace($downloadNeedle, $downloadReplacement)
+    Assert-True ((Get-SingleQuotedAssignment $bootstrap 'VerifierVersion') -ceq '1.2.7') 'Evergreen bootstrap does not pin verifier generation 1.2.7.'
+    Assert-True ((Get-SingleQuotedAssignment $bootstrap 'ExpectedVerifierSha256') -cmatch '^[0-9A-F]{64}$') 'Evergreen bootstrap verifier SHA-256 is not canonical.'
+    foreach ($requiredFragment in @(
+        'https://raw.githubusercontent.com/$Repository/main/updater/channel/stable.json',
+        'https://raw.githubusercontent.com/$Repository/main/updater/channel/stable.sig',
+        '--verify-updater-channel',
+        'Ignoring replayed updater channel',
+        'installed-updater-channel.json',
+        'CobbleMusicUpdaterVerifier-$VerifierVersion.exe'
+    )) {
+        Assert-True ($bootstrap.Contains($requiredFragment, [StringComparison]::Ordinal)) "Evergreen bootstrap is missing security behavior: $requiredFragment"
+    }
+
+    $tokens = $null
+    $parseErrors = $null
+    $bootstrapAst = [Management.Automation.Language.Parser]::ParseInput($bootstrap, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -ne 0) { throw "Evergreen bootstrap has parse errors: $($parseErrors.Message -join '; ')" }
+    $currentUpdaterFunctions = @($bootstrapAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-CurrentUpdater'
+    }, $true))
+    Assert-True ($currentUpdaterFunctions.Count -eq 1) 'Could not isolate Get-CurrentUpdater for the no-network PrismPreLaunch fixture.'
+    $functionExtent = $currentUpdaterFunctions[0].Extent
+    $replacementFunction = @'
+function Get-CurrentUpdater {
+    $fakeUpdater = Join-Path $targetDirectory 'CobbleMusicUpdater.exe'
+    if (-not (Test-Path -LiteralPath $fakeUpdater -PathType Leaf)) {
+        [IO.File]::WriteAllBytes($fakeUpdater, [byte[]](0x4d, 0x5a, 0x01, 0x02, 0x03, 0x04))
+    }
+}
+'@
+    $bootstrap = $bootstrap.Substring(0, $functionExtent.StartOffset) + $replacementFunction.TrimEnd("`r", "`n") + $bootstrap.Substring($functionExtent.EndOffset)
     $invokeNeedle = "    `$updaterProcess = Start-Process -FilePath `$targetExe -ArgumentList `$updaterArguments -PassThru -Wait"
     $invokeReplacement = @'
     [IO.File]::WriteAllLines(
         [Environment]::GetEnvironmentVariable('COBBLE_MUSIC_TEST_BOOTSTRAP_LOG'),
         [string[]]@($instance, $minecraft, '--prism-prelaunch'))
+    $updaterProcess = [pscustomobject]@{ ExitCode = 0 }
 '@
     Assert-True ([regex]::Matches($bootstrap, [regex]::Escape($invokeNeedle)).Count -eq 1) 'Bootstrap updater invocation fixture was not unique.'
     $bootstrap = $bootstrap.Replace($invokeNeedle, $invokeReplacement.TrimEnd("`r", "`n"))
@@ -167,7 +199,7 @@ param([string]$InstanceDirectory, [switch]$PrismPreLaunch)
     catch { $contextFailure = $_.Exception.Message }
     Assert-True ($null -ne $contextFailure -and $contextFailure.IndexOf('do not match', [StringComparison]::Ordinal) -ge 0) 'PrismPreLaunch mode accepted mismatched Prism instance paths.'
 
-    Write-Host 'One-command Prism bootstrap checks passed: encoded argument safety, exact cache reuse, fail-closed replacement, no live instance.cfg mutation, and same-launch updater invocation.'
+    Write-Host 'One-command Prism bootstrap checks passed: encoded argument safety, exact cache reuse, fail-closed replacement, signed evergreen-channel wiring, no live instance.cfg mutation, and same-launch updater invocation.'
 }
 finally {
     [Environment]::SetEnvironmentVariable('INST_DIR', $savedInstance)

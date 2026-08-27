@@ -20,6 +20,8 @@ param(
     [ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')]
     [string]$Repository = 'Kewz4/Cobble-Music',
 
+    [string]$PrivateKeyPath = (Join-Path $env:USERPROFILE '.cobble-music\keys\cobble-music-release-private.key'),
+
     [switch]$DryRun,
     [switch]$UploadDraft,
     [switch]$Publish,
@@ -43,7 +45,10 @@ $BuildScript = Join-Path $Root 'tools\Build-CobbleMusicUpdater.ps1'
 $GlobalJsonPath = Join-Path $Root 'global.json'
 $NuGetConfigPath = Join-Path $Root 'NuGet.Config'
 $BootstrapPath = Join-Path $Root 'bootstrap\Bootstrap-CobbleMusicUpdater.ps1'
+$ChannelPath = Join-Path $Root 'updater\channel\stable.json'
+$ChannelSignaturePath = Join-Path $Root 'updater\channel\stable.sig'
 $DistExe = Join-Path $Root 'updater\dist\win-x64\CobbleMusicUpdater.exe'
+$VerifierDistExe = Join-Path $Root 'updater\verifier\win-x64\CobbleMusicUpdater.exe'
 $PipelineTest = Join-Path $Root 'tests\Test-UpdaterReleasePipeline.ps1'
 $ReproducibilityTest = Join-Path $Root 'tests\Test-UpdaterBuildReproducibility.ps1'
 $TemporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('cobble-music-updater-release-' + [Guid]::NewGuid().ToString('N'))
@@ -145,8 +150,20 @@ function Get-ProposedBootstrap([string]$Version, [string]$UpdaterSha256, [string
     if ($bootstrapRepository -cne $Repository) {
         throw "Bootstrap repository ($bootstrapRepository) does not match requested repository ($Repository)."
     }
-    $text = Set-SingleQuotedAssignment $text 'UpdaterVersion' $Version
-    $text = Set-SingleQuotedAssignment $text 'ExpectedUpdaterSha256' $UpdaterSha256.ToUpperInvariant()
+    $verifierVersion = Get-SingleQuotedAssignment $text 'VerifierVersion'
+    $verifierHash = Get-SingleQuotedAssignment $text 'ExpectedVerifierSha256'
+    $candidateVersion = ConvertTo-CanonicalUpdaterVersion $Version 'Updater build version'
+    $parsedVerifierVersion = ConvertTo-CanonicalUpdaterVersion $verifierVersion 'Bootstrap verifier version'
+    if ($parsedVerifierVersion -gt $candidateVersion) {
+        throw "Bootstrap verifier version $verifierVersion is newer than updater build $Version."
+    }
+    if ($parsedVerifierVersion -eq $candidateVersion) {
+        $text = Set-SingleQuotedAssignment $text 'ExpectedVerifierSha256' $UpdaterSha256.ToUpperInvariant()
+        $verifierHash = $UpdaterSha256.ToUpperInvariant()
+    }
+    elseif ($verifierHash -cnotmatch '^[0-9A-F]{64}$') {
+        throw 'Stable bootstrap verifier checksum must be canonical uppercase SHA-256.'
+    }
 
     $commentPattern = '(?m)^# SHA-256 of CobbleMusicUpdater\.exe from updater-v[^\r\n]+(?<eol>\r?)$'
     $commentMatches = [regex]::Matches($text, $commentPattern)
@@ -158,15 +175,48 @@ function Get-ProposedBootstrap([string]$Version, [string]$UpdaterSha256, [string
         $text,
         [Text.RegularExpressions.MatchEvaluator]{
             param($match)
-            return "# SHA-256 of CobbleMusicUpdater.exe from updater-v$Version." + $match.Groups['eol'].Value
+            return "# SHA-256 of CobbleMusicUpdater.exe from updater-v$verifierVersion. The release publisher" + $match.Groups['eol'].Value
         },
         1)
 
-    if ((Get-SingleQuotedAssignment $text 'UpdaterVersion') -cne $Version) { throw 'Bootstrap version replacement did not verify.' }
-    if (-not (Get-SingleQuotedAssignment $text 'ExpectedUpdaterSha256').Equals($UpdaterSha256, [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Bootstrap checksum replacement did not verify.'
+    if ((Get-SingleQuotedAssignment $text 'VerifierVersion') -cne $verifierVersion) { throw 'Bootstrap verifier version changed unexpectedly.' }
+    if (-not (Get-SingleQuotedAssignment $text 'ExpectedVerifierSha256').Equals($verifierHash, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Bootstrap verifier checksum replacement did not verify.'
     }
     return $text
+}
+
+function Get-UpdaterChannelText([string]$Version, [string]$UpdaterSha256, [int64]$UpdaterSize) {
+    $descriptor = [ordered]@{
+        schemaVersion = 1
+        productId = 'cobble-music-updater'
+        repository = $Repository
+        channel = 'stable'
+        updaterVersion = $Version
+        releaseTag = "updater-v$Version"
+        updater = [ordered]@{
+            name = 'CobbleMusicUpdater.exe'
+            size = $UpdaterSize
+            sha256 = $UpdaterSha256.ToLowerInvariant()
+        }
+    }
+    return ($descriptor | ConvertTo-Json -Depth 5 -Compress) + "`n"
+}
+
+function Invoke-UpdaterTool([string]$Executable, [string[]]$Arguments, [string]$Description) {
+    & $Executable @Arguments | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "$Description failed with exit code $LASTEXITCODE." }
+}
+
+function Assert-PrivateKeyIsolation([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw 'Offline updater-channel signing key is missing.' }
+    $resolved = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path).Path)
+    $rootWithSeparator = $Root + [IO.Path]::DirectorySeparatorChar
+    if ($resolved.Equals($Root, [StringComparison]::OrdinalIgnoreCase) `
+        -or $resolved.StartsWith($rootWithSeparator, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The updater-channel signing key must remain outside the repository.'
+    }
+    return $resolved
 }
 
 function Invoke-Checked([string]$Description, [scriptblock]$Action) {
@@ -407,12 +457,14 @@ function Assert-CleanReleaseInputs {
         'NuGet.Config',
         'updater/CobbleMusicUpdater',
         'updater/CobbleMusicUpdater.Tests',
+        'updater/channel',
         'tools/Build-CobbleMusicUpdater.ps1',
         'tools/New-CobbleMusicPrismBootstrapCommand.ps1',
         'tools/Publish-CobbleMusicUpdater.ps1',
         'bootstrap/Bootstrap-CobbleMusicUpdater.ps1',
         'tests',
-        'docs/UPDATER.md'
+        'docs/UPDATER.md',
+        'docs/FRIEND-PRELAUNCH-COMMAND.txt'
     )
     $arguments = @('status', '--porcelain=v1', '--') + $paths
     $dirty = @(Invoke-RootGit $arguments)
@@ -653,6 +705,10 @@ if ($RepairStaleUploads -and -not $GitHubMutation) { throw '-RepairStaleUploads 
 if ($VerifySourceBinding -and ($DryRun -or $GitHubMutation -or $ConfirmPublish -or $RepairStaleUploads)) {
     throw '-VerifySourceBinding is a standalone read-only diagnostic.'
 }
+$resolvedPrivateKeyPath = $null
+if (-not $DryRun -and -not $GitHubMutation -and -not $VerifySourceBinding) {
+    $resolvedPrivateKeyPath = Assert-PrivateKeyIsolation $PrivateKeyPath
+}
 
 if (-not (Get-Command git -ErrorAction SilentlyContinue)) { throw 'Git is required on PATH for exact updater source binding.' }
 if ($VerifySourceBinding) {
@@ -684,6 +740,8 @@ try {
     $sourceNuGetConfigPath = Join-Path $sourceRoot 'NuGet.Config'
     $sourcePackagesPath = Join-Path $sourceRoot 'updater\packages'
     $sourceBootstrapPath = Join-Path $sourceRoot 'bootstrap\Bootstrap-CobbleMusicUpdater.ps1'
+    $sourceChannelPath = Join-Path $sourceRoot 'updater\channel\stable.json'
+    $sourceChannelSignaturePath = Join-Path $sourceRoot 'updater\channel\stable.sig'
     $sourcePipelineTest = Join-Path $sourceRoot 'tests\Test-UpdaterReleasePipeline.ps1'
     $sourceReproducibilityTest = Join-Path $sourceRoot 'tests\Test-UpdaterBuildReproducibility.ps1'
     foreach ($required in @($sourceBuildInfoPath, $sourceProjectPath, $sourceBuildScript, $sourceGlobalJsonPath, $sourceNuGetConfigPath, $sourceBootstrapPath, $sourcePipelineTest, $sourceReproducibilityTest)) {
@@ -707,15 +765,51 @@ try {
     if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) { throw "Updater build output is missing: $builtExe" }
     $stagedExe = Join-Path $TemporaryRoot 'CobbleMusicUpdater.exe'
     $stagedBootstrap = Join-Path $TemporaryRoot 'Bootstrap-CobbleMusicUpdater.ps1'
+    $stagedChannel = Join-Path $TemporaryRoot 'stable.json'
+    $stagedChannelSignature = Join-Path $TemporaryRoot 'stable.sig'
     [IO.File]::Copy($builtExe, $stagedExe, $true)
     $updaterSha256 = Get-Sha256 $stagedExe
     $proposedBootstrap = Get-ProposedBootstrap $version $updaterSha256 $sourceBootstrapPath
     [IO.File]::WriteAllText($stagedBootstrap, $proposedBootstrap, [Text.UTF8Encoding]::new($false))
     $bootstrapSha256 = Get-Sha256 $stagedBootstrap
+    $channelText = Get-UpdaterChannelText $version $updaterSha256 (Get-Item -LiteralPath $stagedExe).Length
+    [IO.File]::WriteAllText($stagedChannel, $channelText, [Text.UTF8Encoding]::new($false))
+
+    if ($GitHubMutation) {
+        foreach ($requiredChannelInput in @($sourceChannelPath, $sourceChannelSignaturePath)) {
+            if (-not (Test-Path -LiteralPath $requiredChannelInput -PathType Leaf)) {
+                throw "GitHub upload is blocked because the committed signed updater channel is missing: $requiredChannelInput"
+            }
+        }
+        if ([IO.File]::ReadAllText($sourceChannelPath) -cne $channelText) {
+            throw 'GitHub upload is blocked because the committed stable updater channel does not describe this exact build.'
+        }
+        [IO.File]::Copy($sourceChannelSignaturePath, $stagedChannelSignature, $true)
+    }
+    elseif (-not $DryRun) {
+        Invoke-UpdaterTool $stagedExe @(
+            '--sign-manifest', $stagedChannel,
+            '--private-key-file', $resolvedPrivateKeyPath,
+            '--signature-output', $stagedChannelSignature
+        ) 'Signing the stable updater channel'
+    }
 
     $fileVersion = (Get-Item -LiteralPath $stagedExe).VersionInfo.FileVersion
     Write-Host "Updater: version=$version fileVersion=$fileVersion size=$((Get-Item -LiteralPath $stagedExe).Length) sha256=$updaterSha256"
     Write-Host "Bootstrap: size=$((Get-Item -LiteralPath $stagedBootstrap).Length) sha256=$bootstrapSha256"
+    Write-Host "Stable updater channel: version=$version executableSize=$((Get-Item -LiteralPath $stagedExe).Length)"
+
+    if (-not $DryRun) {
+        $verifiedChannel = Join-Path $TemporaryRoot 'verified-stable.json'
+        Invoke-UpdaterTool $stagedExe @(
+            '--verify-updater-channel', $stagedChannel,
+            '--signature-file', $stagedChannelSignature,
+            '--verified-output', $verifiedChannel
+        ) 'Verifying the signed stable updater channel'
+        if ([IO.File]::ReadAllText($verifiedChannel) -cne $channelText.TrimEnd("`r", "`n")) {
+            throw 'Updater channel verifier did not reproduce the exact canonical channel document.'
+        }
+    }
 
     if ($GitHubMutation) {
         $currentBootstrap = [IO.File]::ReadAllText($BootstrapPath)
@@ -729,8 +823,22 @@ try {
     # updater/bootstrap pair that would be distributed. Install that pair only
     # into the disposable test export after the release artifact is complete.
     $sourceTestDistExe = Join-Path $sourceRoot 'updater\dist\win-x64\CobbleMusicUpdater.exe'
+    $sourceTestVerifierExe = Join-Path $sourceRoot 'updater\verifier\win-x64\CobbleMusicUpdater.exe'
     New-Item -ItemType Directory -Path (Split-Path -Parent $sourceTestDistExe) -Force | Out-Null
     [IO.File]::Copy($stagedExe, $sourceTestDistExe, $true)
+    New-Item -ItemType Directory -Path (Split-Path -Parent $sourceTestVerifierExe) -Force | Out-Null
+    $testVerifierVersion = Get-SingleQuotedAssignment $proposedBootstrap 'VerifierVersion'
+    $testVerifierHash = Get-SingleQuotedAssignment $proposedBootstrap 'ExpectedVerifierSha256'
+    if ($testVerifierVersion -ceq $version) {
+        [IO.File]::Copy($stagedExe, $sourceTestVerifierExe, $true)
+    }
+    else {
+        if (-not (Test-Path -LiteralPath $VerifierDistExe -PathType Leaf) `
+            -or -not (Get-Sha256 $VerifierDistExe).Equals($testVerifierHash, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Pinned local verifier v$testVerifierVersion is unavailable for downstream publisher tests."
+        }
+        [IO.File]::Copy($VerifierDistExe, $sourceTestVerifierExe, $true)
+    }
     [IO.File]::WriteAllText($sourceBootstrapPath, $proposedBootstrap, [Text.UTF8Encoding]::new($false))
     Write-Host 'Prepared the disposable exact-build updater/bootstrap pair for downstream publisher safety tests.'
 
@@ -801,6 +909,16 @@ try {
 
     Copy-Atomically $stagedExe $DistExe
     Write-Host "Installed verified local build output: $DistExe"
+    $stableVerifierVersion = Get-SingleQuotedAssignment $proposedBootstrap 'VerifierVersion'
+    $stableVerifierHash = Get-SingleQuotedAssignment $proposedBootstrap 'ExpectedVerifierSha256'
+    if ($stableVerifierVersion -ceq $version) {
+        Copy-Atomically $stagedExe $VerifierDistExe
+        Write-Host "Installed immutable local verifier artifact: $VerifierDistExe"
+    }
+    elseif (-not (Test-Path -LiteralPath $VerifierDistExe -PathType Leaf) `
+        -or -not (Get-Sha256 $VerifierDistExe).Equals($stableVerifierHash, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Local immutable verifier artifact is missing or does not match bootstrap v$stableVerifierVersion."
+    }
 
     if (-not $GitHubMutation) {
         if ([IO.File]::ReadAllText($BootstrapPath) -cne $proposedBootstrap) {
@@ -808,9 +926,14 @@ try {
             Write-Host "Atomically pinned bootstrap to $tag and updater SHA-256 $updaterSha256."
         }
         else {
-            Write-Host "Bootstrap already pins exact updater build $tag."
+            Write-Host 'Stable bootstrap verifier pin is already current.'
         }
-        Write-Host 'No GitHub mutation was made. Review and commit the updater source, publisher, tests, documentation, and bootstrap before -UploadDraft.'
+        if (-not $DryRun) {
+            Copy-Atomically $stagedChannel $ChannelPath
+            Copy-Atomically $stagedChannelSignature $ChannelSignaturePath
+            Write-Host 'Atomically staged the signed stable updater channel.'
+        }
+        Write-Host 'No GitHub mutation was made. Review and commit the updater source, signed channel, publisher, tests, documentation, and bootstrap before -UploadDraft.'
         exit 0
     }
 
@@ -823,13 +946,13 @@ try {
     $notes = @"
 # Kewz's Cobblemon Updater v$version
 
-Self-contained Windows x64 updater and checksum-pinned one-time Prism bootstrap.
+Self-contained Windows x64 updater and checksum-pinned evergreen Prism bootstrap.
 
 - ``CobbleMusicUpdater.exe`` SHA-256: ``$updaterSha256``
 - ``Bootstrap-CobbleMusicUpdater.ps1`` SHA-256: ``$bootstrapSha256``
 - Source commit: ``$commit``
 
-The bootstrap verifies the exact updater executable before installation. No private signing keys, access tokens, hosting credentials, modpack payloads, or player data are included in this release.
+The permanently pinned bootstrap uses its immutable verifier to authenticate the signed stable updater channel before installing this executable. No private signing keys, access tokens, hosting credentials, modpack payloads, or player data are included in this release.
 "@
     [IO.File]::WriteAllText($notesPath, $notes, [Text.UTF8Encoding]::new($false))
 

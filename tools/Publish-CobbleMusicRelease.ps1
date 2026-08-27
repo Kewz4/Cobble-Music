@@ -75,7 +75,10 @@ $ReleaseOutputRoot = Join-Path $Root 'release-output'
 $CoreModule = Join-Path $PSScriptRoot 'CobbleMusicRelease.Core.psm1'
 $UpdaterBootstrap = Join-Path $Root 'bootstrap\Bootstrap-CobbleMusicUpdater.ps1'
 $PinnedUpdaterExe = Join-Path $Root 'updater\dist\win-x64\CobbleMusicUpdater.exe'
-$RequiredPinnedUpdaterVersion = '1.2.6'
+$PinnedVerifierExe = Join-Path $Root 'updater\verifier\win-x64\CobbleMusicUpdater.exe'
+$UpdaterChannelPath = Join-Path $Root 'updater\channel\stable.json'
+$UpdaterChannelSignaturePath = Join-Path $Root 'updater\channel\stable.sig'
+$RequiredVerifierVersion = '1.2.7'
 $AllowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $MaximumManifestSnapshotBytes = 8MB
 $MaximumSignatureSnapshotBytes = 64KB
@@ -139,17 +142,72 @@ function Get-SingleQuotedBootstrapAssignment([string]$Text, [string]$Name) {
     return $matches[0].Groups['value'].Value
 }
 
-function Get-PinnedUpdaterPin {
+function Get-BootstrapVerifierPin {
     if (-not (Test-Path -LiteralPath $UpdaterBootstrap -PathType Leaf)) { throw "Pinned updater bootstrap was not found: $UpdaterBootstrap" }
     $text = [IO.File]::ReadAllText($UpdaterBootstrap)
-    $version = Get-SingleQuotedBootstrapAssignment $text 'UpdaterVersion'
-    $sha256 = Get-SingleQuotedBootstrapAssignment $text 'ExpectedUpdaterSha256'
-    if ($version -cne $RequiredPinnedUpdaterVersion -or
+    $version = Get-SingleQuotedBootstrapAssignment $text 'VerifierVersion'
+    $sha256 = Get-SingleQuotedBootstrapAssignment $text 'ExpectedVerifierSha256'
+    if ($version -cne $RequiredVerifierVersion -or
         $version -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
-        throw "Bootstrap must pin the supported distributed updater version $RequiredPinnedUpdaterVersion."
+        throw "Bootstrap must pin the supported immutable verifier version $RequiredVerifierVersion."
     }
-    if ($sha256 -cnotmatch '^[0-9A-F]{64}$') { throw 'Bootstrap updater SHA-256 must be canonical uppercase hexadecimal.' }
+    if ($sha256 -cnotmatch '^[0-9A-F]{64}$') { throw 'Bootstrap verifier SHA-256 must be canonical uppercase hexadecimal.' }
     return [pscustomobject]@{ Version = $version; Sha256 = $sha256.ToLowerInvariant() }
+}
+
+function Invoke-PinnedVerifier([string[]]$Arguments) {
+    if (-not (Test-Path -LiteralPath $PinnedVerifierExe -PathType Leaf)) {
+        throw "Immutable verifier artifact was not found: $PinnedVerifierExe"
+    }
+    $pin = Get-BootstrapVerifierPin
+    $stream = [IO.File]::Open($PinnedVerifierExe, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try { $actualHash = [Convert]::ToHexString($hasher.ComputeHash($stream)).ToLowerInvariant() }
+        finally { $hasher.Dispose() }
+        if ($actualHash -cne $pin.Sha256) { throw 'Immutable verifier artifact does not match the bootstrap SHA-256.' }
+        $verifierProductVersion = [string](Get-Item -LiteralPath $PinnedVerifierExe).VersionInfo.ProductVersion
+        if ($verifierProductVersion -cne $pin.Version) {
+            throw 'Immutable verifier ProductVersion does not match the bootstrap pin.'
+        }
+        & $PinnedVerifierExe @Arguments | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw "Pinned verifier failed with exit code $LASTEXITCODE." }
+    }
+    finally { $stream.Dispose() }
+}
+
+function Get-PinnedUpdaterPin {
+    foreach ($path in @($UpdaterChannelPath, $UpdaterChannelSignaturePath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Signed stable updater channel input is missing: $path" }
+    }
+    $channelBytes = [IO.File]::ReadAllBytes($UpdaterChannelPath)
+    $signatureBytes = [IO.File]::ReadAllBytes($UpdaterChannelSignaturePath)
+    if ($channelBytes.Length -gt 16KB -or $signatureBytes.Length -gt 64KB) {
+        throw 'Signed stable updater channel input exceeds its safety limit.'
+    }
+    $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('cobble-music-channel-verify-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
+        $channelSnapshot = Join-Path $temporaryRoot 'stable.json'
+        $signatureSnapshot = Join-Path $temporaryRoot 'stable.sig'
+        $verifiedOutput = Join-Path $temporaryRoot 'verified.json'
+        [IO.File]::WriteAllBytes($channelSnapshot, $channelBytes)
+        [IO.File]::WriteAllBytes($signatureSnapshot, $signatureBytes)
+        Invoke-PinnedVerifier -Arguments @(
+            '--verify-updater-channel', $channelSnapshot,
+            '--signature-file', $signatureSnapshot,
+            '--verified-output', $verifiedOutput
+        )
+        $channel = [IO.File]::ReadAllText($verifiedOutput) | ConvertFrom-Json
+        return [pscustomobject]@{
+            Version = [string]$channel.updaterVersion
+            Sha256 = ([string]$channel.updater.sha256).ToLowerInvariant()
+            Size = [int64]$channel.updater.size
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryRoot) { Remove-Item -LiteralPath $temporaryRoot -Recurse -Force }
+    }
 }
 
 function Assert-PinnedUpdaterStream([IO.FileStream]$Stream) {
@@ -158,12 +216,12 @@ function Assert-PinnedUpdaterStream([IO.FileStream]$Stream) {
     $hasher = [Security.Cryptography.SHA256]::Create()
     try { $actualHash = [Convert]::ToHexString($hasher.ComputeHash($Stream)).ToLowerInvariant() }
     finally { $hasher.Dispose() }
-    if ($actualHash -cne $pin.Sha256) {
-        throw "Pinned updater artifact does not match bootstrap SHA-256: $PinnedUpdaterExe"
+    if ($actualHash -cne $pin.Sha256 -or $Stream.Length -ne $pin.Size) {
+        throw "Distributed updater artifact does not match the signed stable channel: $PinnedUpdaterExe"
     }
     $productVersion = (Get-Item -LiteralPath $PinnedUpdaterExe).VersionInfo.ProductVersion
     if ([string]$productVersion -cne $pin.Version) {
-        throw "Pinned updater artifact ProductVersion does not match bootstrap version: $productVersion / $($pin.Version)"
+        throw "Distributed updater artifact ProductVersion does not match signed channel version: $productVersion / $($pin.Version)"
     }
     return [pscustomobject]@{
         version = $pin.Version
@@ -899,7 +957,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.6'
+            minimumUpdaterVersion = '1.2.7'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             payload = $payloadResult.Payload
             files = @($authoritativeFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
@@ -915,7 +973,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.6'
+            minimumUpdaterVersion = '1.2.7'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             base = [ordered]@{ version = $BaseVersion; manifestSha256 = $baseHash }
             payload = $payloadResult.Payload

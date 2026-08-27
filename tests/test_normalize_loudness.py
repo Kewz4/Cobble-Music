@@ -53,6 +53,14 @@ class PairingTests(unittest.TestCase):
             "assets/cobblemon/sounds/battle/special/bdsp/arceus.ogg",
         )
 
+    def test_known_short_stinger_layout_is_paired(self) -> None:
+        self.assertEqual(
+            "assets/cobblemon/sounds/battle/special/pla/origin.ogg",
+            NORMALIZE.paired_main(
+                "assets/cobblemon/sounds/battle/special/pla/origin_intro.ogg"
+            ),
+        )
+
     def test_non_battle_intro_is_not_grouped(self) -> None:
         self.assertIsNone(NORMALIZE.paired_main("music/route_intro.ogg"))
 
