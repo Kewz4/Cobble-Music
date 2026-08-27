@@ -406,10 +406,31 @@ def set_battle_event_volumes(
     if source_data != output_data:
         fail("Copied Cobblemon sound registry changed before volume standardization")
 
+    summary = summarize_battle_event_volumes(source_data, expected_references)
+    for event_value in output_data.values():
+        if not isinstance(event_value, dict):
+            continue
+        sounds = event_value.get("sounds", [])
+        if not isinstance(sounds, list):
+            continue
+        for sound in sounds:
+            if not isinstance(sound, dict):
+                continue
+            name = str(sound.get("name", ""))
+            if not name.startswith("cobblemon:battle/"):
+                continue
+            sound["volume"] = 1.0
+    write_json(output_path, output_data)
+    return summary
+
+
+def summarize_battle_event_volumes(
+    source_data: dict[str, Any], expected_references: int | None
+) -> dict[str, Any]:
     before: dict[str, int] = {}
     references = 0
     changed = 0
-    for event_value in output_data.values():
+    for event_value in source_data.values():
         if not isinstance(event_value, dict):
             continue
         sounds = event_value.get("sounds", [])
@@ -426,15 +447,12 @@ def set_battle_event_volumes(
             references += 1
             if effective_volume != 1.0 or "volume" not in sound:
                 changed += 1
-            sound["volume"] = 1.0
-
     if references == 0:
         fail("Cobblemon sound registry contains no battle music references")
     if expected_references is not None and references != expected_references:
         fail(
             f"Expected {expected_references} battle sound references, but discovered {references}"
         )
-    write_json(output_path, output_data)
     return {
         "references": references,
         "changedOrMadeExplicit": changed,
@@ -705,6 +723,134 @@ def verify_outputs(
     }
 
 
+def validate_analysis_for_tree(
+    analysis: dict[str, Any],
+    tree_root: Path,
+    files: list[Path],
+    ffmpeg_sha256: str,
+    expected_target: tuple[float, float, float],
+    label: str,
+) -> list[dict[str, Any]]:
+    if str(analysis.get("ffmpegSha256", "")).casefold() != ffmpeg_sha256.casefold():
+        fail(f"{label} analysis report was produced by a different FFmpeg binary")
+    target = analysis.get("target", {})
+    actual_target = (
+        number(target.get("integratedLufs")),
+        number(target.get("truePeakDbtp")),
+        number(target.get("loudnessRangeLu")),
+    )
+    if actual_target != expected_target:
+        fail(
+            f"{label} analysis target {actual_target} does not match requested "
+            f"normalization target {expected_target}"
+        )
+    tracks = list(analysis["tracks"])
+    current_paths = {path.relative_to(tree_root).as_posix() for path in files}
+    report_paths = {str(track["path"]) for track in tracks}
+    if current_paths != report_paths:
+        fail(f"{label} audio inventory changed after its analysis report was created")
+    for track in tracks:
+        current = tree_root / Path(str(track["path"]))
+        if current.stat().st_size != int(track["size"]) or sha256(current) != str(
+            track["sha256"]
+        ):
+            fail(f"{label} audio changed after analysis: {track['path']}")
+    return tracks
+
+
+def existing_output_records(
+    output_root: Path,
+    tracks: list[dict[str, Any]],
+    methods: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for track in tracks:
+        relative = str(track["path"])
+        destination = output_root / Path(relative)
+        if not destination.is_file() or destination.stat().st_size == 0:
+            fail(f"Completed normalized output is missing or empty: {relative}")
+        method = methods[relative]
+        records.append(
+            {
+                "path": relative,
+                "method": method["method"],
+                "appliedGainDb": method.get("appliedGainDb"),
+                "loudnorm": None,
+                "size": destination.stat().st_size,
+                "sha256": sha256(destination),
+            }
+        )
+    return records
+
+
+def build_manifest(
+    ffmpeg_sha256: str,
+    tracks: list[dict[str, Any]],
+    output_analysis: list[dict[str, Any]],
+    normalized: list[dict[str, Any]],
+    methods: dict[str, dict[str, Any]],
+    pairing: dict[str, Any],
+    runtime_volume: dict[str, Any],
+    verification: dict[str, Any],
+    target_lufs: float,
+    true_peak: float,
+    target_lra: float,
+    resumed_after_encoding: bool,
+) -> dict[str, Any]:
+    normalization_by_path = {str(item["path"]): item for item in normalized}
+    output_by_path = {str(item["path"]): item for item in output_analysis}
+    manifest_tracks = []
+    for before in tracks:
+        relative = str(before["path"])
+        manifest_tracks.append(
+            {
+                "path": relative,
+                "method": methods[relative]["method"],
+                "pairedMain": methods[relative].get("main"),
+                "appliedGainDb": methods[relative].get("appliedGainDb"),
+                "input": before,
+                "output": output_by_path[relative],
+                "outputFile": normalization_by_path[relative],
+            }
+        )
+    telemetry = [
+        (item.get("loudnorm") or {}).get("normalizationType") for item in normalized
+    ]
+    return {
+        "schemaVersion": 1,
+        "standard": "EBU R128 / ITU-R BS.1770 (FFmpeg loudnorm)",
+        "target": {
+            "integratedLufs": target_lufs,
+            "truePeakDbtp": true_peak,
+            "loudnessRangeLu": target_lra,
+        },
+        "ffmpegSha256": ffmpeg_sha256,
+        "encoding": {
+            "mp3": "libmp3lame VBR quality 0",
+            "ogg": "libvorbis VBR quality 8",
+            "metadata": "copied from source where supported by the output container",
+        },
+        "processing": {
+            "measuredTwoPass": sum(
+                1 for item in normalized if item["method"] == "measuredTwoPassLoudnorm"
+            ),
+            "sharedBattleSegmentGain": sum(
+                1 for item in normalized if item["method"] == "sharedBattleSegmentGain"
+            ),
+            "twoPassLinear": sum(item == "linear" for item in telemetry),
+            "twoPassDynamic": sum(item == "dynamic" for item in telemetry),
+            "secondPassTelemetryRetained": not resumed_after_encoding,
+            "resumedAfterCompletedEncoding": resumed_after_encoding,
+        },
+        "runtimeVolume": runtime_volume,
+        "sourceSummary": summarize(tracks),
+        "normalizedSummary": summarize(output_analysis),
+        "verification": verification,
+        "battlePairing": pairing,
+        "tracks": manifest_tracks,
+    }
+
+
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".new")
@@ -734,7 +880,7 @@ def validate_ffmpeg(path: str) -> Path:
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("analyze", "normalize"):
+    for name in ("analyze", "normalize", "finalize"):
         command = subparsers.add_parser(name)
         command.add_argument("--source", required=True)
         command.add_argument("--ffmpeg", required=True)
@@ -746,8 +892,10 @@ def arguments() -> argparse.Namespace:
         command.add_argument("--expected-audio-count", type=int)
         command.add_argument("--expected-paired-segments", type=int)
         command.add_argument("--expected-battle-sound-references", type=int)
-        if name == "normalize":
+        if name in ("normalize", "finalize"):
             command.add_argument("--output", required=True)
+        if name == "finalize":
+            command.add_argument("--output-report", required=True)
     return parser.parse_args()
 
 
@@ -812,20 +960,17 @@ def main() -> int:
         print(f"Wrote analysis report: {report_path}", flush=True)
         return 0
 
-    analysis = load_analysis(report_path)
     current_ffmpeg_sha256 = sha256(ffmpeg)
-    if str(analysis.get("ffmpegSha256", "")).casefold() != current_ffmpeg_sha256.casefold():
-        fail("Analysis report was produced by a different FFmpeg binary")
-    target = analysis.get("target", {})
     expected_target = (args.target_lufs, args.true_peak, args.target_lra)
-    actual_target = (
-        number(target.get("integratedLufs")),
-        number(target.get("truePeakDbtp")),
-        number(target.get("loudnessRangeLu")),
+    analysis = load_analysis(report_path)
+    tracks = validate_analysis_for_tree(
+        analysis,
+        source_root,
+        files,
+        current_ffmpeg_sha256,
+        expected_target,
+        "Source",
     )
-    if actual_target != expected_target:
-        fail(f"Analysis target {actual_target} does not match requested normalization target {expected_target}")
-    tracks = list(analysis["tracks"])
     pairing = pairing_summary(tracks)
     if (
         args.expected_paired_segments is not None
@@ -835,18 +980,64 @@ def main() -> int:
             f"Expected {args.expected_paired_segments} paired battle segments, "
             f"but discovered {pairing['pairedSegments']}"
         )
-    current_paths = {path.relative_to(source_root).as_posix() for path in files}
-    if current_paths != {str(track["path"]) for track in tracks}:
-        fail("Source audio inventory changed after the analysis report was created")
-    for track in tracks:
-        source = source_root / Path(str(track["path"]))
-        if source.stat().st_size != int(track["size"]) or sha256(source) != str(track["sha256"]):
-            fail(f"Source audio changed after analysis: {track['path']}")
-
-    output_root = canonical_root(args.output, must_exist=False)
+    output_root = canonical_root(args.output, must_exist=args.command == "finalize")
     if output_root == source_root or source_root in output_root.parents:
         fail("Output must be outside the source pack tree")
     methods = build_methods(tracks, args.target_lufs, args.true_peak)
+
+    if args.command == "finalize":
+        ensure_plain_tree(output_root)
+        output_files = discover_audio(output_root)
+        if args.expected_audio_count is not None and len(output_files) != args.expected_audio_count:
+            fail(
+                f"Expected {args.expected_audio_count} normalized audio files, "
+                f"but discovered {len(output_files)}"
+            )
+        output_report_path = Path(args.output_report).expanduser().resolve()
+        if output_report_path == output_root or output_root in output_report_path.parents:
+            fail("Output analysis report must be outside the normalized pack tree")
+        output_report = load_analysis(output_report_path)
+        output_analysis = validate_analysis_for_tree(
+            output_report,
+            output_root,
+            output_files,
+            current_ffmpeg_sha256,
+            expected_target,
+            "Normalized output",
+        )
+        source_registry_path = source_root / BATTLE_SOUNDS_PATH
+        if not source_registry_path.is_file():
+            fail(f"Cobblemon battle sound registry is missing: {BATTLE_SOUNDS_PATH.as_posix()}")
+        source_registry = json.loads(source_registry_path.read_text(encoding="utf-8"))
+        runtime_volume = summarize_battle_event_volumes(
+            source_registry, args.expected_battle_sound_references
+        )
+        verify_non_audio(source_root, output_root)
+        verify_battle_event_volumes(source_root, output_root, runtime_volume)
+        verification = verify_outputs(
+            tracks, output_analysis, methods, args.target_lufs, args.true_peak
+        )
+        normalized = existing_output_records(output_root, tracks, methods)
+        manifest = build_manifest(
+            current_ffmpeg_sha256,
+            tracks,
+            output_analysis,
+            normalized,
+            methods,
+            pairing,
+            runtime_volume,
+            verification,
+            args.target_lufs,
+            args.true_peak,
+            args.target_lra,
+            True,
+        )
+        write_json(output_root / "LOUDNESS_MANIFEST.json", manifest)
+        print(json.dumps(manifest["normalizedSummary"], indent=2), flush=True)
+        print(json.dumps(verification, indent=2), flush=True)
+        print(f"Finalized existing normalized pack tree: {output_root}", flush=True)
+        return 0
+
     normalized = normalize_all(
         ffmpeg,
         source_root,
@@ -876,61 +1067,20 @@ def main() -> int:
     verify_non_audio(source_root, output_root)
     verify_battle_event_volumes(source_root, output_root, runtime_volume)
     verification = verify_outputs(tracks, output_analysis, methods, args.target_lufs, args.true_peak)
-    normalization_by_path = {str(item["path"]): item for item in normalized}
-    output_by_path = {str(item["path"]): item for item in output_analysis}
-    manifest_tracks = []
-    for before in tracks:
-        relative = str(before["path"])
-        manifest_tracks.append(
-            {
-                "path": relative,
-                "method": methods[relative]["method"],
-                "pairedMain": methods[relative].get("main"),
-                "appliedGainDb": methods[relative].get("appliedGainDb"),
-                "input": before,
-                "output": output_by_path[relative],
-                "outputFile": normalization_by_path[relative],
-            }
-        )
-    manifest = {
-        "schemaVersion": 1,
-        "standard": "EBU R128 / ITU-R BS.1770 (FFmpeg loudnorm)",
-        "target": {
-            "integratedLufs": args.target_lufs,
-            "truePeakDbtp": args.true_peak,
-            "loudnessRangeLu": args.target_lra,
-        },
-        "ffmpegSha256": sha256(ffmpeg),
-        "encoding": {
-            "mp3": "libmp3lame VBR quality 0",
-            "ogg": "libvorbis VBR quality 8",
-            "metadata": "copied from source where supported by the output container",
-        },
-        "processing": {
-            "measuredTwoPass": sum(
-                1 for item in normalized if item["method"] == "measuredTwoPassLoudnorm"
-            ),
-            "sharedBattleSegmentGain": sum(
-                1 for item in normalized if item["method"] == "sharedBattleSegmentGain"
-            ),
-            "twoPassLinear": sum(
-                1
-                for item in normalized
-                if (item.get("loudnorm") or {}).get("normalizationType") == "linear"
-            ),
-            "twoPassDynamic": sum(
-                1
-                for item in normalized
-                if (item.get("loudnorm") or {}).get("normalizationType") == "dynamic"
-            ),
-        },
-        "runtimeVolume": runtime_volume,
-        "sourceSummary": summarize(tracks),
-        "normalizedSummary": summarize(output_analysis),
-        "verification": verification,
-        "battlePairing": pairing,
-        "tracks": manifest_tracks,
-    }
+    manifest = build_manifest(
+        current_ffmpeg_sha256,
+        tracks,
+        output_analysis,
+        normalized,
+        methods,
+        pairing,
+        runtime_volume,
+        verification,
+        args.target_lufs,
+        args.true_peak,
+        args.target_lra,
+        False,
+    )
     write_json(output_root / "LOUDNESS_MANIFEST.json", manifest)
     print(json.dumps(manifest["normalizedSummary"], indent=2), flush=True)
     print(json.dumps(verification, indent=2), flush=True)

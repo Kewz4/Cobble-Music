@@ -134,6 +134,54 @@ class VerificationTests(unittest.TestCase):
                 -1.5,
             )
 
+    def test_existing_output_records_require_every_completed_audio_file(self) -> None:
+        relative = "music/test.mp3"
+        methods = {relative: {"method": "measuredTwoPassLoudnorm"}}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / relative
+            destination.parent.mkdir(parents=True)
+            with self.assertRaisesRegex(RuntimeError, "missing or empty"):
+                NORMALIZE.existing_output_records(root, [track(relative)], methods)
+            destination.write_bytes(b"normalized-audio")
+            records = NORMALIZE.existing_output_records(root, [track(relative)], methods)
+            self.assertEqual(records[0]["size"], len(b"normalized-audio"))
+            self.assertEqual(records[0]["method"], "measuredTwoPassLoudnorm")
+
+    def test_analysis_tree_validation_rejects_post_report_tampering(self) -> None:
+        relative = "music/test.mp3"
+        expected_target = (-16.0, -1.5, 11.0)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            audio = root / relative
+            audio.parent.mkdir(parents=True)
+            audio.write_bytes(b"first")
+            report_track = track(relative)
+            report_track.update(
+                {
+                    "size": audio.stat().st_size,
+                    "sha256": NORMALIZE.sha256(audio),
+                }
+            )
+            analysis = {
+                "ffmpegSha256": "abc123",
+                "target": {
+                    "integratedLufs": -16.0,
+                    "truePeakDbtp": -1.5,
+                    "loudnessRangeLu": 11.0,
+                },
+                "tracks": [report_track],
+            }
+            validated = NORMALIZE.validate_analysis_for_tree(
+                analysis, root, [audio], "abc123", expected_target, "Fixture"
+            )
+            self.assertEqual(validated[0]["path"], relative)
+            audio.write_bytes(b"tampered")
+            with self.assertRaisesRegex(RuntimeError, "changed after analysis"):
+                NORMALIZE.validate_analysis_for_tree(
+                    analysis, root, [audio], "abc123", expected_target, "Fixture"
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
