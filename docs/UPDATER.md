@@ -415,6 +415,22 @@ updater state must itself match the exact signed base version/hash/inventory:
   -SourceMinecraftDir $source
 ```
 
+There is one deliberate exception: the first release that moves a path from
+managed `files` into player-owned `seedFiles` must be a full schema-v1
+baseline. A delta would otherwise describe the old managed path as a deletion.
+The schema-v1 updater path excludes seeds from cleanup, preserves any existing
+player copy, and records only the remaining immutable files in the new state.
+The publisher rejects a delta that attempts this ownership transition. For
+example, the 1.0.6 settings/Axiom ownership migration is staged with:
+
+```powershell
+.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.6 -FullBaseline `
+  -SourceMinecraftDir $source
+```
+
+After that baseline has established the new ownership model, later releases
+can return to schema-v2 deltas.
+
 To use reviewed local copies of the base assets, supply both paths:
 
 ```powershell

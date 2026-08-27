@@ -894,6 +894,13 @@ try {
         $deletedFiles = @()
     }
     else {
+        $ownershipTransitions = @($baseFiles | Where-Object {
+            $seedSet.ByKey.ContainsKey((Get-CobblePathKey $_.path))
+        })
+        if ($ownershipTransitions.Count -gt 0) {
+            $paths = @($ownershipTransitions | ForEach-Object { $_.path }) -join ', '
+            throw "A signed-base managed file is becoming a player-owned seed ($paths). Publish this ownership transition with -FullBaseline so existing player files are preserved instead of deleted."
+        }
         $deltaPlan = New-CobbleDeltaPlan -CurrentFiles @($currentSet.Entries) -BaseFiles $baseFiles
         $authoritativeFiles = @($deltaPlan.Files)
         $payloadFiles = @($deltaPlan.PayloadFiles)
