@@ -509,11 +509,10 @@ function Get-ExactReleaseSnapshotById([int64]$ReleaseId, [string]$Tag, [Validate
     }
 }
 
-function Wait-GitHubAssetFinalization(
+function Wait-GitHubAssetInventoryFinalization(
     [int64]$ReleaseId,
     [string]$Tag,
     [object[]]$ExpectedAssets,
-    [string]$AssetName,
     [int]$MaximumAttempts = 60
 ) {
     if ($MaximumAttempts -lt 1) { throw 'MaximumAttempts must be positive.' }
@@ -522,32 +521,21 @@ function Wait-GitHubAssetFinalization(
         $snapshot = Get-ExactReleaseSnapshotById -ReleaseId $ReleaseId -Tag $Tag -State 'draft'
         $assets = @($snapshot.Assets)
         $starters = @(Get-CobbleRepairableStarterAssets -ExpectedAssets $ExpectedAssets -RemoteAssets $assets)
-        $named = @($assets | Where-Object { [string]$_.name -ceq $AssetName })
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($asset in $assets) { $seen.Add([string]$asset.name) | Out-Null }
+        $missing = @($ExpectedAssets | Where-Object { -not $seen.Contains([string]$_.name) })
 
-        if ($named.Count -gt 1) { throw "GitHub draft contains duplicate exact-name assets while finalizing: $AssetName" }
-        if ($named.Count -eq 1 -and [string]$named[0].state -ceq 'uploaded') {
-            $missing = @(Assert-CobbleRemoteAssetInventory -ExpectedAssets $ExpectedAssets -RemoteAssets $assets)
-            if ($missing -contains $AssetName) { throw "GitHub finalized asset was not accepted by the signed inventory: $AssetName" }
+        if ($starters.Count -eq 0 -and $missing.Count -eq 0) {
+            Assert-CobbleRemoteAssetInventory -ExpectedAssets $ExpectedAssets -RemoteAssets $assets -RequireComplete | Out-Null
             return $snapshot
         }
 
-        if ($named.Count -eq 1) {
-            if ([string]$named[0].state -cne 'starter') {
-                throw "GitHub asset entered an unsupported state while finalizing: $AssetName ($($named[0].state))"
-            }
-            $otherStarters = @($starters | Where-Object { [string]$_.name -cne $AssetName })
-            if ($otherStarters.Count -gt 0) {
-                throw "Another unfinished GitHub asset blocks sequential finalization: $($otherStarters.name -join ', ')"
-            }
-        }
-
         if ($attempt -eq $MaximumAttempts) {
-            $state = if ($named.Count -eq 0) { 'missing' } else { [string]$named[0].state }
-            throw "GitHub did not finalize asset within the bounded wait: $AssetName ($state)"
+            throw "GitHub did not finalize the exact asset inventory within the bounded wait ($($starters.Count) starter; $($missing.Count) missing)."
         }
         Start-Sleep -Milliseconds ([Math]::Min(2000, 250 * $attempt))
     }
-    throw "GitHub asset finalization did not complete: $AssetName"
+    throw 'GitHub asset inventory finalization did not complete.'
 }
 
 function Get-PublishedStableReleaseSnapshot([string]$Tag, [string]$Description) {
@@ -723,24 +711,15 @@ function Publish-StagedRelease(
     if ($missing.Count -gt 0) {
         $expectedByName = @{}
         foreach ($asset in $expected) { $expectedByName[$asset.name] = $asset }
-        Write-Host "Uploading $($missing.Count) missing asset(s) to persistent draft $tag, one finalized asset at a time. Completed matching assets will be reused on -ResumePublish."
-        foreach ($missingName in $missing) {
-            # Reverify the locked signed identity and exact draft immediately
-            # before every upload mutation. A concurrent completed upload is
-            # reused instead of overwritten.
-            Assert-ManifestSignatureIdentity $StagedIdentity | Out-Null
-            $current = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'draft'
-            $remaining = @(Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($current.Assets))
-            if ($remaining -notcontains $missingName) {
-                Write-Host "Reusing concurrently finalized asset: $missingName"
-                continue
-            }
-
-            $uploadPath = [string]$expectedByName[$missingName].path
-            Write-Host "Uploading and finalizing asset: $missingName"
+        Assert-ManifestSignatureIdentity $StagedIdentity | Out-Null
+        $current = Get-ExactReleaseSnapshotById -ReleaseId $releaseId -Tag $tag -State 'draft'
+        $missing = @(Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($current.Assets))
+        if ($missing.Count -gt 0) {
+            $uploadPaths = @($missing | ForEach-Object { $expectedByName[$_].path })
+            Write-Host "Uploading $($uploadPaths.Count) missing asset(s) concurrently to persistent draft $tag. Completed matching assets will be reused on -ResumePublish."
             try {
-                Invoke-NativeHost -Command 'gh' -Arguments @('release', 'upload', $tag, '--repo', $Repository, $uploadPath)
-                Wait-GitHubAssetFinalization -ReleaseId $releaseId -Tag $tag -ExpectedAssets $expected -AssetName $missingName | Out-Null
+                Invoke-NativeHost -Command 'gh' -Arguments (@('release', 'upload', $tag, '--repo', $Repository) + $uploadPaths)
+                Wait-GitHubAssetInventoryFinalization -ReleaseId $releaseId -Tag $tag -ExpectedAssets $expected | Out-Null
             }
             catch { throw "$($_.Exception.Message)`nThe draft was preserved. After any active GitHub upload settles, rerun this version with -ResumePublish -ConfirmDistributionRights." }
         }
