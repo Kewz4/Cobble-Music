@@ -942,11 +942,37 @@ function Test-CobblePaginationHasNextPage {
 function Assert-CobblePayloadZipInventory {
     param(
         [Parameter(Mandatory)][string]$ZipPath,
-        [Parameter(Mandatory)][object[]]$ExpectedFiles
+        [Parameter(Mandatory)][object[]]$ExpectedFiles,
+        [AllowEmptyCollection()][object[]]$ExpectedSeedFiles = @()
     )
 
     if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw "Payload ZIP was not found: $ZipPath" }
-    $expected = ConvertTo-CobbleFileRecordSet -Entries $ExpectedFiles -Context 'payload ZIP expected files'
+    $declaredSeeds = ConvertTo-CobbleSeedFileRecordSet -Entries $ExpectedSeedFiles -Context 'payload ZIP declared seed files'
+    $managedEntries = @($ExpectedFiles | Where-Object {
+        -not $declaredSeeds.ByKey.ContainsKey((Get-CobblePathKey ([string]$_.path)))
+    })
+    $seedEntries = @($ExpectedFiles | Where-Object {
+        $declaredSeeds.ByKey.ContainsKey((Get-CobblePathKey ([string]$_.path)))
+    })
+    $managed = ConvertTo-CobbleFileRecordSet -Entries $managedEntries -Context 'payload ZIP expected managed files' -AllowEmpty
+    $seeds = ConvertTo-CobbleSeedFileRecordSet -Entries $seedEntries -Context 'payload ZIP expected seed files'
+    if ($seeds.Entries.Count -ne $declaredSeeds.Entries.Count) {
+        throw 'Payload ZIP expected files do not contain the exact declared seed inventory.'
+    }
+    foreach ($seed in $declaredSeeds.Entries) {
+        $key = Get-CobblePathKey $seed.path
+        if (-not $seeds.ByKey.ContainsKey($key) -or -not (Test-CobbleSameFileRecord $seed $seeds.ByKey[$key])) {
+            throw "Payload ZIP declared seed identity differs from its expected file: $($seed.path)"
+        }
+    }
+    $expectedByKey = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    foreach ($entry in @($managed.Entries) + @($seeds.Entries)) {
+        $key = Get-CobblePathKey $entry.path
+        if (-not $expectedByKey.TryAdd($key, $entry)) {
+            throw "Payload ZIP expected managed and seed files overlap: $($entry.path)"
+        }
+    }
+    $expectedEntries = @($expectedByKey.Values)
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $fileStream = [IO.File]::Open($ZipPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
@@ -955,12 +981,17 @@ function Assert-CobblePayloadZipInventory {
             foreach ($entry in $archive.Entries) {
                 $path = [string]$entry.FullName
                 if ([string]::IsNullOrWhiteSpace([string]$entry.Name)) { throw "Payload ZIP contains a directory or unnamed entry: $path" }
-                Assert-CobbleManagedPath -Path $path -Context 'payload ZIP entry' | Out-Null
                 $key = Get-CobblePathKey $path
+                if ($declaredSeeds.ByKey.ContainsKey($key)) {
+                    Assert-CobbleSeedPathPolicy -Path $path -Context 'payload ZIP seed entry' | Out-Null
+                }
+                else {
+                    Assert-CobbleManagedPath -Path $path -Context 'payload ZIP managed entry' | Out-Null
+                }
                 if (-not $seen.Add($key)) { throw "Payload ZIP contains a duplicate or case/Unicode-colliding entry: $path" }
-                if (-not $expected.ByKey.ContainsKey($key)) { throw "Payload ZIP contains an unexpected entry: $path" }
+                if (-not $expectedByKey.ContainsKey($key)) { throw "Payload ZIP contains an unexpected entry: $path" }
 
-                $wanted = $expected.ByKey[$key]
+                $wanted = $expectedByKey[$key]
                 if ($path -cne $wanted.path -or [int64]$entry.Length -ne $wanted.size) {
                     throw "Payload ZIP path/size does not match the inventoried source: $path"
                 }
@@ -978,7 +1009,7 @@ function Assert-CobblePayloadZipInventory {
     }
     finally { $fileStream.Dispose() }
 
-    $missing = @($expected.Entries | Where-Object { -not $seen.Contains((Get-CobblePathKey $_.path)) })
+    $missing = @($expectedEntries | Where-Object { -not $seen.Contains((Get-CobblePathKey $_.path)) })
     if ($missing.Count -gt 0) { throw "Payload ZIP is missing inventoried files: $($missing.path -join ', ')" }
     return $true
 }

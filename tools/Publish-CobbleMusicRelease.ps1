@@ -370,7 +370,10 @@ function Split-ReleaseFile([string]$Source, [string]$DestinationRoot, [int64]$Ch
     return @($parts)
 }
 
-function New-PayloadParts([object[]]$PayloadFiles) {
+function New-PayloadParts(
+    [object[]]$PayloadFiles,
+    [object[]]$PayloadSeedFiles = @()
+) {
     if ($PayloadFiles.Count -eq 0) {
         Assert-CobbleReleaseAssetCount -PayloadPartCount 0 | Out-Null
         return [pscustomobject]@{ Payload = $null; Parts = @(); Size = 0 }
@@ -407,7 +410,8 @@ function New-PayloadParts([object[]]$PayloadFiles) {
             if ($LASTEXITCODE -ne 0) { throw "7-Zip failed with exit code $LASTEXITCODE" }
         }
         finally { Pop-Location }
-        Assert-CobblePayloadZipInventory -ZipPath $payloadPath -ExpectedFiles $PayloadFiles | Out-Null
+        Assert-CobblePayloadZipInventory -ZipPath $payloadPath -ExpectedFiles $PayloadFiles `
+            -ExpectedSeedFiles $PayloadSeedFiles | Out-Null
     }
     catch {
         if (Test-Path -LiteralPath $payloadPath -PathType Leaf) {
@@ -943,7 +947,7 @@ try {
     $legacyCleanup = Read-LegacyCleanupManifest $LegacyCleanupManifest $forbiddenCleanupPaths
     New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
     Assert-Under $OutputRoot $ReleaseOutputRoot
-    $payloadResult = New-PayloadParts $archiveFiles
+    $payloadResult = New-PayloadParts -PayloadFiles $archiveFiles -PayloadSeedFiles @($seedSet.Entries)
 
     $manifest = if ($FullBaseline) {
         [ordered]@{

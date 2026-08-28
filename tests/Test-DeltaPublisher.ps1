@@ -457,6 +457,27 @@ try {
     Assert-Throws { Assert-CobblePayloadZipInventory -ZipPath $zipPath -ExpectedFiles $wrongPathInventory } 'ZIP unexpected/missing entry set was accepted.'
     $missingEntryInventory = @($zipExpected) + @([pscustomobject]@{ path = 'mods/missing.txt'; size = 1; sha256 = (New-Hash '7') })
     Assert-Throws { Assert-CobblePayloadZipInventory -ZipPath $zipPath -ExpectedFiles $missingEntryInventory } 'ZIP missing an inventoried entry was accepted.'
+
+    $seedZipPath = Join-Path $zipTestRoot 'seed-payload.zip'
+    $seedContent = [Text.Encoding]::UTF8.GetBytes('initial player settings')
+    $seedZipStream = [IO.File]::Open($seedZipPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        $seedZip = [IO.Compression.ZipArchive]::new($seedZipStream, [IO.Compression.ZipArchiveMode]::Create, $true)
+        try {
+            $seedEntry = $seedZip.CreateEntry('options.txt')
+            $seedEntryStream = $seedEntry.Open()
+            try { $seedEntryStream.Write($seedContent, 0, $seedContent.Length) }
+            finally { $seedEntryStream.Dispose() }
+        }
+        finally { $seedZip.Dispose() }
+    }
+    finally { $seedZipStream.Dispose() }
+    $seedHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($seedContent)).ToLowerInvariant()
+    $seedExpected = @([pscustomobject]@{ path = 'options.txt'; size = $seedContent.Length; sha256 = $seedHash })
+    Assert-True (Assert-CobblePayloadZipInventory -ZipPath $seedZipPath -ExpectedFiles $seedExpected -ExpectedSeedFiles $seedExpected) 'Declared create-only options seed was rejected from the exact ZIP inventory.'
+    Assert-Throws { Assert-CobblePayloadZipInventory -ZipPath $seedZipPath -ExpectedFiles $seedExpected } 'Undeclared top-level options file was accepted as a managed payload.'
+    $wrongSeedIdentity = @([pscustomobject]@{ path = 'options.txt'; size = $seedContent.Length; sha256 = (New-Hash '6') })
+    Assert-Throws { Assert-CobblePayloadZipInventory -ZipPath $seedZipPath -ExpectedFiles $seedExpected -ExpectedSeedFiles $wrongSeedIdentity } 'Declared seed identity mismatch was accepted.'
 }
 finally {
     if ([IO.Directory]::Exists($zipTestRoot)) { [IO.Directory]::Delete($zipTestRoot, $true) }
