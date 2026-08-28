@@ -840,6 +840,8 @@ try {
         [IO.File]::Copy($VerifierDistExe, $sourceTestVerifierExe, $true)
     }
     [IO.File]::WriteAllText($sourceBootstrapPath, $proposedBootstrap, [Text.UTF8Encoding]::new($false))
+    [IO.File]::Copy($stagedChannel, $sourceChannelPath, $true)
+    [IO.File]::Copy($stagedChannelSignature, $sourceChannelSignaturePath, $true)
     Write-Host 'Prepared the disposable exact-build updater/bootstrap pair for downstream publisher safety tests.'
 
     $ordinaryTests = @(Get-ChildItem -LiteralPath (Join-Path $sourceRoot 'tests') -Filter 'Test-*.ps1' -File |
