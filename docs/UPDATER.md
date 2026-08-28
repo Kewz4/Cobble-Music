@@ -324,6 +324,19 @@ running. The bootstrap's `-PrismPreLaunch` mode writes only its own
 finish. This avoids racing Prism's in-memory settings while still making the
 very first Play perform the pack update.
 
+### Existing 1.0.5 players
+
+Release 1.0.5 installed updater 1.2.3 and a short pre-launch command that runs
+the local EXE directly. That updater predates the signed stable updater channel
+and cannot replace itself. A 1.0.5 player must therefore replace the entire old
+`"$INST_MC_DIR/cobble-music-updater/CobbleMusicUpdater.exe" ...` entry with the
+current release-generated `powershell.exe ... -EncodedCommand ...` line once.
+
+On the next Play, the permanent command verifies and installs updater 1.2.7,
+then applies the signed 1.0.6 baseline. The player does not need to delete the
+old updater, reinstall the Prism instance, or change the command again for
+ordinary future updater releases.
+
 Generate the exact friend-facing command only after the updater release
 bootstrap has its final checksum:
 
@@ -603,15 +616,22 @@ mapping from a reviewed known baseline, not guesses about a friend’s disk.
 
 ## Friend installation and updater-binary upgrades
 
-Give friends only the compiled EXE and approved setup/configuration—never the
-private signing seed. Their Prism instance must be writable; a user-writable
-Prism location is easiest.
+Give friends only the release-generated permanent command and approved setup
+instructions—never the private signing seed. Their Prism instance must be
+writable; a user-writable Prism location is easiest.
 
-This updater updates the signed **modpack payload**, not its own running EXE.
-If a future release requires a newer updater binary, publish a new bootstrap
-asset with a new pinned EXE checksum and have players run that one-time
-bootstrap again. Older clients safely keep launching their last known-good
-pack rather than applying a format they cannot verify.
+The updater cannot replace its own running EXE, so the immutable bootstrap runs
+first and owns updater-binary upgrades. For an ordinary updater release,
+publish the newer immutable updater asset and atomically advance the signed
+stable channel descriptor and signature. Existing permanent commands fetch
+that channel on Play, authenticate its version, release tag, byte length, and
+SHA-256 with the pinned verifier, then atomically replace the runnable EXE
+before starting it. Players do not change their Prism command.
+
+A signing-key or verifier trust-root rotation, or an incompatible stable-channel
+protocol change, is a deliberate migration and may require a new permanent
+command. If channel retrieval or verification fails, clients retain and run
+their last verified compatible updater instead of adopting untrusted bytes.
 
 ## Claude workflow
 
