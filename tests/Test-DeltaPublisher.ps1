@@ -599,6 +599,15 @@ Assert-True ($null -ne $waitReleaseFunction -and
     $waitReleaseFunction.Extent.Text.Contains('Get-GitHubReleaseByTag $Tag', [StringComparison]::Ordinal) -and
     $waitReleaseFunction.Extent.Text.Contains('Start-Sleep -Milliseconds', [StringComparison]::Ordinal)) 'Draft creation lost its bounded eventual-consistency lookup.'
 Assert-True ($publishFunctionText.Contains('Wait-GitHubReleaseByTag $tag', [StringComparison]::Ordinal)) 'Draft creation does not use the bounded release lookup.'
+$waitAssetFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Wait-GitHubAssetFinalization' }, $true)
+Assert-True ($null -ne $waitAssetFunction -and
+    $waitAssetFunction.Extent.Text.Contains('Get-ExactReleaseSnapshotById', [StringComparison]::Ordinal) -and
+    $waitAssetFunction.Extent.Text.Contains('Get-CobbleRepairableStarterAssets', [StringComparison]::Ordinal) -and
+    $waitAssetFunction.Extent.Text.Contains('Assert-CobbleRemoteAssetInventory', [StringComparison]::Ordinal) -and
+    $waitAssetFunction.Extent.Text.Contains('Start-Sleep -Milliseconds', [StringComparison]::Ordinal)) 'Per-asset upload finalization lost its bounded exact-inventory wait.'
+Assert-True ($publishFunctionText.Contains('foreach ($missingName in $missing)', [StringComparison]::Ordinal) -and
+    $publishFunctionText.Contains("@('release', 'upload', `$tag, '--repo', `$Repository, `$uploadPath)", [StringComparison]::Ordinal) -and
+    -not $publishFunctionText.Contains('+ $uploadPaths', [StringComparison]::Ordinal)) 'Release payload assets are not uploaded sequentially.'
 $patchIndex = $publishFunctionText.IndexOf("'draft=false'", [StringComparison]::Ordinal)
 $patchCallStartIndex = $publishFunctionText.IndexOf("Invoke-GhJson -Arguments @('api', '--method', 'PATCH'", [StringComparison]::Ordinal)
 $finalUpdaterCheckIndex = $publishFunctionText.LastIndexOf('Assert-PublishedPinnedUpdater', [StringComparison]::Ordinal)
