@@ -50,6 +50,8 @@ param(
     [switch]$Publish,
     [switch]$ResumePublish,
     [switch]$RepairStaleUploads,
+    [ValidateRange(1, 4)]
+    [int]$UploadProcessCount = 1,
     [switch]$ConfirmDistributionRights
 )
 
@@ -113,6 +115,56 @@ function Invoke-NativeHost {
 
     & $Command @Arguments | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "$Command failed with exit code $LASTEXITCODE." }
+}
+
+function Invoke-GhReleaseUploadBatches(
+    [string]$Tag,
+    [string]$RepositoryName,
+    [string[]]$UploadPaths,
+    [ValidateRange(1, 4)][int]$ProcessCount
+) {
+    if ($UploadPaths.Count -eq 0) { return }
+    $workerCount = [Math]::Min($ProcessCount, $UploadPaths.Count)
+    if ($workerCount -eq 1) {
+        Invoke-NativeHost -Command 'gh' -Arguments (@('release', 'upload', $Tag, '--repo', $RepositoryName) + $UploadPaths)
+        return
+    }
+
+    $pathGroups = [object[]]::new($workerCount)
+    for ($worker = 0; $worker -lt $workerCount; $worker++) {
+        $pathGroups[$worker] = [Collections.Generic.List[string]]::new()
+    }
+    for ($index = 0; $index -lt $UploadPaths.Count; $index++) {
+        $pathGroups[$index % $workerCount].Add($UploadPaths[$index])
+    }
+    $workItems = @(
+        for ($worker = 0; $worker -lt $workerCount; $worker++) {
+            [pscustomobject]@{
+                Worker = $worker + 1
+                Arguments = [string[]](@('release', 'upload', $Tag, '--repo', $RepositoryName) + $pathGroups[$worker].ToArray())
+            }
+        }
+    )
+
+    $results = @($workItems | ForEach-Object -Parallel {
+        $arguments = [string[]]$_.Arguments
+        $lines = @(& gh @arguments 2>&1)
+        [pscustomobject]@{
+            Worker = [int]$_.Worker
+            ExitCode = [int]$LASTEXITCODE
+            Output = (($lines | ForEach-Object { [string]$_ }) -join [Environment]::NewLine)
+        }
+    } -ThrottleLimit $workerCount)
+
+    foreach ($result in @($results | Sort-Object Worker)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$result.Output)) {
+            Write-Host "gh upload worker $($result.Worker):`n$($result.Output)"
+        }
+    }
+    $failed = @($results | Where-Object ExitCode -NE 0)
+    if ($failed.Count -gt 0) {
+        throw "gh release upload worker(s) failed: $($failed.Worker -join ', ')"
+    }
 }
 
 function Invoke-GhJson {
@@ -716,9 +768,9 @@ function Publish-StagedRelease(
         $missing = @(Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($current.Assets))
         if ($missing.Count -gt 0) {
             $uploadPaths = @($missing | ForEach-Object { $expectedByName[$_].path })
-            Write-Host "Uploading $($uploadPaths.Count) missing asset(s) concurrently to persistent draft $tag. Completed matching assets will be reused on -ResumePublish."
+            Write-Host "Uploading $($uploadPaths.Count) missing asset(s) through $UploadProcessCount gh process(es) to persistent draft $tag. Completed matching assets will be reused on -ResumePublish."
             try {
-                Invoke-NativeHost -Command 'gh' -Arguments (@('release', 'upload', $tag, '--repo', $Repository) + $uploadPaths)
+                Invoke-GhReleaseUploadBatches -Tag $tag -RepositoryName $Repository -UploadPaths $uploadPaths -ProcessCount $UploadProcessCount
                 Wait-GitHubAssetInventoryFinalization -ReleaseId $releaseId -Tag $tag -ExpectedAssets $expected | Out-Null
             }
             catch { throw "$($_.Exception.Message)`nThe draft was preserved. After any active GitHub upload settles, rerun this version with -ResumePublish -ConfirmDistributionRights." }

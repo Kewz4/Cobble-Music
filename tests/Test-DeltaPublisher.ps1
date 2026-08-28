@@ -605,8 +605,43 @@ Assert-True ($null -ne $waitAssetFunction -and
     $waitAssetFunction.Extent.Text.Contains('Get-CobbleRepairableStarterAssets', [StringComparison]::Ordinal) -and
     $waitAssetFunction.Extent.Text.Contains('Assert-CobbleRemoteAssetInventory', [StringComparison]::Ordinal) -and
     $waitAssetFunction.Extent.Text.Contains('Start-Sleep -Milliseconds', [StringComparison]::Ordinal)) 'Concurrent upload finalization lost its bounded exact-inventory wait.'
-Assert-True ($publishFunctionText.Contains('+ $uploadPaths', [StringComparison]::Ordinal) -and
+Assert-True ($publishFunctionText.Contains('Invoke-GhReleaseUploadBatches', [StringComparison]::Ordinal) -and
     $publishFunctionText.Contains('Wait-GitHubAssetInventoryFinalization', [StringComparison]::Ordinal)) 'Release payload assets do not use concurrent resumable upload plus bounded finalization.'
+$uploadBatchFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-GhReleaseUploadBatches' }, $true)
+Assert-True ($null -ne $uploadBatchFunction -and
+    $uploadBatchFunction.Extent.Text.Contains('ForEach-Object -Parallel', [StringComparison]::Ordinal) -and
+    $uploadBatchFunction.Extent.Text.Contains('-ThrottleLimit $workerCount', [StringComparison]::Ordinal) -and
+    $uploadBatchFunction.Extent.Text.Contains('$index % $workerCount', [StringComparison]::Ordinal)) 'Multi-process upload lost its bounded disjoint worker partitioning.'
+Assert-True ($publishFunctionText.Contains('-ProcessCount $UploadProcessCount', [StringComparison]::Ordinal)) 'Publisher does not pass the validated upload process count to the batch uploader.'
+$uploadWorkerRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-upload-workers-$([Guid]::NewGuid().ToString('N'))"
+$uploadWorkerBin = Join-Path $uploadWorkerRoot 'bin'
+$uploadWorkerLog = Join-Path $uploadWorkerRoot 'log'
+$oldPath = $env:PATH
+$oldFakeGhLog = $env:FAKE_GH_LOG
+try {
+    [IO.Directory]::CreateDirectory($uploadWorkerBin) | Out-Null
+    [IO.Directory]::CreateDirectory($uploadWorkerLog) | Out-Null
+    [IO.File]::WriteAllText(
+        (Join-Path $uploadWorkerBin 'gh.cmd'),
+        "@echo off`r`n> `"%FAKE_GH_LOG%\%~nx6.log`" echo %*`r`nexit /b 0`r`n",
+        [Text.UTF8Encoding]::new($false))
+    $env:FAKE_GH_LOG = $uploadWorkerLog
+    $env:PATH = "$uploadWorkerBin$([IO.Path]::PathSeparator)$oldPath"
+    . ([scriptblock]::Create($uploadBatchFunction.Extent.Text))
+    $fixtureAssets = @('asset1.part', 'asset2.part', 'asset3.part', 'asset4.part', 'asset5.part', 'asset6.part', 'asset7.part')
+    Invoke-GhReleaseUploadBatches -Tag 'fixture-v1' -RepositoryName 'owner/repo' -UploadPaths $fixtureAssets -ProcessCount 3
+    $workerLogs = @(Get-ChildItem -LiteralPath $uploadWorkerLog -File)
+    Assert-True ($workerLogs.Count -eq 3) 'Multi-process upload did not launch the requested bounded worker count.'
+    $tokens = @($workerLogs | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw).Trim() -split '\s+' })
+    foreach ($fixtureAsset in $fixtureAssets) {
+        Assert-True (@($tokens | Where-Object { $_ -ceq $fixtureAsset }).Count -eq 1) "Multi-process upload did not assign exactly one worker to $fixtureAsset."
+    }
+}
+finally {
+    $env:PATH = $oldPath
+    $env:FAKE_GH_LOG = $oldFakeGhLog
+    if ([IO.Directory]::Exists($uploadWorkerRoot)) { [IO.Directory]::Delete($uploadWorkerRoot, $true) }
+}
 $patchIndex = $publishFunctionText.IndexOf("'draft=false'", [StringComparison]::Ordinal)
 $patchCallStartIndex = $publishFunctionText.IndexOf("Invoke-GhJson -Arguments @('api', '--method', 'PATCH'", [StringComparison]::Ordinal)
 $finalUpdaterCheckIndex = $publishFunctionText.LastIndexOf('Assert-PublishedPinnedUpdater', [StringComparison]::Ordinal)
