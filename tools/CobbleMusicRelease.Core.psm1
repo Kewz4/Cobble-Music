@@ -1200,6 +1200,7 @@ function Assert-CobbleRemoteAssetInventory {
 
 Export-ModuleMember -Function @(
     'Get-CobbleOptionalPropertyValue',
+    'Get-CobblePathKey',
     'Assert-CobbleManagedPath',
     'Assert-CobbleSourcePathPolicy',
     'Assert-CobbleSeedPathPolicy',

@@ -16,6 +16,8 @@ function Assert-True([bool]$Condition, [string]$Message) {
     if (-not $Condition) { throw $Message }
 }
 
+Assert-True ($null -ne (Get-Command Get-CobblePathKey -ErrorAction SilentlyContinue)) 'The publisher path-key helper is not exported from the release core module.'
+
 function Assert-Throws([scriptblock]$Action, [string]$Message) {
     try { & $Action; throw "Expected failure did not occur: $Message" }
     catch {
