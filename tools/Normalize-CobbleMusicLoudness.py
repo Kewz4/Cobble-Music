@@ -7,7 +7,9 @@ an auditable JSON report.  Long tracks use measured two-pass normalization.
 Battle intro/loop segments and their matching main theme receive one shared
 constant gain so a stitched battle cue cannot jump at the boundary.  This
 covers both legacy ``intro/name-intro.ogg`` layouts and the pack's newer
-``name_intro.ogg`` sibling layout.
+``name_intro.ogg`` sibling layout.  The ``repair-peaks`` command provides an
+audited, transactional retry for the rare libvorbis stream whose decoded peak
+exceeds the post-encode verification limit.
 """
 
 from __future__ import annotations
@@ -34,6 +36,10 @@ LOUDNORM_JSON = re.compile(r'\{\s*"input_i"\s*:.*?\}', re.DOTALL)
 DURATION = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
 AUDIO_STREAM = re.compile(r"Stream #.*?Audio:.*?,\s*(\d+)\s*Hz,\s*([^,]+)")
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+TRUE_PEAK_TOLERANCE_DB = 0.50
+VORBIS_PEAK_REPAIR_NUDGE_DB = -0.01
+LINEAR_TARGET_TOLERANCE_LU = 0.50
+DYNAMIC_TARGET_UNDERSHOOT_TOLERANCE_LU = 1.50
 
 
 def fail(message: str) -> NoReturn:
@@ -470,6 +476,7 @@ def normalize_one(
     target_lufs: float,
     true_peak: float,
     target_lra: float,
+    post_filter_gain_db: float = 0.0,
 ) -> dict[str, Any]:
     relative = str(track["path"])
     source = source_root / Path(relative)
@@ -479,6 +486,8 @@ def normalize_one(
         audio_filter = f"volume={float(method['appliedGainDb']):.6f}dB:precision=double"
     else:
         audio_filter = measured_filter(track, target_lufs, true_peak, target_lra)
+    if post_filter_gain_db:
+        audio_filter += f",volume={post_filter_gain_db:.6f}dB:precision=double"
 
     suffix = source.suffix.lower()
     # This is an unavoidable lossy-to-lossy generation.  Use the encoders'
@@ -545,6 +554,146 @@ def normalize_one(
         "size": destination.stat().st_size,
         "sha256": sha256(destination),
     }
+
+
+def peak_repair_candidates(
+    output_tracks: list[dict[str, Any]], true_peak: float
+) -> list[dict[str, Any]]:
+    threshold = true_peak + TRUE_PEAK_TOLERANCE_DB
+    candidates = [
+        track
+        for track in output_tracks
+        if float(track["input_tp"]) > threshold
+    ]
+    unsupported = [
+        str(track["path"])
+        for track in candidates
+        if Path(str(track["path"])).suffix.lower() != ".ogg"
+    ]
+    if unsupported:
+        fail(
+            "Automatic encoded-peak repair is restricted to verified Vorbis "
+            "outliers:\n" + "\n".join(unsupported)
+        )
+    return candidates
+
+
+def repair_encoded_vorbis_peaks(
+    ffmpeg: Path,
+    source_root: Path,
+    output_root: Path,
+    source_tracks: list[dict[str, Any]],
+    output_report: dict[str, Any],
+    report_path: Path,
+    methods: dict[str, dict[str, Any]],
+    target_lufs: float,
+    true_peak: float,
+    target_lra: float,
+) -> dict[str, Any]:
+    output_tracks = list(output_report["tracks"])
+    candidates = peak_repair_candidates(output_tracks, true_peak)
+    if not candidates:
+        print("No encoded Vorbis true-peak outliers require repair.", flush=True)
+        return {"repairedTracks": 0, "tracks": []}
+
+    source_by_path = {str(track["path"]): track for track in source_tracks}
+    repair_records: list[dict[str, Any]] = []
+    threshold = true_peak + TRUE_PEAK_TOLERANCE_DB
+
+    # Encode and analyze every candidate away from the normalized tree first.
+    # Only a fully verified candidate set is allowed to replace live outputs.
+    with tempfile.TemporaryDirectory(
+        prefix="cobble-music-peak-repair-", dir=output_root.parent
+    ) as temporary_name:
+        temporary_root = Path(temporary_name)
+        staged_root = temporary_root / "staged"
+        backup_root = temporary_root / "backup"
+        repaired_tracks: dict[str, dict[str, Any]] = {}
+        for index, before in enumerate(candidates, 1):
+            relative = str(before["path"])
+            source_track = source_by_path[relative]
+            normalize_one(
+                ffmpeg,
+                source_root,
+                staged_root,
+                source_track,
+                methods[relative],
+                target_lufs,
+                true_peak,
+                target_lra,
+                post_filter_gain_db=VORBIS_PEAK_REPAIR_NUDGE_DB,
+            )
+            staged_path = staged_root / Path(relative)
+            after = analyze_one(
+                ffmpeg,
+                staged_root,
+                staged_path,
+                target_lufs,
+                true_peak,
+                target_lra,
+            )
+            if float(after["input_tp"]) > threshold:
+                fail(
+                    f"Encoded Vorbis peak repair remained above {threshold:.2f} dBTP: "
+                    f"{relative} ({after['input_tp']} dBTP)"
+                )
+            verify_outputs(
+                [source_track],
+                [after],
+                {relative: methods[relative]},
+                target_lufs,
+                true_peak,
+            )
+            repair = {
+                "reason": "libvorbis decoded true peak exceeded the verified tolerance",
+                "postNormalizationSafetyNudgeDb": VORBIS_PEAK_REPAIR_NUDGE_DB,
+                "beforeInputTpDbtp": before["input_tp"],
+                "afterInputTpDbtp": after["input_tp"],
+                "beforeSha256": before["sha256"],
+                "afterSha256": after["sha256"],
+            }
+            after["peakRepair"] = repair
+            repaired_tracks[relative] = after
+            repair_records.append({"path": relative, **repair})
+            print(
+                f"  verified encoded-peak repair {index}/{len(candidates)}: {relative}",
+                flush=True,
+            )
+
+        updated_tracks = [
+            repaired_tracks.get(str(track["path"]), track) for track in output_tracks
+        ]
+        updated_tracks.sort(key=lambda item: str(item["path"]).casefold())
+        updated_report = dict(output_report)
+        updated_report["summary"] = summarize(updated_tracks)
+        updated_report["battlePairing"] = pairing_summary(updated_tracks)
+        updated_report["tracks"] = updated_tracks
+        updated_report["encodedPeakRepair"] = {
+            "schemaVersion": 1,
+            "truePeakThresholdDbtp": threshold,
+            "postNormalizationSafetyNudgeDb": VORBIS_PEAK_REPAIR_NUDGE_DB,
+            "tracks": repair_records,
+        }
+
+        replaced: list[str] = []
+        try:
+            for relative in repaired_tracks:
+                destination = output_root / Path(relative)
+                backup = backup_root / Path(relative)
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(destination, backup)
+                os.replace(staged_root / Path(relative), destination)
+                replaced.append(relative)
+            write_json(report_path, updated_report)
+        except Exception:
+            for relative in replaced:
+                backup = backup_root / Path(relative)
+                if backup.is_file():
+                    os.replace(backup, output_root / Path(relative))
+            write_json(report_path, output_report)
+            raise
+
+    return {"repairedTracks": len(repair_records), "tracks": repair_records}
 
 
 def normalize_all(
@@ -660,8 +809,11 @@ def verify_outputs(
         fail("Normalized audio path inventory differs from the source inventory")
     failures: list[str] = []
     standalone_errors: list[float] = []
+    linear_standalone_errors: list[float] = []
+    dynamic_standalone_errors: list[float] = []
     group_gain_errors: list[float] = []
     group_main_target_errors: list[float] = []
+    peak_limited_main_target_errors: list[float] = []
     loudness_range_deltas: list[float] = []
     for relative, before in input_by_path.items():
         after = output_by_path[relative]
@@ -674,14 +826,23 @@ def verify_outputs(
             )
         if abs(float(after["durationSeconds"]) - float(before["durationSeconds"])) > 0.20:
             failures.append(f"duration changed by more than 0.20 seconds: {relative}")
-        if float(after["input_tp"]) > true_peak + 0.50:
+        if float(after["input_tp"]) > true_peak + TRUE_PEAK_TOLERANCE_DB:
             failures.append(f"true peak exceeded tolerance: {relative} ({after['input_tp']} dBTP)")
         loudness_range_deltas.append(float(after["input_lra"]) - float(before["input_lra"]))
         method = methods[relative]
         if method["method"] == "measuredTwoPassLoudnorm":
             error = float(after["input_i"]) - target_lufs
             standalone_errors.append(error)
-            if abs(error) > 0.50:
+            if str(before.get("normalizationType")) == "dynamic":
+                dynamic_standalone_errors.append(error)
+                missed_target = (
+                    error > LINEAR_TARGET_TOLERANCE_LU
+                    or error < -DYNAMIC_TARGET_UNDERSHOOT_TOLERANCE_LU
+                )
+            else:
+                linear_standalone_errors.append(error)
+                missed_target = abs(error) > LINEAR_TARGET_TOLERANCE_LU
+            if missed_target:
                 failures.append(f"integrated loudness missed target: {relative} ({after['input_i']} LUFS)")
         else:
             if before.get("input_i") is not None and after.get("input_i") is not None:
@@ -694,8 +855,11 @@ def verify_outputs(
                 failures.append(f"shared segment gain mismatch: {relative} ({error:+.3f} dB)")
             if relative == str(method["main"]):
                 target_error = float(after["input_i"]) - target_lufs
-                group_main_target_errors.append(target_error)
-                if abs(target_error) > 0.75:
+                if bool(method.get("peakLimited", False)):
+                    peak_limited_main_target_errors.append(target_error)
+                else:
+                    group_main_target_errors.append(target_error)
+                if not bool(method.get("peakLimited", False)) and abs(target_error) > 0.75:
                     failures.append(
                         f"paired main theme missed loudness target: {relative} "
                         f"({after['input_i']} LUFS)"
@@ -705,9 +869,23 @@ def verify_outputs(
     return {
         "verifiedTracks": len(outputs),
         "maximumStandaloneTargetErrorLu": round(max(map(abs, standalone_errors), default=0.0), 4),
+        "linearStandaloneTracks": len(linear_standalone_errors),
+        "maximumLinearStandaloneTargetErrorLu": round(
+            max(map(abs, linear_standalone_errors), default=0.0), 4
+        ),
+        "dynamicConstrainedStandaloneTracks": len(dynamic_standalone_errors),
+        "maximumDynamicStandaloneTargetErrorLu": round(
+            max(map(abs, dynamic_standalone_errors), default=0.0), 4
+        ),
+        "linearTargetToleranceLu": LINEAR_TARGET_TOLERANCE_LU,
+        "dynamicTargetUndershootToleranceLu": DYNAMIC_TARGET_UNDERSHOOT_TOLERANCE_LU,
         "maximumSharedGainErrorDb": round(max(map(abs, group_gain_errors), default=0.0), 4),
         "maximumPairedMainTargetErrorLu": round(
             max(map(abs, group_main_target_errors), default=0.0), 4
+        ),
+        "peakLimitedPairedMains": len(peak_limited_main_target_errors),
+        "maximumPeakLimitedPairedMainTargetErrorLu": round(
+            max(map(abs, peak_limited_main_target_errors), default=0.0), 4
         ),
         "pairedMainTargetToleranceLu": 0.75,
         "loudnessRangeChangeLu": {
@@ -718,7 +896,7 @@ def verify_outputs(
                 1 for delta in loudness_range_deltas if abs(delta) > 1.0
             ),
         },
-        "truePeakToleranceDb": 0.50,
+        "truePeakToleranceDb": TRUE_PEAK_TOLERANCE_DB,
         "durationToleranceSeconds": 0.20,
     }
 
@@ -816,6 +994,11 @@ def build_manifest(
     telemetry = [
         (item.get("loudnorm") or {}).get("normalizationType") for item in normalized
     ]
+    peak_repairs = [
+        {"path": str(item["path"]), **dict(item["peakRepair"])}
+        for item in output_analysis
+        if isinstance(item.get("peakRepair"), dict)
+    ]
     return {
         "schemaVersion": 1,
         "standard": "EBU R128 / ITU-R BS.1770 (FFmpeg loudnorm)",
@@ -841,6 +1024,10 @@ def build_manifest(
             "twoPassDynamic": sum(item == "dynamic" for item in telemetry),
             "secondPassTelemetryRetained": not resumed_after_encoding,
             "resumedAfterCompletedEncoding": resumed_after_encoding,
+        },
+        "encodedPeakRepair": {
+            "count": len(peak_repairs),
+            "tracks": peak_repairs,
         },
         "runtimeVolume": runtime_volume,
         "sourceSummary": summarize(tracks),
@@ -880,7 +1067,12 @@ def validate_ffmpeg(path: str) -> Path:
 def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    for name in ("analyze", "normalize", "finalize"):
+    for name in (
+        "analyze",
+        "normalize",
+        "repair-peaks",
+        "finalize",
+    ):
         command = subparsers.add_parser(name)
         command.add_argument("--source", required=True)
         command.add_argument("--ffmpeg", required=True)
@@ -892,9 +1084,9 @@ def arguments() -> argparse.Namespace:
         command.add_argument("--expected-audio-count", type=int)
         command.add_argument("--expected-paired-segments", type=int)
         command.add_argument("--expected-battle-sound-references", type=int)
-        if name in ("normalize", "finalize"):
+        if name in ("normalize", "repair-peaks", "finalize"):
             command.add_argument("--output", required=True)
-        if name == "finalize":
+        if name in ("repair-peaks", "finalize"):
             command.add_argument("--output-report", required=True)
     return parser.parse_args()
 
@@ -980,12 +1172,15 @@ def main() -> int:
             f"Expected {args.expected_paired_segments} paired battle segments, "
             f"but discovered {pairing['pairedSegments']}"
         )
-    output_root = canonical_root(args.output, must_exist=args.command == "finalize")
+    output_root = canonical_root(
+        args.output,
+        must_exist=args.command in ("repair-peaks", "finalize"),
+    )
     if output_root == source_root or source_root in output_root.parents:
         fail("Output must be outside the source pack tree")
     methods = build_methods(tracks, args.target_lufs, args.true_peak)
 
-    if args.command == "finalize":
+    if args.command in ("repair-peaks", "finalize"):
         ensure_plain_tree(output_root)
         output_files = discover_audio(output_root)
         if args.expected_audio_count is not None and len(output_files) != args.expected_audio_count:
@@ -1005,6 +1200,22 @@ def main() -> int:
             expected_target,
             "Normalized output",
         )
+        if args.command == "repair-peaks":
+            repair = repair_encoded_vorbis_peaks(
+                ffmpeg,
+                source_root,
+                output_root,
+                tracks,
+                output_report,
+                output_report_path,
+                methods,
+                args.target_lufs,
+                args.true_peak,
+                args.target_lra,
+            )
+            print(json.dumps(repair, indent=2), flush=True)
+            print(f"Updated normalized output analysis: {output_report_path}", flush=True)
+            return 0
         source_registry_path = source_root / BATTLE_SOUNDS_PATH
         if not source_registry_path.is_file():
             fail(f"Cobblemon battle sound registry is missing: {BATTLE_SOUNDS_PATH.as_posix()}")

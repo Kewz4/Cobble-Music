@@ -72,6 +72,57 @@ class PairingTests(unittest.TestCase):
 
 
 class VerificationTests(unittest.TestCase):
+    def test_peak_repair_candidates_are_only_vorbis_outliers(self) -> None:
+        safe = track("assets/cobblemon/sounds/battle/safe.ogg", -16.0, -1.01)
+        repair = track("assets/cobblemon/sounds/battle/repair.ogg", -16.0, -0.99)
+        self.assertEqual(
+            [repair], NORMALIZE.peak_repair_candidates([safe, repair], -1.5)
+        )
+        unsupported = track("music/repair.mp3", -16.0, -0.99)
+        with self.assertRaisesRegex(RuntimeError, "restricted to verified Vorbis"):
+            NORMALIZE.peak_repair_candidates([unsupported], -1.5)
+
+    def test_peak_limited_shared_group_can_remain_below_target(self) -> None:
+        main = "assets/cobblemon/sounds/battle/special/main.ogg"
+        before = track(main, -20.0, -1.0)
+        after = track(main, -18.0, -3.0)
+        method = {
+            "method": "sharedBattleSegmentGain",
+            "main": main,
+            "members": [main],
+            "appliedGainDb": 2.0,
+            "peakLimited": True,
+        }
+        result = NORMALIZE.verify_outputs(
+            [before], [after], {main: method}, -16.0, -1.5
+        )
+        self.assertEqual(result["peakLimitedPairedMains"], 1)
+        self.assertEqual(result["maximumPeakLimitedPairedMainTargetErrorLu"], 2.0)
+
+    def test_dynamic_loudnorm_may_finish_quieter_to_preserve_peak_limit(self) -> None:
+        path = "music/dynamic.mp3"
+        before = track(path, -24.0, -8.0)
+        before["normalizationType"] = "dynamic"
+        after = track(path, -17.49, -1.49)
+        result = NORMALIZE.verify_outputs(
+            [before],
+            [after],
+            {path: {"method": "measuredTwoPassLoudnorm"}},
+            -16.0,
+            -1.5,
+        )
+        self.assertEqual(result["dynamicConstrainedStandaloneTracks"], 1)
+        self.assertEqual(result["maximumDynamicStandaloneTargetErrorLu"], 1.49)
+        after["input_i"] = -17.51
+        with self.assertRaisesRegex(RuntimeError, "missed target"):
+            NORMALIZE.verify_outputs(
+                [before],
+                [after],
+                {path: {"method": "measuredTwoPassLoudnorm"}},
+                -16.0,
+                -1.5,
+            )
+
     def test_shared_group_main_must_reach_target(self) -> None:
         main = "assets/cobblemon/sounds/battle/special/bdsp/arceus.ogg"
         intro = "assets/cobblemon/sounds/battle/special/bdsp/arceus_intro.ogg"
