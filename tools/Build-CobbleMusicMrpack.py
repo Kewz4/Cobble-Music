@@ -26,7 +26,6 @@ INDEX_ROOTS = (
     "config",
     "resourcepacks",
     "shaderpacks",
-    "fancymenu_data",
     "ESM",
     "ModTranslations",
 )
@@ -90,6 +89,8 @@ def should_exclude_override(relative: str) -> bool:
     parts = PurePosixPath(lowered).parts
     name = parts[-1]
     if lowered == "config/mcbrowser/tabs.json":
+        return True
+    if lowered == "config/dreamdisplays/config.toml":
         return True
     if any(part in (".git", ".svn", "__pycache__") for part in parts):
         return True

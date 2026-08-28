@@ -155,6 +155,17 @@ internal static class LocalStateStore
         {
             throw new InvalidDataException("Updater configuration contains no permitted roots or attempts to expand the compiled updater allowlist.");
         }
+
+        // Bootstrap 1.2.7 is intentionally immutable because the permanent
+        // Prism command pins its hash. It writes the legacy six-root config on
+        // every launch, so 1.2.8 upgrades that exact legacy policy in memory.
+        // Deliberately narrowed custom policies remain narrowed.
+        string[] legacyRoots = ["mods", "resourcepacks", "config", "defaultconfigs", "kubejs", "scripts"];
+        if (config.AllowedRoots.Count == legacyRoots.Length
+            && legacyRoots.All(root => config.AllowedRoots.Contains(root, StringComparer.OrdinalIgnoreCase)))
+        {
+            config.AllowedRoots.Add("shaderpacks");
+        }
         return config;
     }
 
@@ -166,7 +177,10 @@ internal static class LocalStateStore
         }
 
         InstalledState? state = JsonSerializer.Deserialize<InstalledState>(File.ReadAllBytes(paths.StatePath), JsonOptions);
-        if (state is null || state.SchemaVersion != 1 || state.ManagedFiles is null)
+        if (state is null
+            || state.SchemaVersion != 1
+            || state.ManagedFiles is null
+            || state.OfferedSeedPaths is null)
         {
             return new InstalledState();
         }
@@ -178,7 +192,7 @@ internal static class LocalStateStore
         {
             return new InstalledState();
         }
-        if (!hasIdentity && state.ManagedFiles.Count != 0)
+        if (!hasIdentity && (state.ManagedFiles.Count != 0 || state.OfferedSeedPaths.Count != 0))
         {
             return new InstalledState();
         }
@@ -206,6 +220,27 @@ internal static class LocalStateStore
             {
                 return new InstalledState();
             }
+        }
+
+        var seenSeeds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int index = 0; index < state.OfferedSeedPaths.Count; index++)
+        {
+            string seedPath;
+            try
+            {
+                seedPath = PathSafety.NormalizeRelativePath(state.OfferedSeedPaths[index]);
+            }
+            catch (InvalidDataException)
+            {
+                return new InstalledState();
+            }
+            if (!PathSafety.IsSeedAllowed(seedPath)
+                || !seenSeeds.Add(seedPath)
+                || seenPaths.Contains(seedPath))
+            {
+                return new InstalledState();
+            }
+            state.OfferedSeedPaths[index] = seedPath;
         }
         return state;
     }

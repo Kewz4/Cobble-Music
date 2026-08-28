@@ -15,7 +15,7 @@ param(
     [ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')]
     [string]$Repository = 'Kewz4/Cobble-Music',
     [string]$PrivateKeyPath = (Join-Path $env:USERPROFILE '.cobble-music\keys\cobble-music-release-private.key'),
-    [string[]]$IncludeRoots = @('mods', 'resourcepacks', 'defaultconfigs', 'kubejs', 'scripts'),
+    [string[]]$IncludeRoots = @('mods', 'resourcepacks', 'shaderpacks', 'defaultconfigs', 'kubejs', 'scripts'),
     [string[]]$IncludeFiles = @(
         'config/cobble-music-bridge.json',
         'config/cobble-music-pack-version.json',
@@ -37,6 +37,7 @@ param(
         'config/sodium-extra-options.json',
         'config/voxy-config.json'
     ),
+    [string[]]$SeedRoots = @('config'),
     [string]$SeedTemplateDir,
     [string]$LegacyCleanupManifest,
 
@@ -69,7 +70,7 @@ $PinnedVerifierExe = Join-Path $Root 'updater\verifier\win-x64\CobbleMusicUpdate
 $UpdaterChannelPath = Join-Path $Root 'updater\channel\stable.json'
 $UpdaterChannelSignaturePath = Join-Path $Root 'updater\channel\stable.sig'
 $RequiredVerifierVersion = '1.2.7'
-$AllowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
+$AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $MaximumManifestSnapshotBytes = 8MB
 $MaximumSignatureSnapshotBytes = 64KB
 
@@ -945,7 +946,7 @@ try {
     $effectiveSeedPaths = @($SeedFiles) + @($optionalAxiomSources | ForEach-Object { $_.path })
     $seedSourceFiles = @(
         Get-CobbleSeedSourceFiles -SourceMinecraftDir $SourceMinecraftDir -SeedFiles $effectiveSeedPaths `
-            -SeedTemplateDir $SeedTemplateDir |
+            -SeedRoots $SeedRoots -ExcludeFiles $IncludeFiles -SeedTemplateDir $SeedTemplateDir |
             ForEach-Object {
                 $item = Get-Item -LiteralPath $_.full
                 [pscustomobject]@{ full = $_.full; path = $_.path; size = $item.Length; sha256 = (Get-Sha256 $_.full) }
@@ -1040,7 +1041,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.6'
+            minimumUpdaterVersion = '1.2.8'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             payload = $payloadResult.Payload
             files = @($authoritativeFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
@@ -1056,7 +1057,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.6'
+            minimumUpdaterVersion = '1.2.8'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             base = [ordered]@{ version = $BaseVersion; manifestSha256 = $baseHash }
             payload = $payloadResult.Payload

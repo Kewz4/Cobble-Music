@@ -16,6 +16,7 @@ internal sealed class UpdaterConfiguration
     [
         "mods",
         "resourcepacks",
+        "shaderpacks",
         "config",
         "defaultconfigs",
         "kubejs",
@@ -30,6 +31,9 @@ internal sealed class InstalledState
     public string ManifestSha256 { get; set; } = "";
     public DateTimeOffset AppliedAtUtc { get; set; }
     public List<ManagedFileState> ManagedFiles { get; set; } = [];
+    // Records which create-only defaults have already been offered. The files
+    // themselves remain player-owned and are never integrity checked.
+    public List<string> OfferedSeedPaths { get; set; } = [];
 }
 
 internal sealed class ManagedFileState

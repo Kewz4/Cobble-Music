@@ -68,6 +68,13 @@ internal sealed class UpdateEngine
         }
 
         LocalStateStore.AssertWritable(_paths);
+        if (await TryAdoptExistingBaselineAsync(target, targetRelease.ManifestSha256, state, cancellationToken))
+        {
+            _log($"Adopted the exact existing signed release {target.Version}; no payload download was needed.");
+            Report(UpdatePhase.Complete, $"Kewz's Cobblemon {target.Version} is ready — starting Minecraft.");
+            return;
+        }
+
         UpdateManifest? trustedBase = null;
         string trustedBaseHash = "";
         var downloadProgress = new DownloadProgressScope(CalculateChainDownloadBytes(releaseChain));
@@ -145,10 +152,10 @@ internal sealed class UpdateEngine
         InstalledState state,
         CancellationToken cancellationToken)
     {
-        if (manifest.SchemaVersion != 1
-            || !string.IsNullOrWhiteSpace(state.Version)
+        if (!string.IsNullOrWhiteSpace(state.Version)
             || !string.IsNullOrWhiteSpace(state.ManifestSha256)
-            || state.ManagedFiles.Count != 0)
+            || state.ManagedFiles.Count != 0
+            || state.OfferedSeedPaths.Count != 0)
         {
             return false;
         }
@@ -169,6 +176,7 @@ internal sealed class UpdateEngine
             }
         }
         foreach (string cleanupPath in manifest.DeletePaths
+            .Concat(manifest.DeletedFiles.Select(file => file.Path))
             .Concat(manifest.LegacyCleanup.Select(file => file.Path))
             .Distinct(StringComparer.OrdinalIgnoreCase))
         {
@@ -190,7 +198,12 @@ internal sealed class UpdateEngine
                 Path = file.Path,
                 Size = file.Size,
                 Sha256 = file.Sha256
-            }).ToList()
+            }).ToList(),
+            OfferedSeedPaths = manifest.SeedFiles
+                .Select(file => file.Path)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToList()
         };
         await LocalStateStore.SaveStateAsync(_paths, adoptedState, cancellationToken);
         return true;
@@ -501,6 +514,19 @@ internal sealed class UpdateEngine
         }
         string transactionId = DateTimeOffset.UtcNow.ToString("yyyyMMddHHmmss") + "-" + Guid.NewGuid().ToString("N");
         string backupDirectory = Path.Combine(_paths.LocalDataDirectory, "rollback", transactionId, "files");
+        bool hasPreviousIdentity = !string.IsNullOrWhiteSpace(previousState.Version)
+            || !string.IsNullOrWhiteSpace(previousState.ManifestSha256)
+            || previousState.ManagedFiles.Count != 0;
+        var previouslyOfferedSeeds = previousState.OfferedSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (signedBase is not null)
+        {
+            // State written by 1.2.6/1.2.7 has no seed ledger. A signed delta
+            // base proves those defaults were already offered under the old
+            // create-only policy, so deleted optional/default files stay gone.
+            previouslyOfferedSeeds.UnionWith(signedBase.SeedFiles.Select(file => file.Path));
+        }
+        var nextOfferedSeeds = previouslyOfferedSeeds.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        nextOfferedSeeds.UnionWith(manifest.SeedFiles.Select(file => file.Path));
         var newState = new InstalledState
         {
             Version = manifest.Version,
@@ -511,7 +537,10 @@ internal sealed class UpdateEngine
                 Path = file.Path,
                 Size = file.Size,
                 Sha256 = file.Sha256
-            }).ToList()
+            }).ToList(),
+            OfferedSeedPaths = nextOfferedSeeds
+                .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToList()
         };
         var journal = new TransactionJournal
         {
@@ -584,9 +613,6 @@ internal sealed class UpdateEngine
                 Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
             }
 
-            bool pristineInstall = string.IsNullOrWhiteSpace(previousState.Version)
-                && string.IsNullOrWhiteSpace(previousState.ManifestSha256)
-                && previousState.ManagedFiles.Count == 0;
             foreach (ManifestFile seedFile in manifest.SeedFiles)
             {
                 Report(UpdatePhase.Applying, "Installing first-run defaults", 0, 0, appliedFiles, totalFiles);
@@ -601,7 +627,7 @@ internal sealed class UpdateEngine
                 }
                 if (Directory.Exists(target))
                 {
-                    if (pristineInstall)
+                    if (!hasPreviousIdentity)
                     {
                         throw new InvalidDataException($"Create-only default target is a directory: {seedFile.Path}");
                     }
@@ -609,7 +635,9 @@ internal sealed class UpdateEngine
                     appliedFiles++;
                     continue;
                 }
-                if (!pristineInstall)
+                bool canInitialize = !hasPreviousIdentity
+                    || (manifest.SchemaVersion == 2 && !previouslyOfferedSeeds.Contains(seedFile.Path));
+                if (!canInitialize)
                 {
                     _log($"Keeping player-owned absence: {seedFile.Path}");
                     appliedFiles++;

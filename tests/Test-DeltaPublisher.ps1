@@ -129,7 +129,7 @@ $badMinimumBaseline = $baselineManifest.PSObject.Copy()
 $badMinimumBaseline.minimumUpdaterVersion = '1.02.0'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $badMinimumBaseline } 'Non-canonical v1 minimumUpdaterVersion was accepted for staged resume.'
 $futureMinimumBaseline = $baselineManifest.PSObject.Copy()
-$futureMinimumBaseline.minimumUpdaterVersion = '1.2.7'
+$futureMinimumBaseline.minimumUpdaterVersion = '1.2.9'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $futureMinimumBaseline } 'V1 requiring a newer-than-pinned updater was accepted for staged resume.'
 
 $seed = New-Record 'config/ReactiveMusic.json5' 42 '9'
@@ -150,6 +150,7 @@ Assert-True (Assert-CobbleSeedPathPolicy -Path 'mods/Axiom-5.4.2-for-MC1.21.1.ja
 Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'mods/required-mod.jar' } 'A non-Axiom mod was accepted as optional.'
 Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'servers.dat' } 'servers.dat was accepted as a create-only default.'
 Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'config/MCBrowser/tabs.json' } 'Browser state was accepted as a create-only default.'
+Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'config/dreamdisplays/config.toml' } 'Credential-bearing DreamDisplays config was accepted as a create-only default.'
 $deltaBaseInV1 = $baselineManifest.PSObject.Copy()
 $deltaBaseInV1 | Add-Member -NotePropertyName base -NotePropertyValue ([pscustomobject]@{ version = '1.0.3'; manifestSha256 = (New-Hash 'a') })
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $deltaBaseInV1 } 'V1 staged resume accepted a delta-only base.'

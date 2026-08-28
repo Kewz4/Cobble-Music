@@ -26,6 +26,7 @@ internal static class Program
             TestUpdaterChannelValidation();
             TestSequentialReleaseChain();
             TestInstanceIdentityNormalization(Path.Combine(tempRoot, "identity"));
+            TestLegacyConfigurationRootMigration(Path.Combine(tempRoot, "configuration-migration"));
             TestOfflineLaunchPolicy();
             TestResumeStagingPreparation(Path.Combine(tempRoot, "staging"));
             await TestExtractAndVerifyReleasesDestinationHandleAsync(Path.Combine(tempRoot, "extract-lock"));
@@ -369,6 +370,14 @@ internal static class Program
         Equal(5, ManifestParser.PayloadContents(valid).Count, "managed payload plus create-only defaults");
         Equal(2, ManifestParser.ManagedPayloadContents(valid).Count, "managed payload excludes defaults");
 
+        var shaderConfiguration = new UpdaterConfiguration { AllowedRoots = ["mods", "shaderpacks"] };
+        UpdateManifest shaderRelease = DeltaManifest();
+        ManifestFile shaderFile = FileEntry("shaderpacks/High Quality/shaders/program.glsl", "shader-source");
+        shaderRelease.Files.Add(shaderFile);
+        shaderRelease.PayloadFiles.Add(Copy(shaderFile));
+        ManifestParser.Validate(shaderRelease, shaderConfiguration, AssetUrls());
+        Equal(true, BuildInfo.SupportedRoots.Contains("shaderpacks"), "shaderpacks compiled update root");
+
         UpdateManifest nonOptionalMod = DeltaManifest();
         nonOptionalMod.SeedFiles = [FileEntry("mods/required-mod.jar", "not-optional")];
         Throws<InvalidDataException>(() => ManifestParser.Validate(nonOptionalMod, configuration, AssetUrls()));
@@ -380,6 +389,10 @@ internal static class Program
         UpdateManifest browserState = DeltaManifest();
         browserState.SeedFiles = [FileEntry("config/MCBrowser/tabs.json", "private-browser-state")];
         Throws<InvalidDataException>(() => ManifestParser.Validate(browserState, configuration, AssetUrls()));
+
+        UpdateManifest credentialState = DeltaManifest();
+        credentialState.SeedFiles = [FileEntry("config/dreamdisplays/config.toml", "private-service-credential")];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(credentialState, configuration, AssetUrls()));
 
         UpdateManifest overlap = DeltaManifest();
         overlap.SeedFiles = [Copy(overlap.Files[0])];
@@ -496,6 +509,69 @@ internal static class Program
             Path.TrimEndingDirectorySeparator(canonical.InstanceDirectory),
             canonical.InstanceDirectory,
             "resolved instance path must not retain a trailing separator");
+    }
+
+    private static void TestLegacyConfigurationRootMigration(string root)
+    {
+        UpdaterPaths paths = Paths(root);
+        Directory.CreateDirectory(paths.InstallationDirectory);
+        string legacy = JsonSerializer.Serialize(new
+        {
+            schemaVersion = 1,
+            modpackId = BuildInfo.DefaultModpackId,
+            repository = BuildInfo.DefaultRepository,
+            channel = "stable",
+            manifestAsset = "cobble-music-update.json",
+            signatureAsset = "cobble-music-update.sig",
+            networkTimeoutSeconds = 30,
+            allowOfflineLaunch = true,
+            allowedRoots = new[] { "mods", "resourcepacks", "config", "defaultconfigs", "kubejs", "scripts" }
+        });
+        File.WriteAllText(paths.ConfigurationPath, legacy);
+        UpdaterConfiguration migrated = LocalStateStore.LoadConfiguration(paths);
+        Equal(true, migrated.AllowedRoots.Contains("shaderpacks"), "immutable 1.2.7 bootstrap config gains shaderpacks in memory");
+
+        string narrowed = JsonSerializer.Serialize(new
+        {
+            schemaVersion = 1,
+            modpackId = BuildInfo.DefaultModpackId,
+            repository = BuildInfo.DefaultRepository,
+            channel = "stable",
+            manifestAsset = "cobble-music-update.json",
+            signatureAsset = "cobble-music-update.sig",
+            networkTimeoutSeconds = 30,
+            allowOfflineLaunch = true,
+            allowedRoots = new[] { "mods" }
+        });
+        File.WriteAllText(paths.ConfigurationPath, narrowed);
+        UpdaterConfiguration custom = LocalStateStore.LoadConfiguration(paths);
+        Equal(false, custom.AllowedRoots.Contains("shaderpacks"), "deliberately narrowed custom config remains narrow");
+
+        string oldState = JsonSerializer.Serialize(new
+        {
+            schemaVersion = 1,
+            version = "1.0.6",
+            manifestSha256 = HashText("legacy-state"),
+            managedFiles = new[]
+            {
+                new { path = "mods/required.jar", size = 8, sha256 = HashText("required") }
+            }
+        });
+        File.WriteAllText(paths.StatePath, oldState);
+        InstalledState migratedState = LocalStateStore.LoadState(paths);
+        Equal("1.0.6", migratedState.Version, "pre-ledger installed state remains valid");
+        Equal(0, migratedState.OfferedSeedPaths.Count, "missing old ledger deserializes as empty");
+
+        string nullLedgerState = JsonSerializer.Serialize(new
+        {
+            schemaVersion = 1,
+            version = "1.0.6",
+            manifestSha256 = HashText("legacy-state"),
+            managedFiles = Array.Empty<object>(),
+            offeredSeedPaths = (string[]?)null
+        });
+        File.WriteAllText(paths.StatePath, nullLedgerState);
+        Equal("", LocalStateStore.LoadState(paths).Version, "explicit-null seed ledger is rejected safely");
     }
 
     private static void TestOfflineLaunchPolicy()
@@ -987,6 +1063,7 @@ internal static class Program
             SchemaVersion = 1,
             Version = "1.0.4",
             Files = [first, second],
+            SeedFiles = [FileEntry("options.txt", "starter-options")],
             DeletePaths = ["mods/obsolete.jar"],
             LegacyCleanup =
             [
@@ -1013,6 +1090,21 @@ internal static class Program
         InstalledState state = LocalStateStore.LoadState(paths);
         Equal("1.0.4", state.Version, "adopted baseline version");
         Equal(2, state.ManagedFiles.Count, "adopted full inventory");
+        Equal("options.txt", state.OfferedSeedPaths.Single(), "adoption records player-owned defaults as offered");
+
+        File.Delete(paths.StatePath);
+        var exactDelta = new UpdateManifest
+        {
+            SchemaVersion = 2,
+            Version = "1.0.5",
+            Files = [first, second],
+            SeedFiles = [FileEntry("options.txt", "starter-options")],
+            DeletedFiles = [FileEntry("mods/removed.jar", "removed")]
+        };
+        bool adoptedDelta = await engine.TryAdoptExistingBaselineAsync(
+            exactDelta, HashText("delta-manifest"), new InstalledState(), NoCancellation);
+        Equal(true, adoptedDelta, "exact delta release adoption supports a fresh current MRPACK without downloading its base");
+        Equal("1.0.5", LocalStateStore.LoadState(paths).Version, "adopted exact delta version");
 
         File.Delete(paths.StatePath);
         string legacy = PathSafety.CombineUnder(paths.MinecraftDirectory, "mods/legacy.jar");
@@ -1172,6 +1264,7 @@ internal static class Program
         InstalledState installed = LocalStateStore.LoadState(paths);
         Equal(1, installed.ManagedFiles.Count, "create-only defaults absent from managed state");
         Equal(managedPath, installed.ManagedFiles.Single().Path, "only immutable file remains managed");
+        Equal(3, installed.OfferedSeedPaths.Count, "schema-one migration records every old default as already offered");
         Equal(true, logs.Any(line => line.Contains("Keeping player-owned setting", StringComparison.Ordinal)), "player-owned preservation logged");
         Equal(true, logs.Any(line => line.Contains("Keeping player-owned absence", StringComparison.Ordinal)), "player-owned absence logged");
 
@@ -1191,6 +1284,47 @@ internal static class Program
         Equal("player-changed-keybinds-and-video", await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, optionsPath)), "later options edits survive another release application");
         Equal("player-moved-toast", await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, mutableConfigPath)), "later mod config edits survive another release application");
         Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, axiomPath)), "removed optional Axiom stays absent on another release application");
+
+        const string fancyMenuSeedPath = "config/fancymenu/customization/title_screen_layout.txt";
+        ManifestFile fancyMenuSeed = FileEntry(fancyMenuSeedPath, "friend-pack-title-layout");
+        var correctiveDelta = new UpdateManifest
+        {
+            SchemaVersion = 2,
+            Version = "1.0.7",
+            Files = [managed],
+            SeedFiles = [configSeed, optionsSeed, axiomSeed, fancyMenuSeed]
+        };
+        await WriteRelativeTextAsync(extract, fancyMenuSeedPath, "friend-pack-title-layout");
+        InstalledState preCorrective = LocalStateStore.LoadState(paths);
+        await engine.ApplyTransactionAsync(
+            correctiveDelta,
+            HashText("corrective-delta"),
+            extract,
+            preCorrective,
+            signedBase: baseline,
+            NoCancellation);
+        Equal("friend-pack-title-layout", await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, fancyMenuSeedPath)), "new 1.0.7 config default reaches an existing 1.0.6 player once");
+        Equal("player-moved-toast", await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, mutableConfigPath)), "an old seed inferred from the signed base remains player-owned");
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, axiomPath)), "signed-base seed inference does not reinstall removed Axiom");
+        InstalledState corrected = LocalStateStore.LoadState(paths);
+        Equal(4, corrected.OfferedSeedPaths.Count, "corrective update persists its expanded one-time seed ledger");
+
+        File.Delete(PathSafety.CombineUnder(paths.MinecraftDirectory, fancyMenuSeedPath));
+        var laterDelta = new UpdateManifest
+        {
+            SchemaVersion = 2,
+            Version = "1.0.8",
+            Files = [managed],
+            SeedFiles = [configSeed, optionsSeed, axiomSeed, fancyMenuSeed]
+        };
+        await engine.ApplyTransactionAsync(
+            laterDelta,
+            HashText("later-delta"),
+            extract,
+            corrected,
+            signedBase: correctiveDelta,
+            NoCancellation);
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, fancyMenuSeedPath)), "deleting a once-offered config remains respected by later releases");
 
         UpdaterPaths freshPaths = Paths(Path.Combine(root, "fresh"));
         Directory.CreateDirectory(freshPaths.MinecraftDirectory);
@@ -1212,6 +1346,7 @@ internal static class Program
         Equal("optional-builder-mod", await File.ReadAllTextAsync(PathSafety.CombineUnder(freshPaths.MinecraftDirectory, axiomPath)), "fresh install receives optional Axiom when supplied");
         InstalledState freshState = LocalStateStore.LoadState(freshPaths);
         Equal(1, freshState.ManagedFiles.Count, "fresh create-only defaults are not recorded as managed");
+        Equal(3, freshState.OfferedSeedPaths.Count, "fresh defaults are recorded only in the offer ledger");
 
         File.Delete(PathSafety.CombineUnder(freshPaths.MinecraftDirectory, axiomPath));
         await WriteRelativeTextAsync(freshExtract, managedPath, "managed-content");
@@ -1256,6 +1391,7 @@ internal static class Program
         Equal(true, await adoptionEngine.TryAdoptExistingBaselineAsync(
             baseline, HashText("adoption"), new InstalledState(), NoCancellation), "baseline adoption accepts existing player-owned defaults without comparing content");
         Equal(1, LocalStateStore.LoadState(adoptionPaths).ManagedFiles.Count, "adoption excludes create-only defaults from state");
+        Equal(3, LocalStateStore.LoadState(adoptionPaths).OfferedSeedPaths.Count, "adoption marks defaults offered without managing them");
 
         UpdaterPaths rollbackPaths = Paths(Path.Combine(root, "rollback"));
         Directory.CreateDirectory(rollbackPaths.MinecraftDirectory);
@@ -1315,6 +1451,7 @@ internal static class Program
         await File.WriteAllTextAsync(backup, "old");
         InstalledState previous = StateFor("1.0.4", HashText("base"), "mods/example.jar", "old");
         InstalledState next = StateFor("1.0.5", HashText("next"), "mods/example.jar", "new");
+        next.OfferedSeedPaths = ["options.txt"];
         await LocalStateStore.SaveStateAsync(rollbackPaths, previous, NoCancellation);
         await TransactionStore.SaveAsync(rollbackPaths, Journal(target, backup, previous, next, "filesApplied"), NoCancellation);
         await TransactionStore.RecoverIfNeededAsync(rollbackPaths, BuildInfo.SupportedRoots, _ => { });

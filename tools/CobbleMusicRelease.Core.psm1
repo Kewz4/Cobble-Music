@@ -1,9 +1,9 @@
 Set-StrictMode -Version Latest
 
-$script:AllowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
+$script:AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $script:Sha256Pattern = '^[0-9a-f]{64}$'
 $script:VersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-$script:PinnedUpdaterVersion = '1.2.6'
+$script:PinnedUpdaterVersion = '1.2.8'
 $script:MaximumReleaseAssetCount = 999
 $script:ReservedReleaseMetadataAssetCount = 2
 $script:MaximumPublicReleaseCount = 499
@@ -135,6 +135,9 @@ function Assert-CobbleSourcePathPolicy {
     if ($normalized -ieq 'config/MCBrowser/tabs.json') {
         throw "$Context is per-user browser state and may not be distributed: $normalized"
     }
+    if ($normalized -ieq 'config/dreamdisplays/config.toml') {
+        throw "$Context is credential-bearing service configuration and may not be distributed: $normalized"
+    }
 
     $forbiddenSegments = @('.git', '.hg', '.svn', '.idea', '.vscode', 'node_modules', '__pycache__')
     foreach ($segment in $normalized.Split('/')) {
@@ -167,8 +170,28 @@ function Assert-CobbleSeedPathPolicy {
     if (-not $normalized.StartsWith('config/', [StringComparison]::OrdinalIgnoreCase)) {
         throw "$Context is outside the create-only allowlist: $normalized"
     }
+    if ($normalized -ieq 'config/dreamdisplays/config.toml') {
+        throw "$Context is a credential-bearing service configuration and may not be distributed: $normalized"
+    }
     Assert-CobbleSourcePathPolicy -Path $normalized -Context $Context -ExplicitSourceFile | Out-Null
     return $true
+}
+
+function Test-CobbleSeedTreeExclusion {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $normalized = $Path.Replace('\', '/')
+    $segments = @($normalized.Split('/'))
+    $name = $segments[-1]
+    if ($normalized -ieq 'config/MCBrowser/tabs.json' -or
+        $normalized -ieq 'config/dreamdisplays/config.toml' -or
+        ($segments[0] -ieq 'config' -and $segments -icontains 'cache') -or
+        $name -imatch '(?:\.bak(?:[-._].*)?|\.old(?:[-._].*)?|~)$' -or
+        $name -ieq 'thumbs.db' -or
+        $name -ieq '.ds_store') {
+        return $true
+    }
+    return $false
 }
 
 function Get-CobbleManagedSourceFiles {
@@ -248,13 +271,42 @@ function Get-CobbleSeedSourceFiles {
     param(
         [Parameter(Mandatory)][string]$SourceMinecraftDir,
         [Parameter(Mandatory)][string[]]$SeedFiles,
+        [string[]]$SeedRoots = @(),
+        [string[]]$ExcludeFiles = @(),
         [AllowEmptyString()][string]$SeedTemplateDir = ''
     )
 
     $sourceRoot = [IO.Path]::GetFullPath($SourceMinecraftDir)
     $templateRoot = if ([string]::IsNullOrWhiteSpace($SeedTemplateDir)) { $null } else { [IO.Path]::GetFullPath($SeedTemplateDir) }
     $byPath = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($relativeInput in $SeedFiles | Sort-Object -Unique) {
+    $excluded = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($relativeInput in $ExcludeFiles) {
+        [void]$excluded.Add($relativeInput.Replace('\', '/').Normalize([Text.NormalizationForm]::FormC))
+    }
+    $treeSeedFiles = [Collections.Generic.List[string]]::new()
+    foreach ($rootInput in $SeedRoots | Sort-Object -Unique) {
+        $rootName = $rootInput.Replace('\', '/').Trim('/')
+        if ($rootName -cne 'config') {
+            throw "Create-only seed root is outside the reviewed tree allowlist: $rootName"
+        }
+        $rootPath = Join-Path $sourceRoot $rootName
+        if (-not (Test-Path -LiteralPath $rootPath -PathType Container)) { continue }
+        $unsafeLinks = @(Get-ChildItem -LiteralPath $rootPath -Recurse -Force | Where-Object {
+            ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+        })
+        if ($unsafeLinks.Count -gt 0) {
+            throw "Create-only seed tree contains a reparse point: $($unsafeLinks[0].FullName)"
+        }
+        foreach ($file in Get-ChildItem -LiteralPath $rootPath -Recurse -File -Force) {
+            $relative = [IO.Path]::GetRelativePath($sourceRoot, $file.FullName).Replace('\', '/')
+            $key = $relative.Normalize([Text.NormalizationForm]::FormC)
+            if (-not $excluded.Contains($key) -and -not (Test-CobbleSeedTreeExclusion -Path $relative)) {
+                $treeSeedFiles.Add($relative)
+            }
+        }
+    }
+
+    foreach ($relativeInput in @($SeedFiles) + @($treeSeedFiles) | Sort-Object -Unique) {
         $relative = $relativeInput.Replace('\', '/')
         Assert-CobbleSeedPathPolicy -Path $relative | Out-Null
 
@@ -650,8 +702,8 @@ function Assert-CobbleV1Manifest {
             throw "Baseline create-only default overlaps a managed file: $($seed.path)"
         }
     }
-    if ($seedFiles.Entries.Count -gt 0 -and [string]$Manifest.minimumUpdaterVersion -cne '1.2.6') {
-        throw 'Baselines with create-only defaults must require updater 1.2.6.'
+    if ($seedFiles.Entries.Count -gt 0 -and [Version]$Manifest.minimumUpdaterVersion -lt [Version]'1.2.6') {
+        throw 'Baselines with create-only defaults must require updater 1.2.6 or newer.'
     }
     $payload = Get-CobbleOptionalPropertyValue $Manifest 'payload'
     Assert-CobblePayloadMetadata $payload
@@ -778,9 +830,9 @@ function Assert-CobbleDeltaManifest {
         throw 'Delta manifests must use exact deletedFiles entries instead of path-only deletePaths.'
     }
     $seedFiles = ConvertTo-CobbleSeedFileRecordSet -Entries @($seedFilesState.Entries) -Context 'delta create-only defaults'
-    $requiredUpdater = if ($seedFiles.Entries.Count -gt 0) { '1.2.6' } else { '1.2.0' }
-    if ([string]$Manifest.minimumUpdaterVersion -cne $requiredUpdater) {
-        throw "Delta manifest must require updater $requiredUpdater for its feature set."
+    $minimumFloor = if ($seedFiles.Entries.Count -gt 0) { [Version]'1.2.6' } else { [Version]'1.2.0' }
+    if ([Version]$Manifest.minimumUpdaterVersion -lt $minimumFloor) {
+        throw "Delta manifest minimum updater version is below $minimumFloor for its feature set."
     }
     if ($null -eq $Manifest.base -or [string]$Manifest.base.version -cne [string]$BaseManifest.version -or
         [string]$Manifest.base.manifestSha256 -cne $ExpectedBaseManifestSha256 -or

@@ -25,6 +25,7 @@ Only these areas of the instance’s `minecraft` directory are ever eligible:
 
 - `mods/`
 - `resourcepacks/`
+- `shaderpacks/`
 - `config/`
 - `defaultconfigs/`
 - `kubejs/`
@@ -53,6 +54,16 @@ release tag, byte length, and SHA-256 before atomically replacing the runnable
 EXE. The unsigned branch pointer and GitHub asset URL provide availability,
 not trust. A cached signed descriptor supports offline launch, and a replayed
 older descriptor cannot downgrade an already trusted updater.
+
+Updater 1.2.8 adds managed shaderpack delivery and a persistent one-time seed
+ledger. New reviewed defaults can now be offered to an existing installation
+once: an existing file always wins, a newly missing default is initialized once,
+and a later edit or deletion remains player-owned. When upgrading state written
+by 1.2.6/1.2.7, the signed base manifest marks its older seeds as already
+offered, so the migration cannot reinstall a removed Axiom JAR or resurrect an
+intentionally deleted old setting. The updater also recognizes the exact full
+state of a current `.mrpack`, including a schema-v2 release, and can adopt it
+without downloading an older multi-gigabyte baseline.
 
 Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
@@ -484,19 +495,21 @@ an explicit JSON `null` for any required collection is different and is
 rejected exactly as the distributed updater rejects it.
 
 The publisher inventories immutable `files` separately from create-only
-`seedFiles`. Player-setting seeds are intentionally narrow: `options.txt`
-covers vanilla keybind/video/sound settings; Reactive Music and Music
-Notification cover their sound UI; and Sodium, Sodium Extra, and Voxy cover
-their video settings. Reviewed files under `release-defaults/` can sanitize a
-seed, such as removing per-player Reactive Music home coordinates. Only the
-music bridge, pack-version marker, Log Begone policy, and resource-pack policy
-are explicit managed config files. All other `config/` files—including AFK
-Cinematic, Iris, particle/fog, camera, and zoom configs—are initial `.mrpack`
-content that the updater never inventories or repairs. Every current top-level
-Axiom JAR is automatically removed from the immutable inventory and added to
-the create-only inventory. A release with seeds requires updater 1.2.6 or
-newer, and the payload ZIP is checked against the exact union of its managed
-payload files and seed files before signing.
+`seedFiles`. `options.txt` and the reviewed safe `config/` tree are seeds, so
+vanilla keybind/video/sound settings plus FancyMenu, Iris, Sodium, Voxy,
+particle/fog, camera, zoom, Atmospherics, and mod defaults can reach a player
+without becoming integrity-enforced afterward. Reviewed files under
+`release-defaults/` sanitize mutable state, such as removing per-player Reactive
+Music home coordinates and comments/timestamps from the initial Iris choice.
+Generated caches, backups, MCBrowser tab state, and the credential-bearing
+DreamDisplays service config are excluded. Only the music bridge, pack-version
+marker, Log Begone policy, and resource-pack policy remain managed configs.
+Shaderpacks are managed pack content and therefore receive normal signed
+updates and repairs. Every current top-level Axiom JAR is automatically removed
+from the immutable inventory and added to the create-only inventory. Historical
+seed releases require updater 1.2.6 or newer; releases using the one-time
+migration ledger require updater 1.2.8. The payload ZIP is checked against the
+exact union of its managed payload files and seed files before signing.
 
 Review `release-output\1.0.5\cobble-music-update.json`, its signature, and all
 generated part hashes. Staging makes no GitHub change. Payload parts default to

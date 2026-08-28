@@ -366,7 +366,9 @@ internal static class TransactionStore
 
     private static void ValidateJournalState(InstalledState state, IReadOnlyCollection<string> allowedRoots)
     {
-        if (state.SchemaVersion != 1 || state.ManagedFiles is null)
+        if (state.SchemaVersion != 1
+            || state.ManagedFiles is null
+            || state.OfferedSeedPaths is null)
         {
             throw new TransactionRecoveryException("The updater transaction journal contains an invalid state snapshot.");
         }
@@ -389,20 +391,38 @@ internal static class TransactionStore
             }
             file.Path = path;
         }
+        var offeredSeeds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int index = 0; index < state.OfferedSeedPaths.Count; index++)
+        {
+            string path = PathSafety.NormalizeRelativePath(state.OfferedSeedPaths[index]);
+            if (!PathSafety.IsSeedAllowed(path)
+                || !offeredSeeds.Add(path)
+                || paths.Contains(path))
+            {
+                throw new TransactionRecoveryException("The updater transaction journal contains an unsafe create-only default ledger.");
+            }
+            state.OfferedSeedPaths[index] = path;
+        }
     }
 
     private static bool StateEquivalent(InstalledState left, InstalledState right)
     {
         if (!string.Equals(left.Version, right.Version, StringComparison.Ordinal)
             || !string.Equals(left.ManifestSha256, right.ManifestSha256, StringComparison.OrdinalIgnoreCase)
-            || left.ManagedFiles.Count != right.ManagedFiles.Count)
+            || left.ManagedFiles.Count != right.ManagedFiles.Count
+            || left.OfferedSeedPaths.Count != right.OfferedSeedPaths.Count)
         {
             return false;
         }
         var rightFiles = right.ManagedFiles.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
-        return left.ManagedFiles.All(file => rightFiles.TryGetValue(file.Path, out ManagedFileState? expected)
+        if (!left.ManagedFiles.All(file => rightFiles.TryGetValue(file.Path, out ManagedFileState? expected)
             && file.Size == expected.Size
-            && string.Equals(file.Sha256, expected.Sha256, StringComparison.OrdinalIgnoreCase));
+            && string.Equals(file.Sha256, expected.Sha256, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+        var rightSeeds = right.OfferedSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        return left.OfferedSeedPaths.All(rightSeeds.Contains);
     }
 
     private static async Task RestoreAsync(

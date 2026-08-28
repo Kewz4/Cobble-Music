@@ -39,6 +39,11 @@ try {
     Write-DummyFile (Join-Path $testRoot 'resourcepacks\backup.zip.bak')
     Write-DummyFile (Join-Path $testRoot 'resourcepacks\.index\generated.json')
     Write-DummyFile (Join-Path $testRoot 'config\ReactiveMusic.json5')
+    Write-DummyFile (Join-Path $testRoot 'config\iris.properties')
+    Write-DummyFile (Join-Path $testRoot 'config\fancymenu\layouts\main.txt')
+    Write-DummyFile (Join-Path $testRoot 'config\inventory-particles\cache\generated.bin')
+    Write-DummyFile (Join-Path $testRoot 'config\example.json.bak')
+    Write-DummyFile (Join-Path $testRoot 'config\dreamdisplays\config.toml')
     Write-DummyFile (Join-Path $testRoot 'config\MCBrowser\tabs.json')
     Write-DummyFile (Join-Path $testRoot 'options.txt')
     Write-DummyFile (Join-Path $testRoot 'mods\Axiom-5.4.2-for-MC1.21.1.jar')
@@ -72,6 +77,7 @@ try {
         'resourcepacks/backup.zip.bak',
         'resourcepacks/unreviewed.zip.rpo',
         'config/MCBrowser/tabs.json',
+        'config/dreamdisplays/config.toml',
         'resourcepacks/pack/.git/config'
     )) {
         Assert-Rejected { Assert-CobbleSourcePathPolicy -Path $unsafe | Out-Null } $unsafe
@@ -80,8 +86,9 @@ try {
 
     $seedSources = @(Get-CobbleSeedSourceFiles -SourceMinecraftDir $testRoot `
         -SeedFiles @('options.txt', 'config/ReactiveMusic.json5', 'mods/Axiom-5.4.2-for-MC1.21.1.jar') `
+        -SeedRoots @('config') -ExcludeFiles @('config/iris.properties') `
         -SeedTemplateDir $templateRoot)
-    if (($seedSources.path -join "`n") -cne (@('config/ReactiveMusic.json5', 'mods/Axiom-5.4.2-for-MC1.21.1.jar', 'options.txt') -join "`n")) {
+    if (($seedSources.path -join "`n") -cne (@('config/fancymenu/layouts/main.txt', 'config/ReactiveMusic.json5', 'mods/Axiom-5.4.2-for-MC1.21.1.jar', 'options.txt') -join "`n")) {
         throw 'Create-only source inventory was incomplete or unstable.'
     }
     $reactiveSeed = @($seedSources | Where-Object path -ceq 'config/ReactiveMusic.json5')
@@ -90,6 +97,7 @@ try {
     }
     Assert-Rejected { Assert-CobbleSeedPathPolicy -Path 'mods/required.jar' | Out-Null } 'a non-Axiom optional mod'
     Assert-Rejected { Assert-CobbleSeedPathPolicy -Path 'servers.dat' | Out-Null } 'private server state as a default'
+    Assert-Rejected { Assert-CobbleSeedPathPolicy -Path 'config/dreamdisplays/config.toml' | Out-Null } 'credential-bearing DreamDisplays config'
 
     Assert-Rejected {
         Get-CobbleManagedSourceFiles -SourceMinecraftDir $testRoot `

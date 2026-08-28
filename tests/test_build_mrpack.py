@@ -33,6 +33,7 @@ class MrpackBuilderTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             MRPACK.canonical_relative("../outside.json")
         self.assertTrue(MRPACK.should_exclude_override("config/MCBrowser/tabs.json"))
+        self.assertTrue(MRPACK.should_exclude_override("config/dreamdisplays/config.toml"))
         self.assertTrue(MRPACK.should_exclude_override("config/mod/cache/runtime.json"))
         self.assertTrue(MRPACK.should_exclude_override("config/example.json.bak-20260822"))
         self.assertFalse(MRPACK.should_exclude_override("config/asyncparticles/asyncparticles.json"))

@@ -50,12 +50,16 @@ internal static class PathSafety
             return false;
         }
 
-        // MCBrowser persists per-user browser state here. It must never be
-        // copied into another player's instance, even as a create-only file.
+        // Browser state and credential-bearing service configuration must
+        // never be copied into another player's instance, even create-only.
         return !string.Equals(
-            normalizedRelativePath,
-            "config/MCBrowser/tabs.json",
-            StringComparison.OrdinalIgnoreCase);
+                normalizedRelativePath,
+                "config/MCBrowser/tabs.json",
+                StringComparison.OrdinalIgnoreCase)
+            && !string.Equals(
+                normalizedRelativePath,
+                "config/dreamdisplays/config.toml",
+                StringComparison.OrdinalIgnoreCase);
     }
 
     public static bool IsOptionalPlayerMod(string normalizedRelativePath)

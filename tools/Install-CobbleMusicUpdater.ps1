@@ -89,7 +89,7 @@ $configuration = [ordered]@{
     signatureAsset = 'cobble-music-update.sig'
     networkTimeoutSeconds = 30
     allowOfflineLaunch = $true
-    allowedRoots = @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
+    allowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 }
 Write-Utf8 $ConfigPath ($configuration | ConvertTo-Json -Depth 8)
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
