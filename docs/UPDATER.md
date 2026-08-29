@@ -526,6 +526,9 @@ particle/fog, camera, zoom, Atmospherics, and mod defaults can reach a player
 without becoming integrity-enforced afterward. Reviewed files under
 `release-defaults/` sanitize mutable state, such as removing per-player Reactive
 Music home coordinates and comments/timestamps from the initial Iris choice.
+PackedPacks configuration and the `Default`/`Realistic` profiles also come from
+reviewed templates; its generated `config/packed_packs/__version.json` is never
+seeded into a release.
 Generated caches, backups, MCBrowser tab state, and the credential-bearing
 DreamDisplays service config are excluded. Only the music bridge, pack-version
 marker, Log Begone policy, and resource-pack policy remain managed configs.

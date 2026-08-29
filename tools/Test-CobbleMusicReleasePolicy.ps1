@@ -45,6 +45,7 @@ try {
     Write-DummyFile (Join-Path $testRoot 'config\example.json.bak')
     Write-DummyFile (Join-Path $testRoot 'config\dreamdisplays\config.toml')
     Write-DummyFile (Join-Path $testRoot 'config\MCBrowser\tabs.json')
+    Write-DummyFile (Join-Path $testRoot 'config\packed_packs\__version.json')
     Write-DummyFile (Join-Path $testRoot 'options.txt')
     Write-DummyFile (Join-Path $testRoot 'mods\Axiom-5.4.2-for-MC1.21.1.jar')
     $templateRoot = Join-Path $testRoot 'reviewed-templates'

@@ -184,6 +184,7 @@ function Test-CobbleSeedTreeExclusion {
     $segments = @($normalized.Split('/'))
     $name = $segments[-1]
     if ($normalized -ieq 'config/MCBrowser/tabs.json' -or
+        $normalized -ieq 'config/packed_packs/__version.json' -or
         $normalized -ieq 'config/dreamdisplays/config.toml' -or
         ($segments[0] -ieq 'config' -and $segments -icontains 'cache') -or
         $name -imatch '(?:\.bak(?:[-._].*)?|\.old(?:[-._].*)?|~)$' -or
