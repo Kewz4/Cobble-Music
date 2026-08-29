@@ -76,7 +76,7 @@ Assert-True (Assert-CobbleDeltaManifest -Manifest $manifest -BaseManifest $baseM
 $rawDeltaMissingDeletePaths = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 Assert-True ($null -eq $rawDeltaMissingDeletePaths.PSObject.Properties['deletePaths']) 'Raw delta fixture unexpectedly contains deletePaths.'
 Assert-True (Assert-CobbleDeltaManifest -Manifest $rawDeltaMissingDeletePaths -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash) 'Missing v2 deletePaths did not preserve the runtime initialized empty list.'
-foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'seedFiles', 'deletePaths', 'legacyCleanup')) {
+foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'seedFiles', 'reofferSeedPaths', 'deletePaths', 'legacyCleanup')) {
     $deltaExplicitNull = $manifest.PSObject.Copy()
     if ($null -eq $deltaExplicitNull.PSObject.Properties[$nullCollection]) {
         $deltaExplicitNull | Add-Member -NotePropertyName $nullCollection -NotePropertyValue $null
@@ -114,7 +114,7 @@ $legacyExplicitNullBase = $baselineManifest.PSObject.Copy()
 $legacyExplicitNullBase | Add-Member -NotePropertyName base -NotePropertyValue $null
 $legacyExplicitNullBase = ($legacyExplicitNullBase | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 Assert-True (Assert-CobbleV1Manifest -Manifest $legacyExplicitNullBase) 'Explicit null v1 base did not match the runtime nullable base model.'
-foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'seedFiles', 'deletePaths', 'legacyCleanup')) {
+foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'seedFiles', 'reofferSeedPaths', 'deletePaths', 'legacyCleanup')) {
     $legacyExplicitNull = $baselineManifest.PSObject.Copy()
     if ($null -eq $legacyExplicitNull.PSObject.Properties[$nullCollection]) {
         $legacyExplicitNull | Add-Member -NotePropertyName $nullCollection -NotePropertyValue $null
@@ -131,7 +131,7 @@ $badMinimumBaseline = $baselineManifest.PSObject.Copy()
 $badMinimumBaseline.minimumUpdaterVersion = '1.02.0'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $badMinimumBaseline } 'Non-canonical v1 minimumUpdaterVersion was accepted for staged resume.'
 $futureMinimumBaseline = $baselineManifest.PSObject.Copy()
-$futureMinimumBaseline.minimumUpdaterVersion = '1.2.9'
+$futureMinimumBaseline.minimumUpdaterVersion = '1.2.10'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $futureMinimumBaseline } 'V1 requiring a newer-than-pinned updater was accepted for staged resume.'
 
 $seed = New-Record 'config/ReactiveMusic.json5' 42 '9'
@@ -162,6 +162,9 @@ Assert-Throws { Assert-CobbleV1Manifest -Manifest $payloadFilesInV1 } 'V1 staged
 $deletedFilesInV1 = $baselineManifest.PSObject.Copy()
 $deletedFilesInV1 | Add-Member -NotePropertyName deletedFiles -NotePropertyValue @($base[0])
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $deletedFilesInV1 } 'V1 staged resume accepted nonempty deletedFiles.'
+$reofferSeedPathsInV1 = $seedBaseline.PSObject.Copy()
+$reofferSeedPathsInV1 | Add-Member -NotePropertyName reofferSeedPaths -NotePropertyValue @($seed.path)
+Assert-Throws { Assert-CobbleV1Manifest -Manifest $reofferSeedPathsInV1 } 'V1 staged resume accepted nonempty reofferSeedPaths.'
 
 $badBaseline = $baselineManifest.PSObject.Copy()
 $badBaseline.deletePaths = @('mods/unchanged.jar')
@@ -234,6 +237,22 @@ Assert-Throws { Assert-CobbleVersionAdvance -BaseVersion '1.0.5' -TargetVersion 
 Assert-Throws { Assert-CobbleVersionAdvance -BaseVersion '1.0.4' -TargetVersion '1.00.5' } 'Non-canonical delta version was accepted.'
 Assert-Throws { Assert-CobbleVersionAdvance -BaseVersion '1.0.4' -TargetVersion '1.0.5.0' } 'Four-part delta version was accepted.'
 Assert-Throws { Assert-CobbleVersionAdvance -BaseVersion '01.0.4' -TargetVersion '1.0.5' } 'Leading-zero base version was accepted.'
+
+$repairSeed = New-Record 'config/packed_packs/profiles/resourcepacks/Default.profile.json' 42 '8'
+$repairManifest = $manifest.PSObject.Copy()
+$repairManifest.minimumUpdaterVersion = '1.2.9'
+$repairManifest | Add-Member -NotePropertyName seedFiles -NotePropertyValue @($repairSeed)
+$repairManifest | Add-Member -NotePropertyName reofferSeedPaths -NotePropertyValue @($repairSeed.path)
+Assert-True (Assert-CobbleDeltaManifest -Manifest $repairManifest -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash) 'Valid corrective seed re-offer was rejected.'
+$oldUpdaterRepair = ($repairManifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$oldUpdaterRepair.minimumUpdaterVersion = '1.2.8'
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $oldUpdaterRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Corrective seed re-offer accepted updater older than 1.2.9.'
+$undeclaredRepair = ($repairManifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$undeclaredRepair.reofferSeedPaths = @('config/packed_packs/profiles/resourcepacks/Missing.profile.json')
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $undeclaredRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Corrective seed re-offer accepted an undeclared seed path.'
+$duplicateRepair = ($repairManifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$duplicateRepair.reofferSeedPaths = @($repairSeed.path, $repairSeed.path.ToUpperInvariant())
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $duplicateRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Corrective seed re-offer accepted a case-insensitive duplicate.'
 
 $tamperedPayload = $manifest.PSObject.Copy()
 $tamperedPayload.payloadFiles = @($plan.PayloadFiles | Where-Object path -ne 'config/changed.json')

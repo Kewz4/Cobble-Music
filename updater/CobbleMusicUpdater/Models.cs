@@ -101,6 +101,10 @@ internal sealed class UpdateManifest
     // Signed create-only defaults are carried in the payload but are never
     // recorded as managed state. Existing player files always win.
     public List<ManifestFile> SeedFiles { get; set; } = [];
+    // A corrective delta may explicitly offer selected create-only defaults
+    // again when they are missing. Existing files still always win, and the
+    // repair applies only while installing this signed release.
+    public List<string> ReofferSeedPaths { get; set; } = [];
     public List<ManifestFile> Files { get; set; } = [];
     public List<string> DeletePaths { get; set; } = [];
     public List<LegacyCleanupFile> LegacyCleanup { get; set; } = [];

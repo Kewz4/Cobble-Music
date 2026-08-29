@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 $script:AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $script:Sha256Pattern = '^[0-9a-f]{64}$'
 $script:VersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-$script:PinnedUpdaterVersion = '1.2.8'
+$script:PinnedUpdaterVersion = '1.2.9'
 $script:MaximumReleaseAssetCount = 999
 $script:ReservedReleaseMetadataAssetCount = 2
 $script:MaximumPublicReleaseCount = 499
@@ -689,10 +689,12 @@ function Assert-CobbleV1Manifest {
     $deletedFiles = Get-CobbleRuntimeCollectionState $Manifest 'deletedFiles' 'Baseline deletedFiles'
     $filesState = Get-CobbleRuntimeCollectionState $Manifest 'files' 'Baseline files'
     $seedFilesState = Get-CobbleRuntimeCollectionState $Manifest 'seedFiles' 'Baseline seedFiles'
+    $reofferSeedPaths = Get-CobbleRuntimeCollectionState $Manifest 'reofferSeedPaths' 'Baseline reofferSeedPaths'
     $deletePaths = Get-CobbleRuntimeCollectionState $Manifest 'deletePaths' 'Baseline deletePaths'
     $legacyCleanup = Get-CobbleRuntimeCollectionState $Manifest 'legacyCleanup' 'Baseline legacyCleanup'
-    if ($null -ne $base -or $payloadFiles.Entries.Count -ne 0 -or $deletedFiles.Entries.Count -ne 0) {
-        throw 'Baseline manifests cannot contain delta-only base, payloadFiles, or deletedFiles data.'
+    if ($null -ne $base -or $payloadFiles.Entries.Count -ne 0 -or $deletedFiles.Entries.Count -ne 0 -or
+        $reofferSeedPaths.Entries.Count -ne 0) {
+        throw 'Baseline manifests cannot contain delta-only base, payloadFiles, deletedFiles, or reofferSeedPaths data.'
     }
 
     $files = ConvertTo-CobbleFileRecordSet -Entries @($filesState.Entries) -Context 'baseline authoritative files'
@@ -824,13 +826,31 @@ function Assert-CobbleDeltaManifest {
     $payloadFilesState = Get-CobbleRuntimeCollectionState $Manifest 'payloadFiles' 'Delta payloadFiles'
     $deletedFilesState = Get-CobbleRuntimeCollectionState $Manifest 'deletedFiles' 'Delta deletedFiles'
     $seedFilesState = Get-CobbleRuntimeCollectionState $Manifest 'seedFiles' 'Delta seedFiles'
+    $reofferSeedPathsState = Get-CobbleRuntimeCollectionState $Manifest 'reofferSeedPaths' 'Delta reofferSeedPaths'
     $deletePaths = Get-CobbleRuntimeCollectionState $Manifest 'deletePaths' 'Delta deletePaths'
     $legacyCleanup = Get-CobbleRuntimeCollectionState $Manifest 'legacyCleanup' 'Delta legacyCleanup'
     if ($deletePaths.Entries.Count -ne 0) {
         throw 'Delta manifests must use exact deletedFiles entries instead of path-only deletePaths.'
     }
     $seedFiles = ConvertTo-CobbleSeedFileRecordSet -Entries @($seedFilesState.Entries) -Context 'delta create-only defaults'
-    $minimumFloor = if ($seedFiles.Entries.Count -gt 0) { [Version]'1.2.6' } else { [Version]'1.2.0' }
+    $reofferSeedKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($pathValue in @($reofferSeedPathsState.Entries)) {
+        $path = [string]$pathValue
+        Assert-CobbleSeedPathPolicy -Path $path -Context 'delta re-offered default' | Out-Null
+        $key = Get-CobblePathKey $path
+        if (-not $reofferSeedKeys.Add($key) -or -not $seedFiles.ByKey.ContainsKey($key)) {
+            throw "Delta reofferSeedPaths is duplicate or does not reference a declared seed file: $path"
+        }
+    }
+    $minimumFloor = if ($reofferSeedKeys.Count -gt 0) {
+        [Version]'1.2.9'
+    }
+    elseif ($seedFiles.Entries.Count -gt 0) {
+        [Version]'1.2.6'
+    }
+    else {
+        [Version]'1.2.0'
+    }
     if ([Version]$Manifest.minimumUpdaterVersion -lt $minimumFloor) {
         throw "Delta manifest minimum updater version is below $minimumFloor for its feature set."
     }

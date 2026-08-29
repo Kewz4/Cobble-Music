@@ -36,6 +36,7 @@ internal static class ManifestParser
             || manifest.PayloadFiles is null
             || manifest.DeletedFiles is null
             || manifest.SeedFiles is null
+            || manifest.ReofferSeedPaths is null
             || manifest.DeletePaths is null
             || manifest.LegacyCleanup is null
             || manifest.Files.Count == 0)
@@ -62,6 +63,7 @@ internal static class ManifestParser
 
         Dictionary<string, ManifestFile> files = ValidateFileSet(manifest.Files, configuration, "managed file");
         Dictionary<string, ManifestFile> seedFiles = ValidateSeedFileSet(manifest.SeedFiles);
+        HashSet<string> reofferSeedPaths = ValidateReofferSeedPaths(manifest.ReofferSeedPaths, seedFiles);
         if (seedFiles.Keys.Any(files.ContainsKey))
         {
             throw new InvalidDataException("Signed release manifest overlaps managed files and create-only defaults.");
@@ -74,10 +76,14 @@ internal static class ManifestParser
                 throw new InvalidDataException("Schema 1 release is missing its full payload.");
             }
             ValidatePayload(manifest.Payload, assetUrls);
-            ValidateSchemaOne(manifest, configuration, files, seedFiles);
+            ValidateSchemaOne(manifest, configuration, files, seedFiles, reofferSeedPaths);
         }
         else
         {
+            if (reofferSeedPaths.Count != 0 && requiredUpdater < new Version(1, 2, 9))
+            {
+                throw new InvalidDataException("Re-offered create-only defaults require updater 1.2.9 or newer.");
+            }
             ValidateSchemaTwo(manifest, configuration, files, seedFiles, releaseVersion!, assetUrls);
         }
     }
@@ -181,15 +187,39 @@ internal static class ManifestParser
         return files;
     }
 
+    private static HashSet<string> ValidateReofferSeedPaths(
+        IList<string> entries,
+        IReadOnlyDictionary<string, ManifestFile> seedFiles)
+    {
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (int index = 0; index < entries.Count; index++)
+        {
+            string normalized = PathSafety.NormalizeRelativePath(entries[index]);
+            entries[index] = normalized;
+            if (!PathSafety.IsSeedAllowed(normalized)
+                || !paths.Add(normalized)
+                || !seedFiles.ContainsKey(normalized))
+            {
+                throw new InvalidDataException(
+                    $"Release manifest contains an unsafe, duplicate, or undeclared re-offered default path: {normalized}");
+            }
+        }
+        return paths;
+    }
+
     private static void ValidateSchemaOne(
         UpdateManifest manifest,
         UpdaterConfiguration configuration,
         IReadOnlyDictionary<string, ManifestFile> files,
-        IReadOnlyDictionary<string, ManifestFile> seedFiles)
+        IReadOnlyDictionary<string, ManifestFile> seedFiles,
+        IReadOnlySet<string> reofferSeedPaths)
     {
-        if (manifest.Base is not null || manifest.PayloadFiles.Count != 0 || manifest.DeletedFiles.Count != 0)
+        if (manifest.Base is not null
+            || manifest.PayloadFiles.Count != 0
+            || manifest.DeletedFiles.Count != 0
+            || reofferSeedPaths.Count != 0)
         {
-            throw new InvalidDataException("Schema 1 releases cannot contain delta-only fields.");
+            throw new InvalidDataException("Schema 1 releases cannot contain delta-only fields or re-offered defaults.");
         }
 
         var seenDeletes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

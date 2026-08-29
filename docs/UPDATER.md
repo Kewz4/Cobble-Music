@@ -65,6 +65,15 @@ intentionally deleted old setting. The updater also recognizes the exact full
 state of a current `.mrpack`, including a schema-v2 release, and can adopt it
 without downloading an older multi-gigabyte baseline.
 
+Updater 1.2.9 adds narrowly scoped corrective seed offers. A signed schema-v2
+manifest may list selected declared `seedFiles` again in `reofferSeedPaths`.
+During that release only, a listed file is initialized if and only if it is
+missing; an existing player file is never compared or overwritten. This repairs
+a packaging mistake that previously recorded a default as offered without
+turning mutable settings into managed content or resurrecting unrelated removed
+defaults. Exact-baseline adoption is disabled while any corrective target is
+missing so adoption cannot silently skip the repair.
+
 Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
 An **unrecoverable local transaction** is the sole fail-closed case: Prism is
@@ -455,6 +464,22 @@ example, the 1.0.6 settings/Axiom ownership migration is staged with:
 After that baseline has established the new ownership model, later releases
 can return to schema-v2 deltas.
 
+A corrective delta may safely restore particular missing defaults without
+overwriting existing player copies:
+
+```powershell
+.\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.10 -BaseVersion 1.0.9 `
+  -SourceMinecraftDir $source `
+  -ReofferSeedFiles @(
+    'config/packed_packs/profiles/resourcepacks/Default.profile.json',
+    'config/packed_packs/profiles/resourcepacks/Realistic.profile.json'
+  )
+```
+
+Every re-offered path must also exist in the signed `seedFiles` inventory, must
+pass the ordinary seed allowlist, and requires updater 1.2.9 or newer. The
+feature is deliberately unavailable to schema-v1 baselines.
+
 To use reviewed local copies of the base assets, supply both paths:
 
 ```powershell
@@ -508,7 +533,8 @@ Shaderpacks are managed pack content and therefore receive normal signed
 updates and repairs. Every current top-level Axiom JAR is automatically removed
 from the immutable inventory and added to the create-only inventory. Historical
 seed releases require updater 1.2.6 or newer; releases using the one-time
-migration ledger require updater 1.2.8. The payload ZIP is checked against the
+migration ledger require updater 1.2.8, and corrective re-offers require updater
+1.2.9. The payload ZIP is checked against the
 exact union of its managed payload files and seed files before signing.
 
 Review `release-output\1.0.5\cobble-music-update.json`, its signature, and all

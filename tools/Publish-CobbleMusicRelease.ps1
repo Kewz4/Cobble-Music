@@ -38,6 +38,7 @@ param(
         'config/voxy-config.json'
     ),
     [string[]]$SeedRoots = @('config'),
+    [string[]]$ReofferSeedFiles = @(),
     [string]$SeedTemplateDir,
     [string]$LegacyCleanupManifest,
 
@@ -960,6 +961,23 @@ try {
             throw "Create-only default overlaps an authoritative managed file: $($seed.path)"
         }
     }
+    $reofferSeedPaths = [Collections.Generic.List[string]]::new()
+    $reofferSeedKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($requestedPath in $ReofferSeedFiles) {
+        $normalized = $requestedPath.Replace('\', '/')
+        Assert-CobbleSeedPathPolicy -Path $normalized -Context 're-offered create-only default' | Out-Null
+        $key = Get-CobblePathKey $normalized
+        if (-not $reofferSeedKeys.Add($key)) {
+            throw "Duplicate re-offered create-only default: $normalized"
+        }
+        if (-not $seedSet.ByKey.ContainsKey($key)) {
+            throw "Re-offered create-only default is not present in the signed seed set: $normalized"
+        }
+        $reofferSeedPaths.Add([string]$seedSet.ByKey[$key].path)
+    }
+    if ($FullBaseline -and $reofferSeedPaths.Count -ne 0) {
+        throw 'Full baselines cannot re-offer create-only defaults; they already initialize all supplied seeds for fresh installs.'
+    }
     $sourcePathByKey = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($source in $sourceFiles) { $sourcePathByKey.Add($source.path.Normalize([Text.NormalizationForm]::FormC), $source.full) }
     $seedSourcePathByKey = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -1041,7 +1059,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.8'
+            minimumUpdaterVersion = '1.2.9'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             payload = $payloadResult.Payload
             files = @($authoritativeFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
@@ -1057,13 +1075,14 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.8'
+            minimumUpdaterVersion = '1.2.9'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             base = [ordered]@{ version = $BaseVersion; manifestSha256 = $baseHash }
             payload = $payloadResult.Payload
             files = @($authoritativeFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
             payloadFiles = @($payloadFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
             seedFiles = @($seedSet.Entries | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
+            reofferSeedPaths = @($reofferSeedPaths | Sort-Object)
             deletedFiles = @($deletedFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
             legacyCleanup = @($legacyCleanup)
         }

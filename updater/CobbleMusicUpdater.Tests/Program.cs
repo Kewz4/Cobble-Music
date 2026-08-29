@@ -366,6 +366,7 @@ internal static class Program
             FileEntry("config/musicnotification.json", "notification-defaults"),
             FileEntry("mods/Axiom-5.4.2-for-MC1.21.1.jar", "optional-builder-mod")
         ];
+        valid.ReofferSeedPaths = ["config/musicnotification.json"];
         ManifestParser.Validate(valid, configuration, AssetUrls());
         Equal(5, ManifestParser.PayloadContents(valid).Count, "managed payload plus create-only defaults");
         Equal(2, ManifestParser.ManagedPayloadContents(valid).Count, "managed payload excludes defaults");
@@ -401,6 +402,21 @@ internal static class Program
         UpdateManifest deletedOverlap = DeltaManifest();
         deletedOverlap.SeedFiles = [Copy(deletedOverlap.DeletedFiles[0])];
         Throws<InvalidDataException>(() => ManifestParser.Validate(deletedOverlap, configuration, AssetUrls()));
+
+        UpdateManifest undeclaredReoffer = DeltaManifest();
+        undeclaredReoffer.ReofferSeedPaths = ["config/missing-default.json"];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(undeclaredReoffer, configuration, AssetUrls()));
+
+        UpdateManifest duplicateReoffer = DeltaManifest();
+        duplicateReoffer.SeedFiles = [FileEntry("config/profile.json", "profile")];
+        duplicateReoffer.ReofferSeedPaths = ["config/profile.json", "CONFIG/PROFILE.JSON"];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(duplicateReoffer, configuration, AssetUrls()));
+
+        UpdateManifest oldUpdaterReoffer = DeltaManifest();
+        oldUpdaterReoffer.MinimumUpdaterVersion = "1.2.8";
+        oldUpdaterReoffer.SeedFiles = [FileEntry("config/profile.json", "profile")];
+        oldUpdaterReoffer.ReofferSeedPaths = ["config/profile.json"];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(oldUpdaterReoffer, configuration, AssetUrls()));
     }
 
     private static void TestUpdaterChannelValidation()
@@ -1326,6 +1342,44 @@ internal static class Program
             NoCancellation);
         Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, fancyMenuSeedPath)), "deleting a once-offered config remains respected by later releases");
 
+        var repairDelta = new UpdateManifest
+        {
+            SchemaVersion = 2,
+            Version = "1.0.9",
+            Files = [managed],
+            SeedFiles = [configSeed, optionsSeed, axiomSeed, fancyMenuSeed],
+            ReofferSeedPaths = [fancyMenuSeedPath]
+        };
+        await WriteRelativeTextAsync(extract, fancyMenuSeedPath, "friend-pack-title-layout");
+        InstalledState preRepair = LocalStateStore.LoadState(paths);
+        await engine.ApplyTransactionAsync(
+            repairDelta,
+            HashText("repair-delta"),
+            extract,
+            preRepair,
+            signedBase: laterDelta,
+            NoCancellation);
+        Equal("friend-pack-title-layout", await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, fancyMenuSeedPath)), "signed corrective re-offer restores a missing seed once");
+        Equal("player-moved-toast", await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, mutableConfigPath)), "corrective re-offer does not overwrite existing player config");
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, axiomPath)), "corrective re-offer does not reinstall unrelated optional seeds");
+
+        File.Delete(PathSafety.CombineUnder(paths.MinecraftDirectory, fancyMenuSeedPath));
+        var postRepairDelta = new UpdateManifest
+        {
+            SchemaVersion = 2,
+            Version = "1.0.10",
+            Files = [managed],
+            SeedFiles = [configSeed, optionsSeed, axiomSeed, fancyMenuSeed]
+        };
+        await engine.ApplyTransactionAsync(
+            postRepairDelta,
+            HashText("post-repair-delta"),
+            extract,
+            LocalStateStore.LoadState(paths),
+            signedBase: repairDelta,
+            NoCancellation);
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, fancyMenuSeedPath)), "a later release without a re-offer respects player-owned absence again");
+
         UpdaterPaths freshPaths = Paths(Path.Combine(root, "fresh"));
         Directory.CreateDirectory(freshPaths.MinecraftDirectory);
         string freshExtract = Path.Combine(root, "fresh-extract");
@@ -1383,6 +1437,23 @@ internal static class Program
         var adoptionEngine = new UpdateEngine(adoptionPaths, Configuration(), _ => { });
         Equal(true, await adoptionEngine.TryAdoptExistingBaselineAsync(
             baseline, HashText("adoption"), new InstalledState(), NoCancellation), "baseline adoption ignores missing player-owned defaults and optional mods");
+
+        UpdaterPaths repairAdoptionPaths = Paths(Path.Combine(root, "adoption-reoffer"));
+        await WriteRelativeTextAsync(repairAdoptionPaths.MinecraftDirectory, managedPath, "managed-content");
+        var repairAdoptionEngine = new UpdateEngine(repairAdoptionPaths, Configuration(), _ => { });
+        var repairAdoptionManifest = new UpdateManifest
+        {
+            SchemaVersion = 2,
+            Version = "1.0.9",
+            Files = [managed],
+            SeedFiles = [optionsSeed],
+            ReofferSeedPaths = [optionsPath]
+        };
+        Equal(false, await repairAdoptionEngine.TryAdoptExistingBaselineAsync(
+            repairAdoptionManifest, HashText("repair-adoption"), new InstalledState(), NoCancellation), "baseline adoption cannot skip a missing corrective seed offer");
+        await WriteRelativeTextAsync(repairAdoptionPaths.MinecraftDirectory, optionsPath, "player-existing-options");
+        Equal(true, await repairAdoptionEngine.TryAdoptExistingBaselineAsync(
+            repairAdoptionManifest, HashText("repair-adoption"), new InstalledState(), NoCancellation), "baseline adoption accepts an existing corrective seed without comparing player content");
         adoptionPaths = Paths(Path.Combine(root, "adoption-with-defaults"));
         await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, managedPath, "managed-content");
         adoptionEngine = new UpdateEngine(adoptionPaths, Configuration(), _ => { });

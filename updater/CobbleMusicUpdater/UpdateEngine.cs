@@ -175,6 +175,18 @@ internal sealed class UpdateEngine
                 return false;
             }
         }
+        // Corrective seed offers must run through a signed transaction when
+        // their target is absent. Otherwise exact-baseline adoption would mark
+        // the seed as offered without ever restoring the missing file.
+        foreach (string reofferPath in manifest.ReofferSeedPaths)
+        {
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, reofferPath);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (!File.Exists(target))
+            {
+                return false;
+            }
+        }
         foreach (string cleanupPath in manifest.DeletePaths
             .Concat(manifest.DeletedFiles.Select(file => file.Path))
             .Concat(manifest.LegacyCleanup.Select(file => file.Path))
@@ -518,6 +530,7 @@ internal sealed class UpdateEngine
             || !string.IsNullOrWhiteSpace(previousState.ManifestSha256)
             || previousState.ManagedFiles.Count != 0;
         var previouslyOfferedSeeds = previousState.OfferedSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var reofferSeedPaths = manifest.ReofferSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (signedBase is not null)
         {
             // State written by 1.2.6/1.2.7 has no seed ledger. A signed delta
@@ -636,7 +649,9 @@ internal sealed class UpdateEngine
                     continue;
                 }
                 bool canInitialize = !hasPreviousIdentity
-                    || (manifest.SchemaVersion == 2 && !previouslyOfferedSeeds.Contains(seedFile.Path));
+                    || (manifest.SchemaVersion == 2
+                        && (!previouslyOfferedSeeds.Contains(seedFile.Path)
+                            || reofferSeedPaths.Contains(seedFile.Path)));
                 if (!canInitialize)
                 {
                     _log($"Keeping player-owned absence: {seedFile.Path}");
