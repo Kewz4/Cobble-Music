@@ -172,7 +172,28 @@ function Invoke-GhReleaseUploadBatches(
 function Invoke-GhJson {
     param([Parameter(Mandatory)][string[]]$Arguments)
 
-    $json = Invoke-NativeText -Command 'gh' -Arguments $Arguments
+    $isReadOnlyApiRequest = $Arguments.Count -ge 2 -and
+        $Arguments[0] -ceq 'api' -and
+        -not ($Arguments -contains '--method') -and
+        -not ($Arguments -contains '-X')
+    $maximumAttempts = if ($isReadOnlyApiRequest) { 6 } else { 1 }
+    $json = $null
+    for ($attempt = 1; $attempt -le $maximumAttempts; $attempt++) {
+        try {
+            $json = Invoke-NativeText -Command 'gh' -Arguments $Arguments
+            break
+        }
+        catch {
+            $message = [string]$_.Exception.Message
+            $isTransientTransportFailure = $message -match '(?i)(unexpected EOF|TLS handshake timeout|connection (?:timed out|reset)|i/o timeout|stream error|HTTP (?:502|503|504))'
+            if (-not $isReadOnlyApiRequest -or -not $isTransientTransportFailure -or $attempt -eq $maximumAttempts) {
+                throw
+            }
+            $delayMilliseconds = [Math]::Min(5000, 500 * [Math]::Pow(2, $attempt - 1))
+            Write-Warning "Transient GitHub read failure (attempt $attempt/$maximumAttempts); retrying in $delayMilliseconds ms."
+            Start-Sleep -Milliseconds $delayMilliseconds
+        }
+    }
     try { return $json | ConvertFrom-Json }
     catch { throw "GitHub CLI returned invalid JSON for: gh $($Arguments -join ' ')" }
 }
