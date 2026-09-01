@@ -165,6 +165,30 @@ Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'config/MCBrowser/tabs.json' }
 Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'config/dreamdisplays/config.toml' } 'Credential-bearing DreamDisplays config was accepted as a create-only default.'
 Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'config/cobbreeding/encryption' } 'Generated Cobbreeding AES key was accepted as a create-only default.'
 Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'config/jade/usernamecache.json' } 'Jade username cache was accepted as a create-only default.'
+$historicPrivateSeedBase = [pscustomobject]@{
+    schemaVersion = 2
+    modpackId = 'cobble-music'
+    channel = 'stable'
+    version = '1.0.13'
+    releaseTag = 'modpack-v1.0.13'
+    files = $base
+    seedFiles = @((New-Record 'config/cobbreeding/encryption' 32 '7'))
+}
+Assert-True ($null -ne (Assert-CobbleBaseManifest -Manifest $historicPrivateSeedBase -ExpectedVersion '1.0.13' -TargetVersion '1.0.14')) `
+    'The exact historical v1.0.13 Cobbreeding seed could not be authenticated for retirement.'
+$newBaselineWithPrivateSeed = $seedBaseline.PSObject.Copy()
+$newBaselineWithPrivateSeed.seedFiles = @((New-Record 'config/cobbreeding/encryption' 32 '7'))
+Assert-Throws { Assert-CobbleV1Manifest -Manifest $newBaselineWithPrivateSeed } `
+    'A new baseline was allowed to redistribute the historical Cobbreeding encryption state.'
+$wrongHistoricPrivateSeedBase = ($historicPrivateSeedBase | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$wrongHistoricPrivateSeedBase.version = '1.0.12'
+$wrongHistoricPrivateSeedBase.releaseTag = 'modpack-v1.0.12'
+Assert-Throws { Assert-CobbleBaseManifest -Manifest $wrongHistoricPrivateSeedBase -ExpectedVersion '1.0.12' -TargetVersion '1.0.14' } `
+    'The historical Cobbreeding seed exception was accepted outside exact base v1.0.13.'
+$otherPrivateSeedBase = ($historicPrivateSeedBase | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$otherPrivateSeedBase.seedFiles = @((New-Record 'config/jade/usernamecache.json' 32 '7'))
+Assert-Throws { Assert-CobbleBaseManifest -Manifest $otherPrivateSeedBase -ExpectedVersion '1.0.13' -TargetVersion '1.0.14' } `
+    'The exact historical exception broadened to unrelated private runtime state.'
 $deltaBaseInV1 = $baselineManifest.PSObject.Copy()
 $deltaBaseInV1 | Add-Member -NotePropertyName base -NotePropertyValue ([pscustomobject]@{ version = '1.0.3'; manifestSha256 = (New-Hash 'a') })
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $deltaBaseInV1 } 'V1 staged resume accepted a delta-only base.'

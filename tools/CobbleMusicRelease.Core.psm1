@@ -533,7 +533,8 @@ function ConvertTo-CobbleSeedFileRecordSet {
     param(
         [AllowEmptyCollection()]
         [Parameter(Mandatory)][object[]]$Entries,
-        [Parameter(Mandatory)][string]$Context
+        [Parameter(Mandatory)][string]$Context,
+        [switch]$AllowHistoricalCobbreedingEncryption
     )
 
     $byKey = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
@@ -541,7 +542,18 @@ function ConvertTo-CobbleSeedFileRecordSet {
     foreach ($entry in $Entries) {
         if ($null -eq $entry) { throw "$Context contains a null file entry." }
         $path = [string]$entry.path
-        Assert-CobbleSeedPathPolicy -Path $path -Context $Context | Out-Null
+        $isHistoricalCobbreedingEncryption = $AllowHistoricalCobbreedingEncryption -and
+            $path.Replace('\', '/') -ieq 'config/cobbreeding/encryption'
+        if ($isHistoricalCobbreedingEncryption) {
+            # v1.0.13 accidentally shipped this generated key as a seed. It is
+            # accepted only while authenticating that exact signed base so a
+            # clean delta can retire it. It is never accepted into a new
+            # manifest or payload and is never deleted from a player's files.
+            Assert-CobbleManagedPath -Path $path -Context $Context | Out-Null
+        }
+        else {
+            Assert-CobbleSeedPathPolicy -Path $path -Context $Context | Out-Null
+        }
 
         [int64]$size = 0
         if ($null -eq $entry.size -or -not [int64]::TryParse(
@@ -854,7 +866,9 @@ function Assert-CobbleBaseManifest {
     $files = @($Manifest.files)
     $fileSet = ConvertTo-CobbleFileRecordSet -Entries $files -Context 'signed base manifest files'
     $seedFilesState = Get-CobbleRuntimeCollectionState $Manifest 'seedFiles' 'Signed base seedFiles'
-    $seedSet = ConvertTo-CobbleSeedFileRecordSet -Entries @($seedFilesState.Entries) -Context 'signed base create-only defaults'
+    $seedSet = ConvertTo-CobbleSeedFileRecordSet -Entries @($seedFilesState.Entries) `
+        -Context 'signed base create-only defaults' `
+        -AllowHistoricalCobbreedingEncryption:([string]$Manifest.version -ceq '1.0.13')
     foreach ($seed in $seedSet.Entries) {
         if ($fileSet.ByKey.ContainsKey((Get-CobblePathKey $seed.path))) {
             throw "Signed base overlaps managed files and create-only defaults: $($seed.path)"
