@@ -1,0 +1,7 @@
+[
+  {
+    "path": "config/iris.properties",
+    "oldText": "shaderPack=Max Quality (Iteration RP - Path Traced)",
+    "newText": "shaderPack=Max Quality (Iteration RP - Path Traced).zip"
+  }
+]

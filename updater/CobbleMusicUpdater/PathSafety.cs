@@ -45,6 +45,12 @@ internal static class PathSafety
         {
             return true;
         }
+        if (normalizedRelativePath.StartsWith("shaderpacks/", StringComparison.OrdinalIgnoreCase))
+        {
+            string fileName = normalizedRelativePath["shaderpacks/".Length..];
+            return !fileName.Contains('/')
+                && fileName.EndsWith(".txt", StringComparison.OrdinalIgnoreCase);
+        }
         if (!normalizedRelativePath.StartsWith("config/", StringComparison.OrdinalIgnoreCase))
         {
             return false;
@@ -61,6 +67,9 @@ internal static class PathSafety
                 "config/dreamdisplays/config.toml",
                 StringComparison.OrdinalIgnoreCase);
     }
+
+    public static bool IsSeedTextReplacementAllowed(string normalizedRelativePath) =>
+        string.Equals(normalizedRelativePath, "config/iris.properties", StringComparison.OrdinalIgnoreCase);
 
     public static bool IsOptionalPlayerMod(string normalizedRelativePath)
     {

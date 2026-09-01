@@ -39,6 +39,7 @@ param(
     ),
     [string[]]$SeedRoots = @('config'),
     [string[]]$ReofferSeedFiles = @(),
+    [string]$SeedTextReplacementManifest,
     [string]$SeedTemplateDir,
     [string]$LegacyCleanupManifest,
 
@@ -405,7 +406,7 @@ function Assert-SourceStateBoundToBase(
 function Read-LegacyCleanupManifest([string]$Path, [string[]]$ForbiddenPaths) {
     if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
     $entries = @(Read-JsonFile -Path $Path -Description 'Legacy cleanup manifest')
-    $set = ConvertTo-CobbleFileRecordSet -Entries $entries -Context 'legacy cleanup manifest' -AllowEmpty
+    $set = ConvertTo-CobbleLegacyCleanupSet -Entries $entries -Context 'legacy cleanup manifest'
     $forbidden = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($item in $ForbiddenPaths) { [void]$forbidden.Add($item.Normalize([Text.NormalizationForm]::FormC)) }
     foreach ($entry in $set.Entries) {
@@ -414,6 +415,31 @@ function Read-LegacyCleanupManifest([string]$Path, [string[]]$ForbiddenPaths) {
         }
     }
     return @($set.Entries | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
+}
+
+function Read-SeedTextReplacementManifest([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
+    $entries = @(Read-JsonFile -Path $Path -Description 'Seed text replacement manifest')
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $result = [Collections.Generic.List[object]]::new()
+    foreach ($entry in $entries) {
+        $pathValue = [string]$entry.path
+        Assert-CobbleSeedTextReplacementPathPolicy -Path $pathValue -Context 'seed text replacement' | Out-Null
+        $key = Get-CobblePathKey $pathValue
+        $oldText = [string]$entry.oldText
+        $newText = [string]$entry.newText
+        if (-not $seen.Add($key) -or [string]::IsNullOrEmpty($oldText) -or [string]::IsNullOrEmpty($newText) -or
+            $oldText -ceq $newText -or $oldText.Length -gt 4096 -or $newText.Length -gt 4096 -or
+            $oldText.Contains([char]0) -or $newText.Contains([char]0) -or
+            $oldText.Contains("`n") -or $oldText.Contains("`r") -or
+            $newText.Contains("`n") -or $newText.Contains("`r") -or
+            -not $oldText.StartsWith('shaderPack=', [StringComparison]::Ordinal) -or
+            -not $newText.StartsWith('shaderPack=', [StringComparison]::Ordinal)) {
+            throw "Seed text replacement is unsafe or duplicated: $pathValue"
+        }
+        $result.Add([ordered]@{ path = $pathValue; oldText = $oldText; newText = $newText })
+    }
+    return @($result)
 }
 
 function Split-ReleaseFile([string]$Source, [string]$DestinationRoot, [int64]$ChunkBytes) {
@@ -960,12 +986,20 @@ try {
             $path.Substring('mods/'.Length).StartsWith('axiom', [StringComparison]::OrdinalIgnoreCase) -and
             $path.Substring('mods/'.Length) -imatch '\.jar(?:\.disabled)?$'
     })
+    $shaderOptionSeedSources = @($allManagedSourceFiles | Where-Object {
+        $path = [string]$_.path
+        if (-not $path.StartsWith('shaderpacks/', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $underShaderpacks = $path.Substring('shaderpacks/'.Length)
+        return -not $underShaderpacks.Contains('/') -and $underShaderpacks.EndsWith('.txt', [StringComparison]::OrdinalIgnoreCase)
+    })
     $sourceFiles = @($allManagedSourceFiles | Where-Object {
         $candidate = $_
-        -not ($optionalAxiomSources | Where-Object { $_.path -ieq $candidate.path })
+        -not ($optionalAxiomSources | Where-Object { $_.path -ieq $candidate.path }) -and
+            -not ($shaderOptionSeedSources | Where-Object { $_.path -ieq $candidate.path })
     })
 
-    $effectiveSeedPaths = @($SeedFiles) + @($optionalAxiomSources | ForEach-Object { $_.path })
+    $effectiveSeedPaths = @($SeedFiles) + @($optionalAxiomSources | ForEach-Object { $_.path }) +
+        @($shaderOptionSeedSources | ForEach-Object { $_.path })
     $seedSourceFiles = @(
         Get-CobbleSeedSourceFiles -SourceMinecraftDir $SourceMinecraftDir -SeedFiles $effectiveSeedPaths `
             -SeedRoots $SeedRoots -ExcludeFiles $IncludeFiles -SeedTemplateDir $SeedTemplateDir |
@@ -999,6 +1033,23 @@ try {
     if ($FullBaseline -and $reofferSeedPaths.Count -ne 0) {
         throw 'Full baselines cannot re-offer create-only defaults; they already initialize all supplied seeds for fresh installs.'
     }
+    $seedTextReplacements = @(Read-SeedTextReplacementManifest $SeedTextReplacementManifest)
+    foreach ($replacement in $seedTextReplacements) {
+        $key = Get-CobblePathKey ([string]$replacement.path)
+        if (-not $seedSet.ByKey.ContainsKey($key) -or -not $reofferSeedKeys.Contains($key)) {
+            throw "Seed text replacement must reference a re-offered signed seed: $($replacement.path)"
+        }
+    }
+    if ($FullBaseline -and $seedTextReplacements.Count -ne 0) {
+        throw 'Full baselines cannot carry one-time seed text replacements.'
+    }
+
+    $potentialCleanupOverlaps = @($currentSet.Entries) + @($baseFiles) + @($seedSet.Entries)
+    $forbiddenCleanupPaths = @($potentialCleanupOverlaps | Where-Object {
+        -not $reofferSeedKeys.Contains((Get-CobblePathKey $_.path))
+    } | ForEach-Object { $_.path })
+    $legacyCleanup = Read-LegacyCleanupManifest $LegacyCleanupManifest $forbiddenCleanupPaths
+    $legacyCleanupSet = ConvertTo-CobbleLegacyCleanupSet -Entries @($legacyCleanup) -Context 'legacy cleanup manifest'
     $sourcePathByKey = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($source in $sourceFiles) { $sourcePathByKey.Add($source.path.Normalize([Text.NormalizationForm]::FormC), $source.full) }
     $seedSourcePathByKey = [Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -1013,11 +1064,17 @@ try {
         $ownershipTransitions = @($baseFiles | Where-Object {
             $seedSet.ByKey.ContainsKey((Get-CobblePathKey $_.path))
         })
-        if ($ownershipTransitions.Count -gt 0) {
-            $paths = @($ownershipTransitions | ForEach-Object { $_.path }) -join ', '
-            throw "A signed-base managed file is becoming a player-owned seed ($paths). Publish this ownership transition with -FullBaseline so existing player files are preserved instead of deleted."
+        foreach ($transition in $ownershipTransitions) {
+            $key = Get-CobblePathKey $transition.path
+            $hasExactTransitionIdentity = $legacyCleanupSet.ByKey.ContainsKey($key) -and @(
+                $legacyCleanupSet.ByKey[$key] | Where-Object { Test-CobbleSameFileRecord -Left $_ -Right $transition }
+            ).Count -gt 0
+            if (-not $reofferSeedKeys.Contains($key) -or -not $hasExactTransitionIdentity) {
+                throw "Managed-to-player-owned transition requires an exact signed cleanup identity and a corrective re-offer: $($transition.path)"
+            }
         }
-        $deltaPlan = New-CobbleDeltaPlan -CurrentFiles @($currentSet.Entries) -BaseFiles $baseFiles
+        $deltaPlan = New-CobbleDeltaPlan -CurrentFiles @($currentSet.Entries) -BaseFiles $baseFiles `
+            -OwnershipTransitionPaths @($ownershipTransitions | ForEach-Object { $_.path })
         $authoritativeFiles = @($deltaPlan.Files)
         $payloadFiles = @($deltaPlan.PayloadFiles)
         $deletedFiles = @($deltaPlan.DeletedFiles)
@@ -1066,9 +1123,6 @@ try {
         }
     )
 
-    $forbiddenCleanupPaths = @($authoritativeFiles | ForEach-Object { $_.path }) +
-        @($baseFiles | ForEach-Object { $_.path }) + @($seedSet.Entries | ForEach-Object { $_.path })
-    $legacyCleanup = Read-LegacyCleanupManifest $LegacyCleanupManifest $forbiddenCleanupPaths
     New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
     Assert-Under $OutputRoot $ReleaseOutputRoot
     $payloadResult = New-PayloadParts -PayloadFiles $archiveFiles -PayloadSeedFiles @($seedSet.Entries)
@@ -1080,7 +1134,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.9'
+            minimumUpdaterVersion = '1.2.10'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             payload = $payloadResult.Payload
             files = @($authoritativeFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
@@ -1096,7 +1150,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.9'
+            minimumUpdaterVersion = '1.2.10'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             base = [ordered]@{ version = $BaseVersion; manifestSha256 = $baseHash }
             payload = $payloadResult.Payload
@@ -1104,6 +1158,7 @@ try {
             payloadFiles = @($payloadFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
             seedFiles = @($seedSet.Entries | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
             reofferSeedPaths = @($reofferSeedPaths | Sort-Object)
+            seedTextReplacements = @($seedTextReplacements)
             deletedFiles = @($deletedFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
             legacyCleanup = @($legacyCleanup)
         }

@@ -201,7 +201,16 @@ internal static class TransactionStore
             {
                 PathSafety.AssertNoReparsePointsOnTargetPath(rollbackRoot, operation.BackupPath);
             }
+        }
 
+        // A corrective refresh can delete an exact old seed and then create
+        // its signed replacement at the same path. Only the final operation
+        // defines the committed target outcome; earlier operations still have
+        // their backup paths validated above and are retained for rollback.
+        foreach (TransactionOperation operation in journal.Operations
+            .GroupBy(operation => operation.TargetPath, StringComparer.OrdinalIgnoreCase)
+            .Select(group => group.Last()))
+        {
             if (operation.Kind == "delete")
             {
                 if (File.Exists(operation.TargetPath) || Directory.Exists(operation.TargetPath))

@@ -74,6 +74,20 @@ turning mutable settings into managed content or resurrecting unrelated removed
 defaults. Exact-baseline adoption is disabled while any corrective target is
 missing so adoption cannot silently skip the repair.
 
+Updater 1.2.10 adds exact corrective reconciliation for installs that an older
+updater already marked current while leaving known legacy files behind. Signed
+cleanup may accept multiple reviewed size/SHA-256 identities for one path, so
+official old Packed Packs profiles and unpacked shader generations can be
+replaced while any modified player copy is preserved. It also supports a
+signed managed-to-seed transition in a delta when the old signed base identity
+is listed for exact cleanup and the target seed is re-offered. Top-level Iris
+shader option sidecars are therefore player-owned after migration. A separate
+text migration is compile-time restricted to the exact `shaderPack=` line in
+`config/iris.properties`; it cannot rewrite `options.txt`, keybinds, video,
+sound, Sodium, Voxy, or arbitrary mod settings. Corrective reconciliation runs
+even when local state already names the target release, and committed seed
+refreshes remain recoverable across an interrupted launch.
+
 Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
 An **unrecoverable local transaction** is the sole fail-closed case: Prism is
@@ -448,21 +462,21 @@ updater state must itself match the exact signed base version/hash/inventory:
   -SourceMinecraftDir $source
 ```
 
-There is one deliberate exception: the first release that moves a path from
-managed `files` into player-owned `seedFiles` must be a full schema-v1
-baseline. A delta would otherwise describe the old managed path as a deletion.
-The schema-v1 updater path excludes seeds from cleanup, preserves any existing
-player copy, and records only the remaining immutable files in the new state.
-The publisher rejects a delta that attempts this ownership transition. For
-example, the 1.0.6 settings/Axiom ownership migration is staged with:
+Updater 1.2.10 can move a path from managed `files` into player-owned
+`seedFiles` in a schema-v2 delta. The publisher requires the exact signed base
+identity in `legacyCleanup` and requires the path in `reofferSeedPaths`. An
+unchanged official file is refreshed as the new seed, while a locally modified
+copy survives and simply becomes player-owned. Older updater generations used
+a full schema-v1 baseline for this transition. For example, the 1.0.6
+settings/Axiom ownership migration was staged with:
 
 ```powershell
 .\tools\Publish-CobbleMusicRelease.ps1 -Version 1.0.6 -FullBaseline `
   -SourceMinecraftDir $source
 ```
 
-After that baseline has established the new ownership model, later releases
-can return to schema-v2 deltas.
+After that baseline established the original ownership model, later releases
+returned to schema-v2 deltas.
 
 A corrective delta may safely restore particular missing defaults without
 overwriting existing player copies:
@@ -532,12 +546,15 @@ seeded into a release.
 Generated caches, backups, MCBrowser tab state, and the credential-bearing
 DreamDisplays service config are excluded. Only the music bridge, pack-version
 marker, Log Begone policy, and resource-pack policy remain managed configs.
-Shaderpacks are managed pack content and therefore receive normal signed
-updates and repairs. Every current top-level Axiom JAR is automatically removed
+Shaderpack ZIPs and folders are managed pack content and therefore receive
+normal signed updates and repairs. Top-level Iris `.txt` option sidecars are
+create-only player settings, so later shader-option edits do not trigger a
+repair or download. Every current top-level Axiom JAR is automatically removed
 from the immutable inventory and added to the create-only inventory. Historical
 seed releases require updater 1.2.6 or newer; releases using the one-time
-migration ledger require updater 1.2.8, and corrective re-offers require updater
-1.2.9. The payload ZIP is checked against the
+migration ledger require updater 1.2.8, corrective re-offers require updater
+1.2.9, and exact seed refreshes, managed-to-seed transitions, or Iris selector
+migrations require updater 1.2.10. The payload ZIP is checked against the
 exact union of its managed payload files and seed files before signing.
 
 Review `release-output\1.0.5\cobble-music-update.json`, its signature, and all

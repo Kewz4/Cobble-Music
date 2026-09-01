@@ -37,6 +37,7 @@ internal static class ManifestParser
             || manifest.DeletedFiles is null
             || manifest.SeedFiles is null
             || manifest.ReofferSeedPaths is null
+            || manifest.SeedTextReplacements is null
             || manifest.DeletePaths is null
             || manifest.LegacyCleanup is null
             || manifest.Files.Count == 0)
@@ -64,6 +65,7 @@ internal static class ManifestParser
         Dictionary<string, ManifestFile> files = ValidateFileSet(manifest.Files, configuration, "managed file");
         Dictionary<string, ManifestFile> seedFiles = ValidateSeedFileSet(manifest.SeedFiles);
         HashSet<string> reofferSeedPaths = ValidateReofferSeedPaths(manifest.ReofferSeedPaths, seedFiles);
+        ValidateSeedTextReplacements(manifest.SeedTextReplacements, seedFiles, reofferSeedPaths);
         if (seedFiles.Keys.Any(files.ContainsKey))
         {
             throw new InvalidDataException("Signed release manifest overlaps managed files and create-only defaults.");
@@ -80,11 +82,15 @@ internal static class ManifestParser
         }
         else
         {
+            if (manifest.SeedTextReplacements.Count != 0 && requiredUpdater < new Version(1, 2, 10))
+            {
+                throw new InvalidDataException("Signed seed text replacements require updater 1.2.10 or newer.");
+            }
             if (reofferSeedPaths.Count != 0 && requiredUpdater < new Version(1, 2, 9))
             {
                 throw new InvalidDataException("Re-offered create-only defaults require updater 1.2.9 or newer.");
             }
-            ValidateSchemaTwo(manifest, configuration, files, seedFiles, releaseVersion!, assetUrls);
+            ValidateSchemaTwo(manifest, configuration, files, seedFiles, releaseVersion!, requiredUpdater!, assetUrls);
         }
     }
 
@@ -207,6 +213,43 @@ internal static class ManifestParser
         return paths;
     }
 
+    private static void ValidateSeedTextReplacements(
+        IList<SeedTextReplacement> entries,
+        IReadOnlyDictionary<string, ManifestFile> seedFiles,
+        IReadOnlySet<string> reofferSeedPaths)
+    {
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (SeedTextReplacement replacement in entries)
+        {
+            if (replacement is null)
+            {
+                throw new InvalidDataException("Release manifest contains an empty seed text replacement.");
+            }
+            replacement.Path = PathSafety.NormalizeRelativePath(replacement.Path);
+            if (!PathSafety.IsSeedTextReplacementAllowed(replacement.Path)
+                || !seedFiles.ContainsKey(replacement.Path)
+                || !reofferSeedPaths.Contains(replacement.Path)
+                || !paths.Add(replacement.Path)
+                || string.IsNullOrEmpty(replacement.OldText)
+                || string.IsNullOrEmpty(replacement.NewText)
+                || string.Equals(replacement.OldText, replacement.NewText, StringComparison.Ordinal)
+                || replacement.OldText.Length > 4096
+                || replacement.NewText.Length > 4096
+                || replacement.OldText.Contains('\0')
+                || replacement.NewText.Contains('\0')
+                || replacement.OldText.Contains('\n')
+                || replacement.OldText.Contains('\r')
+                || replacement.NewText.Contains('\n')
+                || replacement.NewText.Contains('\r')
+                || !replacement.OldText.StartsWith("shaderPack=", StringComparison.Ordinal)
+                || !replacement.NewText.StartsWith("shaderPack=", StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    $"Release manifest contains an unsafe, duplicate, or undeclared seed text replacement: {replacement.Path}");
+            }
+        }
+    }
+
     private static void ValidateSchemaOne(
         UpdateManifest manifest,
         UpdaterConfiguration configuration,
@@ -217,9 +260,10 @@ internal static class ManifestParser
         if (manifest.Base is not null
             || manifest.PayloadFiles.Count != 0
             || manifest.DeletedFiles.Count != 0
-            || reofferSeedPaths.Count != 0)
+            || reofferSeedPaths.Count != 0
+            || manifest.SeedTextReplacements.Count != 0)
         {
-            throw new InvalidDataException("Schema 1 releases cannot contain delta-only fields or re-offered defaults.");
+            throw new InvalidDataException("Schema 1 releases cannot contain delta-only fields, re-offered defaults, or seed text replacements.");
         }
 
         var seenDeletes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -236,8 +280,8 @@ internal static class ManifestParser
             }
         }
 
-        Dictionary<string, LegacyCleanupFile> legacy = ValidateLegacyCleanup(manifest.LegacyCleanup, configuration);
-        if (legacy.Keys.Any(files.ContainsKey) || legacy.Keys.Any(seedFiles.ContainsKey))
+        HashSet<string> legacyPaths = ValidateLegacyCleanup(manifest.LegacyCleanup, configuration);
+        if (legacyPaths.Any(files.ContainsKey) || legacyPaths.Any(seedFiles.ContainsKey))
         {
             throw new InvalidDataException("Release manifest contains a legacy cleanup path that overlaps a managed file.");
         }
@@ -249,6 +293,7 @@ internal static class ManifestParser
         IReadOnlyDictionary<string, ManifestFile> files,
         IReadOnlyDictionary<string, ManifestFile> seedFiles,
         Version releaseVersion,
+        Version requiredUpdater,
         IReadOnlyDictionary<string, Uri> assetUrls)
     {
         if (manifest.Base is null
@@ -300,20 +345,27 @@ internal static class ManifestParser
         {
             throw new InvalidDataException("Delta deletedFiles overlap the authoritative post-state.");
         }
-        Dictionary<string, LegacyCleanupFile> legacy = ValidateLegacyCleanup(manifest.LegacyCleanup, configuration);
-        if (legacy.Keys.Any(files.ContainsKey)
-            || legacy.Keys.Any(seedFiles.ContainsKey)
-            || legacy.Keys.Any(deletedFiles.ContainsKey))
+        HashSet<string> legacyPaths = ValidateLegacyCleanup(manifest.LegacyCleanup, configuration);
+        var refreshableSeeds = manifest.ReofferSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (legacyPaths.Any(path => seedFiles.ContainsKey(path) && refreshableSeeds.Contains(path))
+            && requiredUpdater < new Version(1, 2, 10))
+        {
+            throw new InvalidDataException("Refreshing an exact older seed requires updater 1.2.10 or newer.");
+        }
+        if (legacyPaths.Any(files.ContainsKey)
+            || legacyPaths.Any(deletedFiles.ContainsKey)
+            || legacyPaths.Any(path => seedFiles.ContainsKey(path) && !refreshableSeeds.Contains(path)))
         {
             throw new InvalidDataException("Delta legacy cleanup overlaps its signed managed file sets.");
         }
     }
 
-    private static Dictionary<string, LegacyCleanupFile> ValidateLegacyCleanup(
+    private static HashSet<string> ValidateLegacyCleanup(
         IEnumerable<LegacyCleanupFile> entries,
         UpdaterConfiguration configuration)
     {
-        var files = new Dictionary<string, LegacyCleanupFile>(StringComparer.OrdinalIgnoreCase);
+        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var identities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (LegacyCleanupFile file in entries)
         {
             if (file is null)
@@ -322,14 +374,19 @@ internal static class ManifestParser
             }
             file.Path = PathSafety.NormalizeRelativePath(file.Path);
             if (!PathSafety.IsAllowed(file.Path, configuration.AllowedRoots)
-                || file.Size < 0
-                || !files.TryAdd(file.Path, file))
+                || file.Size < 0)
             {
-                throw new InvalidDataException($"Release manifest contains an unsafe or duplicate legacy cleanup path: {file.Path}");
+                throw new InvalidDataException($"Release manifest contains an unsafe legacy cleanup entry: {file.Path}");
             }
             ValidateHash(file.Sha256, $"legacy cleanup file {file.Path}");
+            string identity = $"{file.Path}\0{file.Size}\0{file.Sha256}";
+            if (!identities.Add(identity))
+            {
+                throw new InvalidDataException($"Release manifest contains a duplicate legacy cleanup identity: {file.Path}");
+            }
+            paths.Add(file.Path);
         }
-        return files;
+        return paths;
     }
 
     internal static bool SameFile(ManifestFile left, ManifestFile right) =>

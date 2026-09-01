@@ -105,6 +105,10 @@ internal sealed class UpdateManifest
     // again when they are missing. Existing files still always win, and the
     // repair applies only while installing this signed release.
     public List<string> ReofferSeedPaths { get; set; } = [];
+    // Signed, narrowly scoped literal replacements for player-owned text
+    // settings. They are applied only when the exact old text is present;
+    // every other byte and every unrelated setting remains player-owned.
+    public List<SeedTextReplacement> SeedTextReplacements { get; set; } = [];
     public List<ManifestFile> Files { get; set; } = [];
     public List<string> DeletePaths { get; set; } = [];
     public List<LegacyCleanupFile> LegacyCleanup { get; set; } = [];
@@ -136,6 +140,13 @@ internal sealed class ManifestFile
     public string Path { get; set; } = "";
     public long Size { get; set; }
     public string Sha256 { get; set; } = "";
+}
+
+internal sealed class SeedTextReplacement
+{
+    public string Path { get; set; } = "";
+    public string OldText { get; set; } = "";
+    public string NewText { get; set; } = "";
 }
 
 // Used only for a reviewed, one-time migration from a known older pack. The

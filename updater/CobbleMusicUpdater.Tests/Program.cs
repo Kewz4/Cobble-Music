@@ -38,6 +38,7 @@ internal static class Program
             await TestDeltaApplyTimeValidationAsync(Path.Combine(tempRoot, "delta-toctou"));
             await TestSchemaOneSanitizedRecoveryAsync(Path.Combine(tempRoot, "sanitized-baseline"));
             await TestCreateOnlyDefaultsAsync(Path.Combine(tempRoot, "create-only-defaults"));
+            await TestCorrectiveSeedRefreshAndAdoptionAsync(Path.Combine(tempRoot, "corrective-seed-refresh"));
             await TestJournalCommitBoundaryAsync(Path.Combine(tempRoot, "journal"));
             await TestCrossVolumeTransactionRecoveryAsync(Path.Combine(tempRoot, "cross-volume"));
             Console.WriteLine("Schema-v2 delta, release-chain, exact-baseline adoption, base-integrity, and journal commit-boundary checks passed.");
@@ -378,6 +379,54 @@ internal static class Program
         shaderRelease.PayloadFiles.Add(Copy(shaderFile));
         ManifestParser.Validate(shaderRelease, shaderConfiguration, AssetUrls());
         Equal(true, BuildInfo.SupportedRoots.Contains("shaderpacks"), "shaderpacks compiled update root");
+
+        var correctiveConfiguration = new UpdaterConfiguration { AllowedRoots = ["mods", "shaderpacks", "config"] };
+        UpdateManifest corrective = DeltaManifest();
+        corrective.MinimumUpdaterVersion = BuildInfo.Version;
+        corrective.SeedFiles =
+        [
+            FileEntry("shaderpacks/Max Quality.zip.txt", "new-shader-options"),
+            FileEntry("config/iris.properties", "shaderPack=Max Quality.zip\n")
+        ];
+        corrective.ReofferSeedPaths = corrective.SeedFiles.Select(file => file.Path).ToList();
+        corrective.SeedTextReplacements =
+        [
+            new SeedTextReplacement
+            {
+                Path = "config/iris.properties",
+                OldText = "shaderPack=Max Quality",
+                NewText = "shaderPack=Max Quality.zip"
+            }
+        ];
+        corrective.LegacyCleanup =
+        [
+            new LegacyCleanupFile { Path = "shaderpacks/Max Quality.zip.txt", Size = 10, Sha256 = HashText("old-a") },
+            new LegacyCleanupFile { Path = "shaderpacks/Max Quality.zip.txt", Size = 11, Sha256 = HashText("old-b") }
+        ];
+        ManifestParser.Validate(corrective, correctiveConfiguration, AssetUrls());
+
+        UpdateManifest duplicateCleanupIdentity = CloneManifest(corrective);
+        duplicateCleanupIdentity.LegacyCleanup.Add(new LegacyCleanupFile
+        {
+            Path = corrective.LegacyCleanup[0].Path,
+            Size = corrective.LegacyCleanup[0].Size,
+            Sha256 = corrective.LegacyCleanup[0].Sha256
+        });
+        Throws<InvalidDataException>(() => ManifestParser.Validate(duplicateCleanupIdentity, correctiveConfiguration, AssetUrls()));
+
+        UpdateManifest oldUpdaterTextMigration = CloneManifest(corrective);
+        oldUpdaterTextMigration.MinimumUpdaterVersion = "1.2.9";
+        Throws<InvalidDataException>(() => ManifestParser.Validate(oldUpdaterTextMigration, correctiveConfiguration, AssetUrls()));
+
+        UpdateManifest undeclaredTextMigration = CloneManifest(corrective);
+        undeclaredTextMigration.SeedTextReplacements[0].Path = "config/not-a-seed.properties";
+        Throws<InvalidDataException>(() => ManifestParser.Validate(undeclaredTextMigration, correctiveConfiguration, AssetUrls()));
+
+        UpdateManifest optionsTextMigration = CloneManifest(corrective);
+        optionsTextMigration.SeedFiles.Add(FileEntry("options.txt", "player-options"));
+        optionsTextMigration.ReofferSeedPaths.Add("options.txt");
+        optionsTextMigration.SeedTextReplacements[0].Path = "options.txt";
+        Throws<InvalidDataException>(() => ManifestParser.Validate(optionsTextMigration, correctiveConfiguration, AssetUrls()));
 
         UpdateManifest nonOptionalMod = DeltaManifest();
         nonOptionalMod.SeedFiles = [FileEntry("mods/required-mod.jar", "not-optional")];
@@ -1097,6 +1146,9 @@ internal static class Program
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             await File.WriteAllTextAsync(target, content);
         }
+        await File.WriteAllTextAsync(
+            PathSafety.CombineUnder(paths.MinecraftDirectory, "options.txt"),
+            "starter-options");
 
         string manifestHash = HashText("baseline-manifest");
         var engine = new UpdateEngine(paths, Configuration(), _ => { });
@@ -1435,8 +1487,8 @@ internal static class Program
         UpdaterPaths adoptionPaths = Paths(Path.Combine(root, "adoption"));
         await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, managedPath, "managed-content");
         var adoptionEngine = new UpdateEngine(adoptionPaths, Configuration(), _ => { });
-        Equal(true, await adoptionEngine.TryAdoptExistingBaselineAsync(
-            baseline, HashText("adoption"), new InstalledState(), NoCancellation), "baseline adoption ignores missing player-owned defaults and optional mods");
+        Equal(false, await adoptionEngine.TryAdoptExistingBaselineAsync(
+            baseline, HashText("adoption"), new InstalledState(), NoCancellation), "baseline adoption cannot mark missing first-run defaults as already offered");
 
         UpdaterPaths repairAdoptionPaths = Paths(Path.Combine(root, "adoption-reoffer"));
         await WriteRelativeTextAsync(repairAdoptionPaths.MinecraftDirectory, managedPath, "managed-content");
@@ -1459,6 +1511,7 @@ internal static class Program
         adoptionEngine = new UpdateEngine(adoptionPaths, Configuration(), _ => { });
         await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, optionsPath, "custom-existing-options");
         await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, mutableConfigPath, "custom-existing-config");
+        await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, axiomPath, "custom-existing-axiom");
         Equal(true, await adoptionEngine.TryAdoptExistingBaselineAsync(
             baseline, HashText("adoption"), new InstalledState(), NoCancellation), "baseline adoption accepts existing player-owned defaults without comparing content");
         Equal(1, LocalStateStore.LoadState(adoptionPaths).ManagedFiles.Count, "adoption excludes create-only defaults from state");
@@ -1502,12 +1555,197 @@ internal static class Program
         Equal(false, File.Exists(rollbackTarget), "interrupted first-run default creation rolls back safely");
     }
 
+    private static async Task TestCorrectiveSeedRefreshAndAdoptionAsync(string root)
+    {
+        var testConfiguration = new UpdaterConfiguration
+        {
+            AllowedRoots = ["mods", "shaderpacks", "config"]
+        };
+        const string managedPath = "mods/current.jar";
+        const string defaultProfilePath = "config/packed_packs/profiles/resourcepacks/Default.profile.json";
+        const string realisticProfilePath = "config/packed_packs/profiles/resourcepacks/Realistic.profile.json";
+        const string exactShaderOptionsPath = "shaderpacks/Max Quality.zip.txt";
+        const string customShaderOptionsPath = "shaderpacks/Balanced.zip.txt";
+        const string irisPath = "config/iris.properties";
+        const string oldSelector = "shaderPack=Max Quality (Iteration RP - Path Traced)";
+        const string newSelector = "shaderPack=Max Quality (Iteration RP - Path Traced).zip";
+
+        ManifestFile managed = FileEntry(managedPath, "managed");
+        ManifestFile exactShaderBase = FileEntry(exactShaderOptionsPath, "official-old-options");
+        ManifestFile customShaderBase = FileEntry(customShaderOptionsPath, "official-balanced-options");
+        ManifestFile oldDefault = FileEntry(defaultProfilePath, "official-old-default");
+        ManifestFile oldestDefault = FileEntry(defaultProfilePath, "official-even-older-default");
+        ManifestFile oldRealistic = FileEntry(realisticProfilePath, "official-old-realistic");
+        ManifestFile irisSeed = FileEntry(irisPath, "enableShaders=false\n" + newSelector + "\n");
+        var signedBase = new UpdateManifest
+        {
+            SchemaVersion = 2,
+            Version = "1.0.12",
+            Files = [managed, exactShaderBase, customShaderBase],
+            SeedFiles = [oldDefault, oldRealistic, irisSeed]
+        };
+        string baseHash = HashText("seed-refresh-base");
+        InstalledState previousState = StateFrom(signedBase, baseHash);
+        previousState.OfferedSeedPaths = [defaultProfilePath, realisticProfilePath, irisPath];
+
+        UpdaterPaths paths = Paths(Path.Combine(root, "upgrade"));
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, managedPath, "managed");
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, exactShaderOptionsPath, "official-old-options");
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, customShaderOptionsPath, "player-custom-balanced-options");
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, defaultProfilePath, "official-old-default");
+        await WriteRelativeTextAsync(paths.MinecraftDirectory, realisticProfilePath, "player-custom-realistic");
+        await WriteRelativeTextAsync(
+            paths.MinecraftDirectory,
+            irisPath,
+            "#Iris runtime timestamp\nenableShaders=true\nmaxShadowRenderDistance=5\n" + oldSelector + "\n");
+        await LocalStateStore.SaveStateAsync(paths, previousState, NoCancellation);
+
+        ManifestFile newDefault = FileEntry(defaultProfilePath, "official-new-default");
+        ManifestFile newRealistic = FileEntry(realisticProfilePath, "official-new-realistic");
+        ManifestFile newExactShader = FileEntry(exactShaderOptionsPath, "official-new-options");
+        ManifestFile newCustomShader = FileEntry(customShaderOptionsPath, "official-new-balanced-options");
+        var delta = new UpdateManifest
+        {
+            SchemaVersion = 2,
+            Version = "1.0.13",
+            Base = new ManifestBase { Version = signedBase.Version, ManifestSha256 = baseHash },
+            Files = [managed],
+            SeedFiles = [newDefault, newRealistic, newExactShader, newCustomShader, irisSeed],
+            ReofferSeedPaths = [defaultProfilePath, realisticProfilePath, exactShaderOptionsPath, customShaderOptionsPath, irisPath],
+            SeedTextReplacements =
+            [
+                new SeedTextReplacement { Path = irisPath, OldText = oldSelector, NewText = newSelector }
+            ],
+            LegacyCleanup =
+            [
+                new LegacyCleanupFile { Path = defaultProfilePath, Size = oldDefault.Size, Sha256 = oldDefault.Sha256 },
+                new LegacyCleanupFile { Path = defaultProfilePath, Size = oldestDefault.Size, Sha256 = oldestDefault.Sha256 },
+                new LegacyCleanupFile { Path = realisticProfilePath, Size = oldRealistic.Size, Sha256 = oldRealistic.Sha256 },
+                new LegacyCleanupFile { Path = exactShaderOptionsPath, Size = exactShaderBase.Size, Sha256 = exactShaderBase.Sha256 },
+                new LegacyCleanupFile { Path = customShaderOptionsPath, Size = customShaderBase.Size, Sha256 = customShaderBase.Sha256 }
+            ]
+        };
+        string extract = Path.Combine(root, "upgrade-extract");
+        foreach ((string path, string content) in new Dictionary<string, string>
+        {
+            [defaultProfilePath] = "official-new-default",
+            [realisticProfilePath] = "official-new-realistic",
+            [exactShaderOptionsPath] = "official-new-options",
+            [customShaderOptionsPath] = "official-new-balanced-options",
+            [irisPath] = "enableShaders=false\n" + newSelector + "\n"
+        })
+        {
+            await WriteRelativeTextAsync(extract, path, content);
+        }
+
+        var engine = new UpdateEngine(paths, testConfiguration, _ => { });
+        await DeltaValidator.ValidateBaseAsync(
+            delta,
+            signedBase,
+            baseHash,
+            previousState,
+            paths,
+            testConfiguration,
+            NoCancellation);
+        await engine.ApplyTransactionAsync(
+            delta,
+            HashText("seed-refresh-delta"),
+            extract,
+            previousState,
+            signedBase,
+            NoCancellation);
+
+        Equal("official-new-default", await ReadRelativeTextAsync(paths.MinecraftDirectory, defaultProfilePath), "known old Packed Packs profile refreshed");
+        Equal("player-custom-realistic", await ReadRelativeTextAsync(paths.MinecraftDirectory, realisticProfilePath), "custom Packed Packs profile preserved");
+        Equal("official-new-options", await ReadRelativeTextAsync(paths.MinecraftDirectory, exactShaderOptionsPath), "exact managed shader settings became refreshed player-owned seed");
+        Equal("player-custom-balanced-options", await ReadRelativeTextAsync(paths.MinecraftDirectory, customShaderOptionsPath), "modified managed shader settings survived ownership transition");
+        string migratedIris = await ReadRelativeTextAsync(paths.MinecraftDirectory, irisPath);
+        Equal(true, migratedIris.Contains("enableShaders=true", StringComparison.Ordinal), "Iris shader enablement preserved");
+        Equal(true, migratedIris.Contains("maxShadowRenderDistance=5", StringComparison.Ordinal), "unrelated Iris setting preserved");
+        Equal(true, migratedIris.Contains(newSelector, StringComparison.Ordinal), "legacy extensionless shader selector migrated to ZIP identity");
+        Equal(false, migratedIris.Contains(oldSelector + "\n", StringComparison.Ordinal), "obsolete Iris selector removed");
+        InstalledState upgradedState = LocalStateStore.LoadState(paths);
+        Equal(1, upgradedState.ManagedFiles.Count, "shader settings no longer participate in managed integrity");
+
+        UpdaterPaths adoptionPaths = Paths(Path.Combine(root, "adoption"));
+        const string retiredModPath = "mods/toughasnails-legacy.jar";
+        await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, managedPath, "managed");
+        await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, retiredModPath, "retired-mod");
+        await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, defaultProfilePath, "official-even-older-default");
+        await WriteRelativeTextAsync(adoptionPaths.MinecraftDirectory, irisPath, "enableShaders=false\n" + oldSelector + "\n");
+        var adoptionManifest = new UpdateManifest
+        {
+            SchemaVersion = 2,
+            Version = "1.0.13",
+            Files = [managed],
+            SeedFiles = [newDefault, irisSeed],
+            ReofferSeedPaths = [defaultProfilePath, irisPath],
+            SeedTextReplacements =
+            [
+                new SeedTextReplacement { Path = irisPath, OldText = oldSelector, NewText = newSelector }
+            ],
+            LegacyCleanup =
+            [
+                new LegacyCleanupFile { Path = defaultProfilePath, Size = oldDefault.Size, Sha256 = oldDefault.Sha256 },
+                new LegacyCleanupFile { Path = defaultProfilePath, Size = oldestDefault.Size, Sha256 = oldestDefault.Sha256 },
+                new LegacyCleanupFile { Path = retiredModPath, Size = "retired-mod".Length, Sha256 = HashText("retired-mod") }
+            ]
+        };
+        string adoptionExtract = Path.Combine(root, "adoption-extract");
+        await WriteRelativeTextAsync(adoptionExtract, defaultProfilePath, "official-new-default");
+        await WriteRelativeTextAsync(adoptionExtract, irisPath, "enableShaders=false\n" + newSelector + "\n");
+        var adoptionEngine = new UpdateEngine(adoptionPaths, testConfiguration, _ => { });
+        Equal(false, await adoptionEngine.TryAdoptExistingBaselineAsync(
+            adoptionManifest, HashText("adoption-manifest"), new InstalledState(), NoCancellation), "pending corrective work prevents silent exact-state adoption");
+        Equal(true, await adoptionEngine.CanRepairAndAdoptExistingTargetAsync(
+            adoptionManifest, new InstalledState(), NoCancellation), "exact managed post-state permits small corrective adoption transaction");
+        await adoptionEngine.ApplyTransactionAsync(
+            adoptionManifest,
+            HashText("adoption-manifest"),
+            adoptionExtract,
+            new InstalledState(),
+            signedBase: null,
+            NoCancellation,
+            adoptExistingPostState: true);
+        Equal(false, File.Exists(PathSafety.CombineUnder(adoptionPaths.MinecraftDirectory, retiredModPath)), "known retired unmanaged mod removed during adoption repair");
+        Equal("official-new-default", await ReadRelativeTextAsync(adoptionPaths.MinecraftDirectory, defaultProfilePath), "adoption repair refreshed old profile without full baseline");
+        Equal(true, (await ReadRelativeTextAsync(adoptionPaths.MinecraftDirectory, irisPath)).Contains(newSelector, StringComparison.Ordinal), "adoption repair migrated Iris selector");
+        InstalledState adoptedState = LocalStateStore.LoadState(adoptionPaths);
+        Equal("1.0.13", adoptedState.Version, "adoption repair committed target identity");
+        Equal(false, await adoptionEngine.HasPendingCorrectiveWorkAsync(
+            adoptionManifest,
+            adoptedState,
+            NoCancellation), "current target seed identities do not create a perpetual corrective loop");
+
+        UpdaterPaths currentPaths = Paths(Path.Combine(root, "already-current"));
+        await WriteRelativeTextAsync(currentPaths.MinecraftDirectory, managedPath, "managed");
+        await WriteRelativeTextAsync(currentPaths.MinecraftDirectory, retiredModPath, "retired-mod");
+        await WriteRelativeTextAsync(currentPaths.MinecraftDirectory, defaultProfilePath, "official-old-default");
+        await WriteRelativeTextAsync(currentPaths.MinecraftDirectory, irisPath, "enableShaders=true\n" + oldSelector + "\n");
+        string adoptionHash = HashText("adoption-manifest");
+        InstalledState currentState = StateFrom(adoptionManifest, adoptionHash);
+        currentState.OfferedSeedPaths = adoptionManifest.SeedFiles.Select(file => file.Path).ToList();
+        await LocalStateStore.SaveStateAsync(currentPaths, currentState, NoCancellation);
+        var currentEngine = new UpdateEngine(currentPaths, testConfiguration, _ => { });
+        Equal(true, await currentEngine.HasPendingCorrectiveWorkAsync(
+            adoptionManifest,
+            currentState,
+            NoCancellation), "already-current state still detects signed stale cleanup and selector work");
+        Equal(true, await currentEngine.CanRepairAndAdoptExistingTargetAsync(
+            adoptionManifest,
+            currentState,
+            NoCancellation), "already-current state can enter corrective adoption transaction");
+    }
+
     private static async Task WriteRelativeTextAsync(string root, string relativePath, string content)
     {
         string path = PathSafety.CombineUnder(root, relativePath);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         await File.WriteAllTextAsync(path, content);
     }
+
+    private static Task<string> ReadRelativeTextAsync(string root, string relativePath) =>
+        File.ReadAllTextAsync(PathSafety.CombineUnder(root, relativePath));
 
     private static async Task TestJournalCommitBoundaryAsync(string root)
     {
@@ -1543,6 +1781,65 @@ internal static class Program
         await TransactionStore.RecoverIfNeededAsync(committedPaths, BuildInfo.SupportedRoots, _ => { });
         Equal("new", await File.ReadAllTextAsync(target), "new state is the durable commit point");
         Equal(false, File.Exists(TransactionStore.JournalPath(committedPaths)), "committed journal cleanup");
+
+        UpdaterPaths refreshedSeedPaths = Paths(Path.Combine(root, "committed-refreshed-seed"));
+        Directory.CreateDirectory(refreshedSeedPaths.MinecraftDirectory);
+        Directory.CreateDirectory(refreshedSeedPaths.InstallationDirectory);
+        const string refreshedSeedRelative = "config/packed_packs/profiles/resourcepacks/Default.profile.json";
+        string refreshedSeedTarget = PathSafety.CombineUnder(refreshedSeedPaths.MinecraftDirectory, refreshedSeedRelative);
+        string refreshedSeedBackup = Path.Combine(
+            refreshedSeedPaths.LocalDataDirectory,
+            "rollback",
+            "tx",
+            "files",
+            refreshedSeedRelative.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(refreshedSeedTarget)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(refreshedSeedBackup)!);
+        await File.WriteAllTextAsync(refreshedSeedTarget, "new-profile");
+        await File.WriteAllTextAsync(refreshedSeedBackup, "old-profile");
+        var refreshedPrevious = new InstalledState { Version = "1.0.12", ManifestSha256 = HashText("old-release") };
+        var refreshedNext = new InstalledState
+        {
+            Version = "1.0.13",
+            ManifestSha256 = HashText("new-release"),
+            OfferedSeedPaths = [refreshedSeedRelative]
+        };
+        var refreshedJournal = new TransactionJournal
+        {
+            Phase = "filesApplied",
+            PreviousState = refreshedPrevious,
+            NextState = refreshedNext,
+            SeedFiles =
+            [
+                new ManagedFileState
+                {
+                    Path = refreshedSeedRelative,
+                    Size = "new-profile".Length,
+                    Sha256 = HashText("new-profile")
+                }
+            ],
+            Operations =
+            [
+                new TransactionOperation
+                {
+                    Kind = "delete",
+                    TargetPath = refreshedSeedTarget,
+                    BackupPath = refreshedSeedBackup,
+                    OriginalSize = "old-profile".Length,
+                    OriginalSha256 = HashText("old-profile")
+                },
+                new TransactionOperation
+                {
+                    Kind = "create",
+                    TargetPath = refreshedSeedTarget
+                }
+            ]
+        };
+        await LocalStateStore.SaveStateAsync(refreshedSeedPaths, refreshedNext, NoCancellation);
+        await TransactionStore.SaveAsync(refreshedSeedPaths, refreshedJournal, NoCancellation);
+        await TransactionStore.RecoverIfNeededAsync(refreshedSeedPaths, BuildInfo.SupportedRoots, _ => { });
+        Equal("new-profile", await File.ReadAllTextAsync(refreshedSeedTarget), "committed exact seed refresh survives recovery");
+        Equal(false, File.Exists(TransactionStore.JournalPath(refreshedSeedPaths)), "committed seed refresh journal cleanup");
 
         UpdaterPaths mismatchedCommitPaths = Paths(Path.Combine(root, "committed-mismatch"));
         Directory.CreateDirectory(mismatchedCommitPaths.MinecraftDirectory);
@@ -1913,6 +2210,10 @@ internal static class Program
         Size = file.Size,
         Sha256 = file.Sha256
     };
+
+    private static UpdateManifest CloneManifest(UpdateManifest manifest) =>
+        JsonSerializer.Deserialize<UpdateManifest>(JsonSerializer.Serialize(manifest))
+        ?? throw new InvalidOperationException("Could not clone test manifest.");
 
     private static UpdaterChannelDescriptor ChannelDescriptor() => new()
     {

@@ -27,6 +27,9 @@ internal static class DeltaValidator
         Dictionary<string, ManifestFile> postFiles = delta.Files.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
         Dictionary<string, ManifestFile> payloadFiles = delta.PayloadFiles.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
         Dictionary<string, ManifestFile> deletedFiles = delta.DeletedFiles.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, ManifestFile> seedFiles = delta.SeedFiles.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
+        ILookup<string, LegacyCleanupFile> legacyCleanup = delta.LegacyCleanup.ToLookup(file => file.Path, StringComparer.OrdinalIgnoreCase);
+        HashSet<string> reofferSeedPaths = delta.ReofferSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
         Dictionary<string, ManagedFileState> recordedFiles = ValidateInstalledState(installedState, configuration);
 
         if (recordedFiles.Count != baseFiles.Count)
@@ -44,6 +47,12 @@ internal static class DeltaValidator
             bool remains = postFiles.TryGetValue(path, out ManifestFile? postFile);
             bool carried = payloadFiles.TryGetValue(path, out ManifestFile? payloadFile);
             bool deleted = deletedFiles.TryGetValue(path, out ManifestFile? deletedFile);
+            bool becomesPlayerOwned = !remains
+                && seedFiles.ContainsKey(path)
+                && reofferSeedPaths.Contains(path)
+                && legacyCleanup[path].Any(transitionIdentity =>
+                    transitionIdentity.Size == baseFile.Size
+                    && string.Equals(transitionIdentity.Sha256, baseFile.Sha256, StringComparison.OrdinalIgnoreCase));
             if (remains && ManifestParser.SameFile(baseFile, postFile!))
             {
                 if (carried || deleted)
@@ -56,6 +65,13 @@ internal static class DeltaValidator
                 if (!carried || deleted || !ManifestParser.SameFile(payloadFile!, postFile!))
                 {
                     throw new InvalidDataException($"Delta omits the changed payload file: {path}");
+                }
+            }
+            else if (becomesPlayerOwned)
+            {
+                if (deleted || carried)
+                {
+                    throw new InvalidDataException($"Managed-to-player-owned transition redundantly carries or deletes: {path}");
                 }
             }
             else if (!deleted || carried || !ManifestParser.SameFile(baseFile, deletedFile!))
@@ -83,6 +99,16 @@ internal static class DeltaValidator
         // updater-owned file under the guise of a valid base version.
         foreach ((string path, ManifestFile baseFile) in baseFiles)
         {
+            bool becomesPlayerOwned = !postFiles.ContainsKey(path)
+                && seedFiles.ContainsKey(path)
+                && reofferSeedPaths.Contains(path)
+                && legacyCleanup[path].Any(transitionIdentity =>
+                    transitionIdentity.Size == baseFile.Size
+                    && string.Equals(transitionIdentity.Sha256, baseFile.Sha256, StringComparison.OrdinalIgnoreCase));
+            if (becomesPlayerOwned)
+            {
+                continue;
+            }
             cancellationToken.ThrowIfCancellationRequested();
             string target = PathSafety.CombineUnder(paths.MinecraftDirectory, path);
             PathSafety.AssertNoReparsePointsOnTargetPath(paths.MinecraftDirectory, target);

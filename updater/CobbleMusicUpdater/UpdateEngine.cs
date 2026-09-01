@@ -1,5 +1,6 @@
 using System.IO.Compression;
 using System.Security.Cryptography;
+using System.Text;
 
 namespace CobbleMusicUpdater;
 
@@ -46,11 +47,17 @@ internal sealed class UpdateEngine
         InstalledState state = LocalStateStore.LoadState(_paths);
         RemoteRelease targetRelease = releaseChain[^1];
         UpdateManifest target = targetRelease.Manifest;
-        if (IsAlreadyInstalled(state, target, targetRelease.ManifestSha256))
+        bool alreadyInstalled = IsAlreadyInstalled(state, target, targetRelease.ManifestSha256);
+        if (alreadyInstalled
+            && !await HasPendingCorrectiveWorkAsync(target, state, cancellationToken))
         {
             _log($"Already on Kewz's Cobblemon {target.Version}.");
             Report(UpdatePhase.Complete, "You’re up to date — starting Minecraft.");
             return;
+        }
+        if (alreadyInstalled)
+        {
+            _log($"Kewz's Cobblemon {target.Version} is installed, but signed corrective work is still pending.");
         }
         if (IsDowngradeOrMutation(state, target, targetRelease.ManifestSha256))
         {
@@ -72,6 +79,25 @@ internal sealed class UpdateEngine
         {
             _log($"Adopted the exact existing signed release {target.Version}; no payload download was needed.");
             Report(UpdatePhase.Complete, $"Kewz's Cobblemon {target.Version} is ready — starting Minecraft.");
+            return;
+        }
+
+        if (await CanRepairAndAdoptExistingTargetAsync(target, state, cancellationToken))
+        {
+            _log($"The managed {target.Version} files are already exact; applying signed cleanup and player-setting migrations only.");
+            var adoptionProgress = new DownloadProgressScope(CalculatePayloadDownloadBytes(target));
+            PrepareStagingAndEnsureSufficientDiskSpace(target, targetRelease.ManifestSha256, state);
+            await DownloadVerifyAndApplyAsync(
+                target,
+                targetRelease.ManifestSha256,
+                targetRelease.AssetUrls,
+                state,
+                signedBase: null,
+                adoptionProgress,
+                cancellationToken,
+                adoptExistingPostState: true);
+            _log($"Reconciled the existing files with signed release {target.Version}.");
+            Report(UpdatePhase.Complete, $"Kewz's Cobblemon {target.Version} installed — starting Minecraft.");
             return;
         }
 
@@ -175,14 +201,23 @@ internal sealed class UpdateEngine
                 return false;
             }
         }
-        // Corrective seed offers must run through a signed transaction when
-        // their target is absent. Otherwise exact-baseline adoption would mark
-        // the seed as offered without ever restoring the missing file.
-        foreach (string reofferPath in manifest.ReofferSeedPaths)
+        // A blank-state adoption must prove every supplied create-only default
+        // was actually initialized. Otherwise adoption would mark a missing
+        // seed as offered without ever installing it.
+        foreach (string seedPath in manifest.SeedFiles.Select(file => file.Path))
         {
-            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, reofferPath);
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, seedPath);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
             if (!File.Exists(target))
+            {
+                return false;
+            }
+        }
+        foreach (SeedTextReplacement replacement in manifest.SeedTextReplacements)
+        {
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, replacement.Path);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (await ContainsSeedTextAsync(target, replacement.OldText, cancellationToken))
             {
                 return false;
             }
@@ -219,6 +254,100 @@ internal sealed class UpdateEngine
         };
         await LocalStateStore.SaveStateAsync(_paths, adoptedState, cancellationToken);
         return true;
+    }
+
+    internal async Task<bool> CanRepairAndAdoptExistingTargetAsync(
+        UpdateManifest manifest,
+        InstalledState state,
+        CancellationToken cancellationToken)
+    {
+        foreach (ManifestFile file in manifest.Files)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (!File.Exists(target)
+                || new FileInfo(target).Length != file.Size
+                || !PathSafety.IsExpectedHash(await PathSafety.Sha256Async(target, cancellationToken), file.Sha256))
+            {
+                return false;
+            }
+        }
+
+        foreach (string path in manifest.DeletePaths.Concat(manifest.DeletedFiles.Select(file => file.Path)))
+        {
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, path);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (File.Exists(target) || Directory.Exists(target))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    internal async Task<bool> HasPendingCorrectiveWorkAsync(
+        UpdateManifest manifest,
+        InstalledState state,
+        CancellationToken cancellationToken)
+    {
+        var offeredSeeds = state.OfferedSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var reofferedSeeds = manifest.ReofferSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var seedFiles = manifest.SeedFiles.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
+        foreach (ManifestFile seed in manifest.SeedFiles)
+        {
+            bool shouldExist = reofferedSeeds.Contains(seed.Path) || !offeredSeeds.Contains(seed.Path);
+            if (!shouldExist)
+            {
+                continue;
+            }
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, seed.Path);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (!File.Exists(target) && !Directory.Exists(target))
+            {
+                return true;
+            }
+        }
+        foreach (SeedTextReplacement replacement in manifest.SeedTextReplacements)
+        {
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, replacement.Path);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (await ContainsSeedTextAsync(target, replacement.OldText, cancellationToken))
+            {
+                return true;
+            }
+        }
+        foreach (IGrouping<string, LegacyCleanupFile> identities in manifest.LegacyCleanup.GroupBy(
+            file => file.Path,
+            StringComparer.OrdinalIgnoreCase))
+        {
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, identities.Key);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (!File.Exists(target) || Directory.Exists(target))
+            {
+                continue;
+            }
+            var info = new FileInfo(target);
+            string actualHash = await PathSafety.Sha256Async(target, cancellationToken);
+            if (seedFiles.TryGetValue(identities.Key, out ManifestFile? currentSeed)
+                && currentSeed.Size == info.Length
+                && PathSafety.IsExpectedHash(actualHash, currentSeed.Sha256))
+            {
+                // Some ownership transitions intentionally keep identical
+                // bytes. Once the signed target state is installed, the exact
+                // current seed is not stale merely because an accepted old
+                // identity has the same hash.
+                continue;
+            }
+            foreach (LegacyCleanupFile identity in identities.Where(identity => identity.Size == info.Length))
+            {
+                if (PathSafety.IsExpectedHash(actualHash, identity.Sha256))
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private void ValidateRemoteRelease(RemoteRelease release)
@@ -288,7 +417,8 @@ internal sealed class UpdateEngine
         InstalledState previousState,
         UpdateManifest? signedBase,
         DownloadProgressScope downloadProgress,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool adoptExistingPostState = false)
     {
         string workDirectory = Path.Combine(_paths.LocalDataDirectory, "staging", manifestHash);
         string partsDirectory = Path.Combine(workDirectory, "parts");
@@ -362,7 +492,14 @@ internal sealed class UpdateEngine
         _log("Applying verified update...");
         IReadOnlyCollection<ManifestFile> payloadFiles = ManifestParser.PayloadContents(manifest);
         Report(UpdatePhase.Applying, "Installing verified files", 0, 0, 0, payloadFiles.Count);
-        await ApplyTransactionAsync(manifest, manifestHash, extractDirectory, previousState, signedBase, cancellationToken);
+        await ApplyTransactionAsync(
+            manifest,
+            manifestHash,
+            extractDirectory,
+            previousState,
+            signedBase,
+            cancellationToken,
+            adoptExistingPostState);
         TryDeleteDirectory(workDirectory);
     }
 
@@ -518,9 +655,10 @@ internal sealed class UpdateEngine
         string extractDirectory,
         InstalledState previousState,
         UpdateManifest? signedBase,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        bool adoptExistingPostState = false)
     {
-        if (manifest.SchemaVersion == 2 && signedBase is null)
+        if (manifest.SchemaVersion == 2 && signedBase is null && !adoptExistingPostState)
         {
             throw new InvalidDataException("Delta transaction is missing its signed base manifest.");
         }
@@ -564,7 +702,9 @@ internal sealed class UpdateEngine
 
         try
         {
-            IReadOnlyCollection<ManifestFile> payloadFiles = ManifestParser.ManagedPayloadContents(manifest);
+            IReadOnlyCollection<ManifestFile> payloadFiles = adoptExistingPostState
+                ? Array.Empty<ManifestFile>()
+                : ManifestParser.ManagedPayloadContents(manifest);
             Dictionary<string, ManifestFile>? signedBaseFiles = signedBase?.Files.ToDictionary(
                 file => file.Path,
                 StringComparer.OrdinalIgnoreCase);
@@ -625,6 +765,13 @@ internal sealed class UpdateEngine
                 appliedFiles++;
                 Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
             }
+
+            await ApplySeedTextReplacementsAsync(
+                manifest.SeedTextReplacements,
+                backupDirectory,
+                journal,
+                cancellationToken);
+            await ApplyLegacyCleanupAsync(manifest.LegacyCleanup, backupDirectory, journal, cancellationToken);
 
             foreach (ManifestFile seedFile in manifest.SeedFiles)
             {
@@ -690,7 +837,7 @@ internal sealed class UpdateEngine
             {
                 await ApplySchemaOneDeletesAsync(manifest, previousState, backupDirectory, journal, cancellationToken);
             }
-            else
+            else if (!adoptExistingPostState)
             {
                 foreach (ManifestFile deletedFile in manifest.DeletedFiles)
                 {
@@ -707,11 +854,13 @@ internal sealed class UpdateEngine
                     Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
                 }
             }
-            await ApplyLegacyCleanupAsync(manifest.LegacyCleanup, backupDirectory, journal, cancellationToken);
-
             if (signedBase is not null)
             {
                 await ValidateDeltaPostStateBeforeCommitAsync(manifest, signedBase, cancellationToken);
+            }
+            else if (adoptExistingPostState)
+            {
+                await ValidateAdoptedPostStateBeforeCommitAsync(manifest, cancellationToken);
             }
 
             journal.Phase = "filesApplied";
@@ -788,10 +937,22 @@ internal sealed class UpdateEngine
         CancellationToken cancellationToken)
     {
         var postFiles = delta.Files.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
+        var seedFiles = delta.SeedFiles.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
+        ILookup<string, LegacyCleanupFile> legacyCleanup = delta.LegacyCleanup.ToLookup(file => file.Path, StringComparer.OrdinalIgnoreCase);
+        var reofferSeedPaths = delta.ReofferSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (ManifestFile baseFile in signedBase.Files)
         {
             if (!postFiles.TryGetValue(baseFile.Path, out ManifestFile? postFile))
             {
+                bool becamePlayerOwned = seedFiles.ContainsKey(baseFile.Path)
+                    && reofferSeedPaths.Contains(baseFile.Path)
+                    && legacyCleanup[baseFile.Path].Any(transitionIdentity =>
+                        transitionIdentity.Size == baseFile.Size
+                        && string.Equals(transitionIdentity.Sha256, baseFile.Sha256, StringComparison.OrdinalIgnoreCase));
+                if (becamePlayerOwned)
+                {
+                    continue;
+                }
                 string deletedTarget = PathSafety.CombineUnder(_paths.MinecraftDirectory, baseFile.Path);
                 PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, deletedTarget);
                 if (File.Exists(deletedTarget) || Directory.Exists(deletedTarget))
@@ -822,6 +983,27 @@ internal sealed class UpdateEngine
         }
     }
 
+    private async Task ValidateAdoptedPostStateBeforeCommitAsync(
+        UpdateManifest manifest,
+        CancellationToken cancellationToken)
+    {
+        foreach (ManifestFile file in manifest.Files)
+        {
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            await ValidateExactTargetAsync(target, file, "Adopted managed file changed before commit", cancellationToken);
+        }
+        foreach (string path in manifest.DeletePaths.Concat(manifest.DeletedFiles.Select(file => file.Path)))
+        {
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, path);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (File.Exists(target) || Directory.Exists(target))
+            {
+                throw new InvalidDataException($"Deleted target appeared before adoption commit: {path}");
+            }
+        }
+    }
+
     private static async Task ValidateExactTargetAsync(
         string target,
         ManifestFile expected,
@@ -837,12 +1019,167 @@ internal sealed class UpdateEngine
         }
     }
 
+    private async Task ApplySeedTextReplacementsAsync(
+        IReadOnlyCollection<SeedTextReplacement> replacements,
+        string backupDirectory,
+        TransactionJournal journal,
+        CancellationToken cancellationToken)
+    {
+        const long maximumTextSeedBytes = 4L * 1024 * 1024;
+        var strictUtf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+        foreach (SeedTextReplacement replacement in replacements)
+        {
+            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, replacement.Path);
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (!File.Exists(target) || Directory.Exists(target))
+            {
+                continue;
+            }
+            var targetInfo = new FileInfo(target);
+            if (targetInfo.Length > maximumTextSeedBytes)
+            {
+                _log($"Keeping unusually large player-owned setting: {replacement.Path}");
+                continue;
+            }
+
+            byte[] originalBytes = await File.ReadAllBytesAsync(target, cancellationToken);
+            string originalText;
+            try
+            {
+                originalText = strictUtf8.GetString(originalBytes);
+            }
+            catch (DecoderFallbackException)
+            {
+                _log($"Keeping non-UTF-8 player-owned setting: {replacement.Path}");
+                continue;
+            }
+            (int matchCount, int firstMatch) = FindExactLine(originalText, replacement.OldText);
+            if (matchCount == 0)
+            {
+                continue;
+            }
+            if (matchCount != 1)
+            {
+                _log($"Keeping ambiguous player-owned setting with repeated legacy value: {replacement.Path}");
+                continue;
+            }
+
+            string migratedText = originalText[..firstMatch]
+                + replacement.NewText
+                + originalText[(firstMatch + replacement.OldText.Length)..];
+            byte[] migratedBytes = strictUtf8.GetBytes(migratedText);
+            string migratedHash = Convert.ToHexString(SHA256.HashData(migratedBytes)).ToLowerInvariant();
+            var migratedState = new ManagedFileState
+            {
+                Path = replacement.Path,
+                Size = migratedBytes.LongLength,
+                Sha256 = migratedHash
+            };
+            journal.SeedFiles.Add(migratedState);
+
+            string backup = PathSafety.CombineUnder(backupDirectory, replacement.Path);
+            string originalHash = Convert.ToHexString(SHA256.HashData(originalBytes)).ToLowerInvariant();
+            var expectedOriginal = new ManifestFile
+            {
+                Path = replacement.Path,
+                Size = originalBytes.LongLength,
+                Sha256 = originalHash
+            };
+            TransactionOperation operation = await BackupForOperationAsync(
+                "replace",
+                target,
+                backup,
+                journal,
+                cancellationToken,
+                expectedOriginal);
+            await WriteDurableTemporaryAsync(operation.TargetTemporaryPath, migratedBytes, cancellationToken);
+            await VerifyFileAsync(
+                operation.TargetTemporaryPath,
+                migratedBytes.LongLength,
+                migratedHash,
+                replacement.Path,
+                cancellationToken);
+            File.Move(operation.TargetTemporaryPath, target);
+            await VerifyFileAsync(target, migratedBytes.LongLength, migratedHash, replacement.Path, cancellationToken);
+            _log($"Migrated obsolete player-owned setting value: {replacement.Path}");
+        }
+    }
+
+    private static async Task<bool> ContainsSeedTextAsync(
+        string target,
+        string oldText,
+        CancellationToken cancellationToken)
+    {
+        const long maximumTextSeedBytes = 4L * 1024 * 1024;
+        if (!File.Exists(target) || Directory.Exists(target) || new FileInfo(target).Length > maximumTextSeedBytes)
+        {
+            return false;
+        }
+        try
+        {
+            byte[] bytes = await File.ReadAllBytesAsync(target, cancellationToken);
+            string text = new UTF8Encoding(false, true).GetString(bytes);
+            return FindExactLine(text, oldText).Count > 0;
+        }
+        catch (DecoderFallbackException)
+        {
+            return false;
+        }
+    }
+
+    private static (int Count, int Index) FindExactLine(string text, string expectedLine)
+    {
+        int count = 0;
+        int firstIndex = -1;
+        int lineStart = 0;
+        for (int index = 0; index <= text.Length; index++)
+        {
+            bool endOfText = index == text.Length;
+            if (!endOfText && text[index] is not ('\r' or '\n'))
+            {
+                continue;
+            }
+            if (text.AsSpan(lineStart, index - lineStart).SequenceEqual(expectedLine.AsSpan()))
+            {
+                count++;
+                if (firstIndex < 0)
+                {
+                    firstIndex = lineStart;
+                }
+            }
+            if (!endOfText && text[index] == '\r' && index + 1 < text.Length && text[index + 1] == '\n')
+            {
+                index++;
+            }
+            lineStart = index + 1;
+        }
+        return (count, firstIndex);
+    }
+
+    private static async Task WriteDurableTemporaryAsync(
+        string path,
+        byte[] content,
+        CancellationToken cancellationToken)
+    {
+        await using var output = new FileStream(
+            path,
+            FileMode.CreateNew,
+            FileAccess.Write,
+            FileShare.None,
+            64 * 1024,
+            FileOptions.Asynchronous | FileOptions.WriteThrough);
+        await output.WriteAsync(content, cancellationToken);
+        await output.FlushAsync(cancellationToken);
+        output.Flush(flushToDisk: true);
+    }
+
     private async Task ApplyLegacyCleanupAsync(
         IReadOnlyCollection<LegacyCleanupFile> legacyCleanup,
         string backupDirectory,
         TransactionJournal journal,
         CancellationToken cancellationToken)
     {
+        var emptiedParents = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (LegacyCleanupFile legacyFile in legacyCleanup)
         {
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, legacyFile.Path);
@@ -866,6 +1203,41 @@ internal sealed class UpdateEngine
                 cancellationToken,
                 new ManifestFile { Path = legacyFile.Path, Size = legacyFile.Size, Sha256 = legacyFile.Sha256 });
             _log($"Removed verified legacy file: {legacyFile.Path}");
+            emptiedParents.Add(Path.GetDirectoryName(target)!);
+        }
+        foreach (string parent in emptiedParents.OrderByDescending(path => path.Length))
+        {
+            TryDeleteEmptyParents(parent);
+        }
+    }
+
+    private void TryDeleteEmptyParents(string startDirectory)
+    {
+        string minecraftRoot = Path.GetFullPath(_paths.MinecraftDirectory).TrimEnd(
+            Path.DirectorySeparatorChar,
+            Path.AltDirectorySeparatorChar);
+        string? current = Path.GetFullPath(startDirectory);
+        while (!string.IsNullOrWhiteSpace(current)
+            && !string.Equals(current.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), minecraftRoot, StringComparison.OrdinalIgnoreCase)
+            && PathSafety.TryGetRelativePathUnder(minecraftRoot, current, out _))
+        {
+            try
+            {
+                PathSafety.AssertNoReparsePointsOnTargetPath(minecraftRoot, Path.Combine(current, ".empty-check"));
+                Directory.Delete(current, recursive: false);
+            }
+            catch (DirectoryNotFoundException)
+            {
+            }
+            catch (IOException)
+            {
+                break;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                break;
+            }
+            current = Path.GetDirectoryName(current);
         }
     }
 

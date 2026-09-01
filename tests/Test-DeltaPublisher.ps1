@@ -76,7 +76,7 @@ Assert-True (Assert-CobbleDeltaManifest -Manifest $manifest -BaseManifest $baseM
 $rawDeltaMissingDeletePaths = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 Assert-True ($null -eq $rawDeltaMissingDeletePaths.PSObject.Properties['deletePaths']) 'Raw delta fixture unexpectedly contains deletePaths.'
 Assert-True (Assert-CobbleDeltaManifest -Manifest $rawDeltaMissingDeletePaths -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash) 'Missing v2 deletePaths did not preserve the runtime initialized empty list.'
-foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'seedFiles', 'reofferSeedPaths', 'deletePaths', 'legacyCleanup')) {
+foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'seedFiles', 'reofferSeedPaths', 'seedTextReplacements', 'deletePaths', 'legacyCleanup')) {
     $deltaExplicitNull = $manifest.PSObject.Copy()
     if ($null -eq $deltaExplicitNull.PSObject.Properties[$nullCollection]) {
         $deltaExplicitNull | Add-Member -NotePropertyName $nullCollection -NotePropertyValue $null
@@ -114,7 +114,7 @@ $legacyExplicitNullBase = $baselineManifest.PSObject.Copy()
 $legacyExplicitNullBase | Add-Member -NotePropertyName base -NotePropertyValue $null
 $legacyExplicitNullBase = ($legacyExplicitNullBase | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 Assert-True (Assert-CobbleV1Manifest -Manifest $legacyExplicitNullBase) 'Explicit null v1 base did not match the runtime nullable base model.'
-foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'seedFiles', 'reofferSeedPaths', 'deletePaths', 'legacyCleanup')) {
+foreach ($nullCollection in @('files', 'payloadFiles', 'deletedFiles', 'seedFiles', 'reofferSeedPaths', 'seedTextReplacements', 'deletePaths', 'legacyCleanup')) {
     $legacyExplicitNull = $baselineManifest.PSObject.Copy()
     if ($null -eq $legacyExplicitNull.PSObject.Properties[$nullCollection]) {
         $legacyExplicitNull | Add-Member -NotePropertyName $nullCollection -NotePropertyValue $null
@@ -131,8 +131,14 @@ $badMinimumBaseline = $baselineManifest.PSObject.Copy()
 $badMinimumBaseline.minimumUpdaterVersion = '1.02.0'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $badMinimumBaseline } 'Non-canonical v1 minimumUpdaterVersion was accepted for staged resume.'
 $futureMinimumBaseline = $baselineManifest.PSObject.Copy()
-$futureMinimumBaseline.minimumUpdaterVersion = '1.2.10'
+$futureMinimumBaseline.minimumUpdaterVersion = '1.2.11'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $futureMinimumBaseline } 'V1 requiring a newer-than-pinned updater was accepted for staged resume.'
+$nonCanonicalDeltaMinimum = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$nonCanonicalDeltaMinimum.minimumUpdaterVersion = '1.02.10'
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $nonCanonicalDeltaMinimum -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Non-canonical v2 minimumUpdaterVersion was accepted for staged resume.'
+$futureDeltaMinimum = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$futureDeltaMinimum.minimumUpdaterVersion = '1.2.11'
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $futureDeltaMinimum -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'V2 requiring a newer-than-pinned updater was accepted for staged resume.'
 
 $seed = New-Record 'config/ReactiveMusic.json5' 42 '9'
 $seedBaseline = $baselineManifest.PSObject.Copy()
@@ -148,6 +154,7 @@ Assert-Throws { Assert-CobbleV1Manifest -Manifest $overlappingSeedBaseline } 'Cr
 
 Assert-True (Assert-CobbleSeedPathPolicy -Path 'options.txt') 'options.txt was not accepted as a player-owned default.'
 Assert-True (Assert-CobbleSeedPathPolicy -Path 'config/asyncparticles/asyncparticles.json') 'A reviewed config path was not accepted as a player-owned default.'
+Assert-True (Assert-CobbleSeedPathPolicy -Path 'shaderpacks/Max Quality.zip.txt') 'A top-level Iris shader options file was not accepted as a player-owned default.'
 Assert-True (Assert-CobbleSeedPathPolicy -Path 'mods/Axiom-5.4.2-for-MC1.21.1.jar') 'Axiom was not accepted as an optional player-owned mod.'
 Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'mods/required-mod.jar' } 'A non-Axiom mod was accepted as optional.'
 Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'servers.dat' } 'servers.dat was accepted as a create-only default.'
@@ -165,6 +172,11 @@ Assert-Throws { Assert-CobbleV1Manifest -Manifest $deletedFilesInV1 } 'V1 staged
 $reofferSeedPathsInV1 = $seedBaseline.PSObject.Copy()
 $reofferSeedPathsInV1 | Add-Member -NotePropertyName reofferSeedPaths -NotePropertyValue @($seed.path)
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $reofferSeedPathsInV1 } 'V1 staged resume accepted nonempty reofferSeedPaths.'
+$seedTextReplacementInV1 = $seedBaseline.PSObject.Copy()
+$seedTextReplacementInV1 | Add-Member -NotePropertyName seedTextReplacements -NotePropertyValue @(
+    [pscustomobject]@{ path = 'config/iris.properties'; oldText = 'shaderPack=Old'; newText = 'shaderPack=New' }
+)
+Assert-Throws { Assert-CobbleV1Manifest -Manifest $seedTextReplacementInV1 } 'V1 staged resume accepted nonempty seedTextReplacements.'
 
 $badBaseline = $baselineManifest.PSObject.Copy()
 $badBaseline.deletePaths = @('mods/unchanged.jar')
@@ -253,6 +265,43 @@ Assert-Throws { Assert-CobbleDeltaManifest -Manifest $undeclaredRepair -BaseMani
 $duplicateRepair = ($repairManifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 $duplicateRepair.reofferSeedPaths = @($repairSeed.path, $repairSeed.path.ToUpperInvariant())
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $duplicateRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Corrective seed re-offer accepted a case-insensitive duplicate.'
+
+$multiIdentityRefresh = ($repairManifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$multiIdentityRefresh.minimumUpdaterVersion = '1.2.10'
+$multiIdentityRefresh.legacyCleanup = @(
+    (New-Record $repairSeed.path 41 '6'),
+    (New-Record $repairSeed.path 40 '7')
+)
+Assert-True (Assert-CobbleDeltaManifest -Manifest $multiIdentityRefresh -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash) 'Multiple exact historic identities for one refreshed seed were rejected.'
+$duplicateCleanupIdentity = ($multiIdentityRefresh | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$duplicateCleanupIdentity.legacyCleanup += $duplicateCleanupIdentity.legacyCleanup[0]
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $duplicateCleanupIdentity -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'An exact duplicate legacy cleanup identity was accepted.'
+
+$textRepair = ($repairManifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$textRepair.minimumUpdaterVersion = '1.2.10'
+$irisSeed = New-Record 'config/iris.properties' 43 '5'
+$textRepair.seedFiles = @($repairSeed, $irisSeed)
+$textRepair.reofferSeedPaths = @($repairSeed.path, $irisSeed.path)
+$textRepair | Add-Member -NotePropertyName seedTextReplacements -NotePropertyValue @(
+    [pscustomobject]@{
+        path = $irisSeed.path
+        oldText = 'shaderPack=Max Quality'
+        newText = 'shaderPack=Max Quality.zip'
+    }
+)
+Assert-True (Assert-CobbleDeltaManifest -Manifest $textRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash) 'Valid signed seed text replacement was rejected.'
+$oldUpdaterTextRepair = ($textRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$oldUpdaterTextRepair.minimumUpdaterVersion = '1.2.9'
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $oldUpdaterTextRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Seed text replacement accepted updater older than 1.2.10.'
+$undeclaredTextRepair = ($textRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$undeclaredTextRepair.seedTextReplacements[0].path = 'config/not-a-seed.json'
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $undeclaredTextRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Seed text replacement accepted an undeclared seed path.'
+$optionsTextRepair = ($textRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$optionsSeed = New-Record 'options.txt' 44 '4'
+$optionsTextRepair.seedFiles += $optionsSeed
+$optionsTextRepair.reofferSeedPaths += $optionsSeed.path
+$optionsTextRepair.seedTextReplacements[0].path = $optionsSeed.path
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $optionsTextRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Seed text replacement was allowed to rewrite player keybind/video/sound settings.'
 
 $tamperedPayload = $manifest.PSObject.Copy()
 $tamperedPayload.payloadFiles = @($plan.PayloadFiles | Where-Object path -ne 'config/changed.json')
