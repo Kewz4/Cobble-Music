@@ -112,12 +112,18 @@ internal static class DeltaValidator
             cancellationToken.ThrowIfCancellationRequested();
             string target = PathSafety.CombineUnder(paths.MinecraftDirectory, path);
             PathSafety.AssertNoReparsePointsOnTargetPath(paths.MinecraftDirectory, target);
-            if (!File.Exists(target) || new FileInfo(target).Length != baseFile.Size)
+            if (!File.Exists(target))
             {
                 throw new InvalidDataException($"Local file is missing or changed from the signed delta base: {path}");
             }
+            long actualSize = new FileInfo(target).Length;
             string actualHash = await PathSafety.Sha256Async(target, cancellationToken);
-            if (!PathSafety.IsExpectedHash(actualHash, baseFile.Sha256))
+            bool matchesSignedBase = actualSize == baseFile.Size
+                && PathSafety.IsExpectedHash(actualHash, baseFile.Sha256);
+            bool matchesExactManagedRepair = payloadFiles.ContainsKey(path)
+                && legacyCleanup[path].Any(identity => identity.Size == actualSize
+                    && PathSafety.IsExpectedHash(actualHash, identity.Sha256));
+            if (!matchesSignedBase && !matchesExactManagedRepair)
             {
                 throw new InvalidDataException($"Local file is changed from the signed delta base: {path}");
             }

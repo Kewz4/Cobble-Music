@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 $script:AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $script:Sha256Pattern = '^[0-9a-f]{64}$'
 $script:VersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-$script:PinnedUpdaterVersion = '1.2.12'
+$script:PinnedUpdaterVersion = '1.2.13'
 $script:MaximumReleaseAssetCount = 999
 $script:ReservedReleaseMetadataAssetCount = 2
 $script:MaximumPublicReleaseCount = 499
@@ -1036,11 +1036,19 @@ function Assert-CobbleDeltaManifest {
         throw 'The options migration must contain the complete reviewed Iris and Fancy Toasts repair pair.'
     }
     $legacySet = ConvertTo-CobbleLegacyCleanupSet -Entries @($legacyCleanup.Entries) -Context 'delta legacyCleanup'
+    $declaredPayloadForFeaturePolicy = ConvertTo-CobbleFileRecordSet `
+        -Entries @($payloadFilesState.Entries) -Context 'delta payloadFiles feature policy' -AllowEmpty
+    $managedRepairPaths = @($legacySet.Entries | Where-Object {
+        $declaredPayloadForFeaturePolicy.ByKey.ContainsKey((Get-CobblePathKey $_.path))
+    } | ForEach-Object { [string]$_.path } | Sort-Object -Unique)
     $refreshesExactSeeds = @($legacySet.Entries | Where-Object {
         $key = Get-CobblePathKey $_.path
         $seedFiles.ByKey.ContainsKey($key) -and $reofferSeedKeys.Contains($key)
     }).Count -gt 0
-    $minimumFloor = if ($hasOptionsTextReplacement) {
+    $minimumFloor = if ($managedRepairPaths.Count -gt 0) {
+        [Version]'1.2.13'
+    }
+    elseif ($hasOptionsTextReplacement) {
         [Version]'1.2.11'
     }
     elseif ($seedTextReplacementKeys.Count -gt 0 -or $refreshesExactSeeds) {
@@ -1097,6 +1105,16 @@ function Assert-CobbleDeltaManifest {
             throw "Delta create-only default overlaps a managed, changed, or deleted file: $($seed.path)"
         }
     }
+    foreach ($repairPath in $managedRepairPaths) {
+        $key = Get-CobblePathKey $repairPath
+        if (-not $baseSet.ByKey.ContainsKey($key) -or -not $actualPayload.ByKey.ContainsKey($key)) {
+            throw "Exact managed repair is not a changed signed-base payload path: $repairPath"
+        }
+        $replacement = $actualPayload.ByKey[$key]
+        if (@($legacySet.ByKey[$key] | Where-Object { Test-CobbleSameFileRecord -Left $_ -Right $replacement }).Count -gt 0) {
+            throw "Exact managed repair identity equals its signed replacement: $repairPath"
+        }
+    }
 
     foreach ($comparison in @(
         [pscustomobject]@{ Name = 'payloadFiles'; Actual = $actualPayload; Expected = $expectedPayload },
@@ -1128,8 +1146,9 @@ function Assert-CobbleDeltaManifest {
         Assert-CobblePayloadMetadata (Get-CobbleOptionalPropertyValue $Manifest 'payload')
     }
 
+    $allowedCleanupOverlaps = @($reofferSeedPathsState.Entries | ForEach-Object { [string]$_ }) + @($managedRepairPaths)
     Assert-CobbleLegacyCleanup -Entries @($legacyCleanup.Entries) -ForbiddenSets @($fullSet, $baseSet, $seedFiles) `
-        -AllowedOverlapPaths @($reofferSeedPathsState.Entries | ForEach-Object { [string]$_ }) | Out-Null
+        -AllowedOverlapPaths $allowedCleanupOverlaps | Out-Null
 
     return $true
 }

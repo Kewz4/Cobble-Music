@@ -734,9 +734,6 @@ internal sealed class UpdateEngine
             IReadOnlyCollection<ManifestFile> payloadFiles = adoptExistingPostState
                 ? Array.Empty<ManifestFile>()
                 : ManifestParser.ManagedPayloadContents(manifest);
-            Dictionary<string, ManifestFile>? signedBaseFiles = signedBase?.Files.ToDictionary(
-                file => file.Path,
-                StringComparer.OrdinalIgnoreCase);
             int appliedFiles = 0;
             int totalFiles = payloadFiles.Count + manifest.SeedFiles.Count + manifest.DeletedFiles.Count;
             foreach (ManifestFile file in payloadFiles)
@@ -748,20 +745,18 @@ internal sealed class UpdateEngine
                 PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
                 Directory.CreateDirectory(Path.GetDirectoryName(target)!);
 
-                if (signedBase is not null)
-                {
-                    await ValidateDeltaMutationTargetAsync(file.Path, signedBase, cancellationToken);
-                }
+                ManifestFile? expectedOriginal = signedBase is null
+                    ? null
+                    : await ResolveDeltaMutationOriginalAsync(
+                        file.Path,
+                        signedBase,
+                        manifest.LegacyCleanup,
+                        allowExactLegacyRepair: true,
+                        cancellationToken);
 
                 TransactionOperation operation;
                 if (File.Exists(target))
                 {
-                    ManifestFile? expectedOriginal = null;
-                    signedBaseFiles?.TryGetValue(file.Path, out expectedOriginal);
-                    if (signedBaseFiles is not null && expectedOriginal is null)
-                    {
-                        throw new InvalidDataException($"New delta target appeared immediately before mutation: {file.Path}");
-                    }
                     operation = await BackupForOperationAsync("replace", target, backup, journal, cancellationToken, expectedOriginal);
                 }
                 else
@@ -945,6 +940,21 @@ internal sealed class UpdateEngine
         UpdateManifest signedBase,
         CancellationToken cancellationToken)
     {
+        _ = await ResolveDeltaMutationOriginalAsync(
+            relativePath,
+            signedBase,
+            Array.Empty<LegacyCleanupFile>(),
+            allowExactLegacyRepair: false,
+            cancellationToken);
+    }
+
+    private async Task<ManifestFile?> ResolveDeltaMutationOriginalAsync(
+        string relativePath,
+        UpdateManifest signedBase,
+        IReadOnlyCollection<LegacyCleanupFile> legacyCleanup,
+        bool allowExactLegacyRepair,
+        CancellationToken cancellationToken)
+    {
         string normalized = PathSafety.NormalizeRelativePath(relativePath);
         string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, normalized);
         PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
@@ -956,9 +966,35 @@ internal sealed class UpdateEngine
             {
                 throw new InvalidDataException($"New delta target appeared after base validation: {normalized}");
             }
-            return;
+            return null;
         }
-        await ValidateExactTargetAsync(target, expectedBase, "Delta target changed after base validation", cancellationToken);
+        if (!File.Exists(target) || Directory.Exists(target))
+        {
+            throw new InvalidDataException($"Delta target changed after base validation: {normalized}");
+        }
+        long actualSize = new FileInfo(target).Length;
+        string actualHash = await PathSafety.Sha256Async(target, cancellationToken);
+        if (actualSize == expectedBase.Size && PathSafety.IsExpectedHash(actualHash, expectedBase.Sha256))
+        {
+            return expectedBase;
+        }
+        if (allowExactLegacyRepair)
+        {
+            LegacyCleanupFile? repairIdentity = legacyCleanup.FirstOrDefault(identity =>
+                string.Equals(identity.Path, normalized, StringComparison.OrdinalIgnoreCase)
+                && identity.Size == actualSize
+                && PathSafety.IsExpectedHash(actualHash, identity.Sha256));
+            if (repairIdentity is not null)
+            {
+                return new ManifestFile
+                {
+                    Path = expectedBase.Path,
+                    Size = repairIdentity.Size,
+                    Sha256 = repairIdentity.Sha256
+                };
+            }
+        }
+        throw new InvalidDataException($"Delta target changed after base validation: {normalized}");
     }
 
     internal async Task ValidateDeltaPostStateBeforeCommitAsync(

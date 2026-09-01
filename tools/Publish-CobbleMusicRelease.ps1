@@ -72,7 +72,7 @@ $PinnedVerifierExe = Join-Path $Root 'updater\verifier\win-x64\CobbleMusicUpdate
 $UpdaterChannelPath = Join-Path $Root 'updater\channel\stable.json'
 $UpdaterChannelSignaturePath = Join-Path $Root 'updater\channel\stable.sig'
 $RequiredVerifierVersion = '1.2.7'
-$RequiredUpdaterVersion = '1.2.12'
+$RequiredUpdaterVersion = '1.2.13'
 $AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $MaximumManifestSnapshotBytes = 8MB
 $MaximumSignatureSnapshotBytes = 64KB
@@ -1153,9 +1153,19 @@ try {
         throw 'Full baselines cannot carry one-time seed text replacements.'
     }
 
+    $managedRepairKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $baseFilesByKey = ConvertTo-CobbleFileRecordSet -Entries @($baseFiles) -Context 'signed base repair candidates' -AllowEmpty
+    foreach ($currentFile in $currentSet.Entries) {
+        $key = Get-CobblePathKey $currentFile.path
+        if ($baseFilesByKey.ByKey.ContainsKey($key) -and
+            -not (Test-CobbleSameFileRecord -Left $currentFile -Right $baseFilesByKey.ByKey[$key])) {
+            [void]$managedRepairKeys.Add($key)
+        }
+    }
     $potentialCleanupOverlaps = @($currentSet.Entries) + @($baseFiles) + @($seedSet.Entries)
     $forbiddenCleanupPaths = @($potentialCleanupOverlaps | Where-Object {
-        -not $reofferSeedKeys.Contains((Get-CobblePathKey $_.path))
+        $key = Get-CobblePathKey $_.path
+        -not $reofferSeedKeys.Contains($key) -and -not $managedRepairKeys.Contains($key)
     } | ForEach-Object { $_.path })
     $legacyCleanup = Read-LegacyCleanupManifest $LegacyCleanupManifest $forbiddenCleanupPaths
     $legacyCleanupSet = ConvertTo-CobbleLegacyCleanupSet -Entries @($legacyCleanup) -Context 'legacy cleanup manifest'

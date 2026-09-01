@@ -400,12 +400,26 @@ internal static class ManifestParser
         }
         HashSet<string> legacyPaths = ValidateLegacyCleanup(manifest.LegacyCleanup, configuration);
         var refreshableSeeds = manifest.ReofferSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        bool repairsExactManagedPayload = legacyPaths.Any(payloadFiles.ContainsKey);
+        if (repairsExactManagedPayload && requiredUpdater < new Version(1, 2, 13))
+        {
+            throw new InvalidDataException("Repairing an exact legacy identity of a changed managed file requires updater 1.2.13 or newer.");
+        }
         if (legacyPaths.Any(path => seedFiles.ContainsKey(path) && refreshableSeeds.Contains(path))
             && requiredUpdater < new Version(1, 2, 10))
         {
             throw new InvalidDataException("Refreshing an exact older seed requires updater 1.2.10 or newer.");
         }
-        if (legacyPaths.Any(files.ContainsKey)
+        foreach (LegacyCleanupFile legacyFile in manifest.LegacyCleanup)
+        {
+            if (payloadFiles.TryGetValue(legacyFile.Path, out ManifestFile? payloadFile)
+                && legacyFile.Size == payloadFile.Size
+                && string.Equals(legacyFile.Sha256, payloadFile.Sha256, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException($"A managed repair identity cannot equal its signed replacement: {legacyFile.Path}");
+            }
+        }
+        if (legacyPaths.Any(path => files.ContainsKey(path) && !payloadFiles.ContainsKey(path))
             || legacyPaths.Any(deletedFiles.ContainsKey)
             || legacyPaths.Any(path => seedFiles.ContainsKey(path) && !refreshableSeeds.Contains(path)))
         {

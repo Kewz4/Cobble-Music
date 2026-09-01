@@ -162,7 +162,9 @@ internal sealed class SeedTextReplacement
 }
 
 // Used only for a reviewed, one-time migration from a known older pack. The
-// updater deletes it only when the local file exactly matches this hash.
+// updater deletes it only when the local file exactly matches this hash, or
+// accepts it as an exact pre-state when the same signed delta replaces that
+// managed path with a carried payload file.
 internal sealed class LegacyCleanupFile
 {
     public string Path { get; set; } = "";
