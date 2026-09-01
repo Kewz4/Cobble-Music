@@ -282,7 +282,7 @@ internal static class TransactionStore
         string rollbackRoot = Path.Combine(paths.LocalDataDirectory, "rollback");
         foreach (TransactionOperation operation in journal.Operations)
         {
-            bool targetIsCreatedSeed = operation is not null
+            bool targetIsSeedOutcome = operation is not null
                 && !string.IsNullOrWhiteSpace(operation.TargetPath)
                 && PathSafety.TryGetRelativePathUnder(paths.MinecraftDirectory, operation.TargetPath, out string seedTargetRelative)
                 && seedPaths.Contains(seedTargetRelative);
@@ -291,7 +291,7 @@ internal static class TransactionStore
                 || string.IsNullOrWhiteSpace(operation.TargetPath)
                 || !PathSafety.TryGetRelativePathUnder(paths.MinecraftDirectory, operation.TargetPath, out string targetRelative)
                 || (!PathSafety.IsAllowed(targetRelative, allowedRoots)
-                    && (!targetIsCreatedSeed || operation.Kind != "create")))
+                    && (!targetIsSeedOutcome || operation.Kind == "delete")))
             {
                 throw new TransactionRecoveryException("The updater transaction journal contains an unsafe target path.");
             }

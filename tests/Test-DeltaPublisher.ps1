@@ -134,13 +134,13 @@ $badMinimumBaseline = $baselineManifest.PSObject.Copy()
 $badMinimumBaseline.minimumUpdaterVersion = '1.02.0'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $badMinimumBaseline } 'Non-canonical v1 minimumUpdaterVersion was accepted for staged resume.'
 $futureMinimumBaseline = $baselineManifest.PSObject.Copy()
-$futureMinimumBaseline.minimumUpdaterVersion = '1.2.12'
+$futureMinimumBaseline.minimumUpdaterVersion = '1.2.13'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $futureMinimumBaseline } 'V1 requiring a newer-than-pinned updater was accepted for staged resume.'
 $nonCanonicalDeltaMinimum = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 $nonCanonicalDeltaMinimum.minimumUpdaterVersion = '1.02.10'
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $nonCanonicalDeltaMinimum -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Non-canonical v2 minimumUpdaterVersion was accepted for staged resume.'
 $futureDeltaMinimum = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
-$futureDeltaMinimum.minimumUpdaterVersion = '1.2.12'
+$futureDeltaMinimum.minimumUpdaterVersion = '1.2.13'
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $futureDeltaMinimum -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'V2 requiring a newer-than-pinned updater was accepted for staged resume.'
 
 $seed = New-Record 'config/ReactiveMusic.json5' 42 '9'
@@ -702,6 +702,21 @@ finally {
 
 $publishFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Publish-StagedRelease' }, $true)
 $publishFunctionText = $publishFunction.Extent.Text
+$publishedUpdaterFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-PublishedPinnedUpdater' }, $true)
+$publishedUpdaterFunctionText = $publishedUpdaterFunction.Extent.Text
+$publicChannelFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-PublishedMainUpdaterChannelPin' }, $true)
+$publicChannelFunctionText = $publicChannelFunction.Extent.Text
+Assert-True ($publishedUpdaterFunctionText.Contains('[Version]$identity.version -lt [Version]$MinimumVersion', [StringComparison]::Ordinal) -and
+    $publishedUpdaterFunctionText.Contains('Get-PublishedMainUpdaterChannelPin', [StringComparison]::Ordinal) -and
+    $publishedUpdaterFunctionText.Contains('$publicPin.Version -cne $identity.version', [StringComparison]::Ordinal) -and
+    $publishedUpdaterFunctionText.Contains('$publicPin.ReleaseTag -cne "updater-v$($identity.version)"', [StringComparison]::Ordinal) -and
+    $publishedUpdaterFunctionText.Contains('$publicPin.Size -ne $identity.size', [StringComparison]::Ordinal) -and
+    $publishedUpdaterFunctionText.Contains('$publicPin.Sha256 -cne $identity.sha256', [StringComparison]::Ordinal)) 'Published-updater gate does not bind manifest minimum, release asset, and public main channel to one exact updater.'
+Assert-True ($publicChannelFunctionText.Contains('raw.githubusercontent.com/$Repository/main/updater/channel/stable.json', [StringComparison]::Ordinal) -and
+    $publicChannelFunctionText.Contains('raw.githubusercontent.com/$Repository/main/updater/channel/stable.sig', [StringComparison]::Ordinal) -and
+    $publicChannelFunctionText.Contains('Invoke-PinnedVerifier', [StringComparison]::Ordinal) -and
+    $publicChannelFunctionText.Contains('Start-Sleep -Milliseconds', [StringComparison]::Ordinal)) 'Public main updater channel is not fetched, signature-verified, and retried with a bounded wait.'
+Assert-True ([regex]::Matches($publishFunctionText, 'Assert-PublishedPinnedUpdater -MinimumVersion \(\[string\]\$Manifest\.minimumUpdaterVersion\)').Count -eq 2) 'Draft and final publication gates do not both enforce the signed manifest minimum updater version.'
 $waitReleaseFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Wait-GitHubReleaseByTag' }, $true)
 Assert-True ($null -ne $waitReleaseFunction -and
     $waitReleaseFunction.Extent.Text.Contains('Get-GitHubReleaseByTag $Tag', [StringComparison]::Ordinal) -and

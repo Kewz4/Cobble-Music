@@ -2058,6 +2058,8 @@ internal static class Program
         Equal("new-profile", await File.ReadAllTextAsync(refreshedSeedTarget), "committed exact seed refresh survives recovery");
         Equal(false, File.Exists(TransactionStore.JournalPath(refreshedSeedPaths)), "committed seed refresh journal cleanup");
 
+        await TestOptionsMigrationJournalRecoveryAsync(Path.Combine(root, "options-migration-recovery"));
+
         UpdaterPaths mismatchedCommitPaths = Paths(Path.Combine(root, "committed-mismatch"));
         Directory.CreateDirectory(mismatchedCommitPaths.MinecraftDirectory);
         Directory.CreateDirectory(mismatchedCommitPaths.InstallationDirectory);
@@ -2107,6 +2109,114 @@ internal static class Program
             TransactionStore.RecoverIfNeededAsync(corruptStatePaths, BuildInfo.SupportedRoots, _ => { }));
         Equal(true, File.Exists(TransactionStore.JournalPath(corruptStatePaths)), "corrupt state must retain journal and block launch");
         Equal("new", await File.ReadAllTextAsync(target), "corrupt state must not guess rollback or commit");
+    }
+
+    private static async Task TestOptionsMigrationJournalRecoveryAsync(string root)
+    {
+        const string optionsRelative = "options.txt";
+        const string oldOptions = "renderDistance:23\r\nkey_iris.keybind.toggleShaders:key.keyboard.k\r\n";
+        const string newOptions = "renderDistance:23\r\nkey_iris.keybind.toggleShaders:key.keyboard.unknown\r\n";
+        const string migrationId = "options-contest-tracker-k-collision-v1";
+
+        static TransactionJournal OptionsJournal(
+            string target,
+            string backup,
+            InstalledState previous,
+            InstalledState next) => new()
+            {
+                Phase = "filesApplied",
+                PreviousState = previous,
+                NextState = next,
+                SeedFiles =
+                [
+                    new ManagedFileState
+                    {
+                        Path = optionsRelative,
+                        Size = newOptions.Length,
+                        Sha256 = HashText(newOptions)
+                    }
+                ],
+                Operations =
+                [
+                    new TransactionOperation
+                    {
+                        Kind = "replace",
+                        TargetPath = target,
+                        BackupPath = backup,
+                        OriginalSize = oldOptions.Length,
+                        OriginalSha256 = HashText(oldOptions)
+                    }
+                ]
+            };
+
+        static (InstalledState Previous, InstalledState Next) States()
+        {
+            var previous = new InstalledState
+            {
+                Version = "1.0.13",
+                ManifestSha256 = HashText("options-base"),
+                OfferedSeedPaths = [optionsRelative]
+            };
+            var next = new InstalledState
+            {
+                Version = "1.0.14",
+                ManifestSha256 = HashText("options-next"),
+                OfferedSeedPaths = [optionsRelative],
+                AppliedPlayerSettingMigrationIds = [migrationId]
+            };
+            return (previous, next);
+        }
+
+        foreach ((string scenario, bool replacementVisible) in new[]
+        {
+            ("after-backup", false),
+            ("after-replacement", true)
+        })
+        {
+            UpdaterPaths paths = Paths(Path.Combine(root, scenario));
+            Directory.CreateDirectory(paths.MinecraftDirectory);
+            Directory.CreateDirectory(paths.InstallationDirectory);
+            string target = PathSafety.CombineUnder(paths.MinecraftDirectory, optionsRelative);
+            string backup = Path.Combine(paths.LocalDataDirectory, "rollback", "tx", "files", optionsRelative);
+            Directory.CreateDirectory(Path.GetDirectoryName(backup)!);
+            await File.WriteAllTextAsync(backup, oldOptions);
+            if (replacementVisible)
+            {
+                await File.WriteAllTextAsync(target, newOptions);
+            }
+            (InstalledState previous, InstalledState next) = States();
+            await LocalStateStore.SaveStateAsync(paths, previous, NoCancellation);
+            await TransactionStore.SaveAsync(paths, OptionsJournal(target, backup, previous, next), NoCancellation);
+
+            await TransactionStore.RecoverIfNeededAsync(paths, BuildInfo.SupportedRoots, _ => { });
+
+            Equal(oldOptions, await File.ReadAllTextAsync(target), $"{scenario} restores exact player options bytes");
+            Equal(false, LocalStateStore.LoadState(paths).AppliedPlayerSettingMigrationIds.Contains(migrationId),
+                $"{scenario} restores the previous migration ledger");
+            Equal(false, File.Exists(TransactionStore.JournalPath(paths)), $"{scenario} clears the recovered journal");
+        }
+
+        UpdaterPaths committedPaths = Paths(Path.Combine(root, "after-state-commit"));
+        Directory.CreateDirectory(committedPaths.MinecraftDirectory);
+        Directory.CreateDirectory(committedPaths.InstallationDirectory);
+        string committedTarget = PathSafety.CombineUnder(committedPaths.MinecraftDirectory, optionsRelative);
+        string committedBackup = Path.Combine(committedPaths.LocalDataDirectory, "rollback", "tx", "files", optionsRelative);
+        Directory.CreateDirectory(Path.GetDirectoryName(committedBackup)!);
+        await File.WriteAllTextAsync(committedTarget, newOptions);
+        await File.WriteAllTextAsync(committedBackup, oldOptions);
+        (InstalledState committedPrevious, InstalledState committedNext) = States();
+        await LocalStateStore.SaveStateAsync(committedPaths, committedNext, NoCancellation);
+        await TransactionStore.SaveAsync(
+            committedPaths,
+            OptionsJournal(committedTarget, committedBackup, committedPrevious, committedNext),
+            NoCancellation);
+
+        await TransactionStore.RecoverIfNeededAsync(committedPaths, BuildInfo.SupportedRoots, _ => { });
+
+        Equal(newOptions, await File.ReadAllTextAsync(committedTarget), "committed options migration keeps exact migrated bytes");
+        Equal(migrationId, LocalStateStore.LoadState(committedPaths).AppliedPlayerSettingMigrationIds.Single(),
+            "committed options migration keeps its one-time ledger entry");
+        Equal(false, File.Exists(TransactionStore.JournalPath(committedPaths)), "committed options migration clears the journal");
     }
 
     private static TransactionJournal Journal(

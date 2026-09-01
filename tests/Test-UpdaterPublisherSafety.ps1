@@ -276,6 +276,7 @@ $ForeignCommit = 'b' * 40
 $Repository = 'fixture/repository'
 $script:getCount = 0
 $script:postCount = 0
+$script:visibilityDelayReads = 0
 function New-TagRef([string]$Sha, [string]$Type = 'commit') {
     [pscustomobject]@{ ref = "refs/tags/$Tag"; object = [pscustomobject]@{ type = $Type; sha = $Sha } }
 }
@@ -287,6 +288,10 @@ $script:currentRef = switch ($Case) {
 function Get-ExactUpdaterTagRef([string]$RequestedTag) {
     if ($RequestedTag -cne $Tag) { throw 'Tag fixture requested the wrong tag.' }
     $script:getCount++
+    if ($script:visibilityDelayReads -gt 0) {
+        $script:visibilityDelayReads--
+        return $null
+    }
     return $script:currentRef
 }
 function Invoke-GhJson([string[]]$Arguments) {
@@ -299,8 +304,9 @@ function Invoke-GhJson([string[]]$Arguments) {
         $script:currentRef = New-TagRef $Commit
         throw 'simulated ref-already-exists race'
     }
-    if ($Case -ceq 'create') {
+    if ($Case -in @('create', 'delayed')) {
         $script:currentRef = New-TagRef $Commit
+        if ($Case -ceq 'delayed') { $script:visibilityDelayReads = 2 }
         return $script:currentRef
     }
     throw "Unexpected tag mutation in fixture case $Case"
@@ -327,11 +333,16 @@ switch ($Case) {
             throw "Fresh lightweight reservation was not re-fetched and verified: failure=$failure posts=$script:postCount gets=$script:getCount"
         }
     }
+    'delayed' {
+        if ($null -ne $failure -or $script:postCount -ne 1 -or $script:getCount -lt 4) {
+            throw "Eventually consistent lightweight reservation was not retried and verified: failure=$failure posts=$script:postCount gets=$script:getCount"
+        }
+    }
     default { throw "Unknown tag reservation fixture: $Case" }
 }
 "tag-$Case-ok"
 '@)
-foreach ($tagCase in @('existing', 'foreign', 'concurrent', 'create')) {
+foreach ($tagCase in @('existing', 'foreign', 'concurrent', 'create', 'delayed')) {
     $tagResult = @(& $tagReservationHarness $tagCase)
     if ($tagResult.Count -ne 1 -or [string]$tagResult[0] -cne "tag-$tagCase-ok") {
         throw "Updater tag reservation fixture did not complete exactly: $tagCase"

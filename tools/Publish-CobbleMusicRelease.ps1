@@ -72,6 +72,7 @@ $PinnedVerifierExe = Join-Path $Root 'updater\verifier\win-x64\CobbleMusicUpdate
 $UpdaterChannelPath = Join-Path $Root 'updater\channel\stable.json'
 $UpdaterChannelSignaturePath = Join-Path $Root 'updater\channel\stable.sig'
 $RequiredVerifierVersion = '1.2.7'
+$RequiredUpdaterVersion = '1.2.12'
 $AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $MaximumManifestSnapshotBytes = 8MB
 $MaximumSignatureSnapshotBytes = 64KB
@@ -685,10 +686,71 @@ function Get-PublishedStableReleaseSnapshot([string]$Tag, [string]$Description) 
     }
 }
 
-function Assert-PublishedPinnedUpdater {
+function Get-PublishedMainUpdaterChannelPin([int]$MaximumAttempts = 6) {
+    if ($MaximumAttempts -lt 1) { throw 'MaximumAttempts must be positive.' }
+    $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('cobble-music-public-channel-' + [Guid]::NewGuid().ToString('N'))
+    $lastFailure = $null
+    try {
+        New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
+        $channelPath = Join-Path $temporaryRoot 'stable.json'
+        $signaturePath = Join-Path $temporaryRoot 'stable.sig'
+        $verifiedPath = Join-Path $temporaryRoot 'verified.json'
+        for ($attempt = 1; $attempt -le $MaximumAttempts; $attempt++) {
+            try {
+                $nonce = [Guid]::NewGuid().ToString('N')
+                $headers = @{ 'Cache-Control' = 'no-cache'; Pragma = 'no-cache' }
+                Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/$Repository/main/updater/channel/stable.json?verify=$nonce" `
+                    -Headers $headers -OutFile $channelPath -TimeoutSec 30
+                Invoke-WebRequest -UseBasicParsing -Uri "https://raw.githubusercontent.com/$Repository/main/updater/channel/stable.sig?verify=$nonce" `
+                    -Headers $headers -OutFile $signaturePath -TimeoutSec 30
+                if (Test-Path -LiteralPath $verifiedPath) { Remove-Item -LiteralPath $verifiedPath -Force }
+                Invoke-PinnedVerifier -Arguments @(
+                    '--verify-updater-channel', $channelPath,
+                    '--signature-file', $signaturePath,
+                    '--verified-output', $verifiedPath
+                )
+                $channel = [IO.File]::ReadAllText($verifiedPath) | ConvertFrom-Json
+                if ([string]$channel.repository -cne $Repository -or [string]$channel.channel -cne 'stable') {
+                    throw 'Published main updater channel has the wrong repository or channel identity.'
+                }
+                return [pscustomobject]@{
+                    Version = [string]$channel.updaterVersion
+                    ReleaseTag = [string]$channel.releaseTag
+                    Size = [int64]$channel.updater.size
+                    Sha256 = ([string]$channel.updater.sha256).ToLowerInvariant()
+                }
+            }
+            catch {
+                $lastFailure = $_.Exception
+                if ($attempt -lt $MaximumAttempts) {
+                    Start-Sleep -Milliseconds ([Math]::Min(2000, 250 * $attempt))
+                }
+            }
+        }
+        throw "Published main updater channel did not become verifiable within the bounded wait: $($lastFailure.Message)"
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryRoot) { Remove-Item -LiteralPath $temporaryRoot -Recurse -Force }
+    }
+}
+
+function Assert-PublishedPinnedUpdater([string]$MinimumVersion) {
+    if ($MinimumVersion -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        throw "Manifest minimum updater version is not canonical: $MinimumVersion"
+    }
     $identity = Get-PinnedUpdaterIdentity
+    if ([Version]$identity.version -lt [Version]$MinimumVersion) {
+        throw "Pinned updater $($identity.version) does not satisfy manifest minimum $MinimumVersion."
+    }
     $snapshot = Get-PublishedStableReleaseSnapshot -Tag "updater-v$($identity.version)" -Description 'Pinned distributed updater'
     Assert-CobblePublishedUpdaterAsset -LocalAsset $identity -RemoteAssets @($snapshot.Assets) | Out-Null
+    $publicPin = Get-PublishedMainUpdaterChannelPin
+    if ($publicPin.Version -cne $identity.version -or
+        $publicPin.ReleaseTag -cne "updater-v$($identity.version)" -or
+        $publicPin.Size -ne $identity.size -or
+        $publicPin.Sha256 -cne $identity.sha256) {
+        throw 'Published main updater channel does not advertise the exact pinned updater release.'
+    }
     return $identity
 }
 
@@ -794,7 +856,7 @@ function Publish-StagedRelease(
     [string]$NotesPath,
     [AllowEmptyCollection()][object[]]$BaseIdentityAssets = @()
 ) {
-    Assert-PublishedPinnedUpdater | Out-Null
+    Assert-PublishedPinnedUpdater -MinimumVersion ([string]$Manifest.minimumUpdaterVersion) | Out-Null
     $tag = "modpack-v$Version"
     Assert-ManifestSignatureIdentity $StagedIdentity | Out-Null
     $expected = @(Get-ExpectedStagedAssets $Manifest $StagedIdentity)
@@ -863,7 +925,7 @@ function Publish-StagedRelease(
     Assert-CobbleRemoteAssetInventory -ExpectedAssets $expected -RemoteAssets @($current.Assets) -RequireComplete | Out-Null
     Write-Host 'Remote asset names, states, sizes, and GitHub SHA-256 digests exactly match signed staging.'
 
-    Assert-PublishedPinnedUpdater | Out-Null
+    Assert-PublishedPinnedUpdater -MinimumVersion ([string]$Manifest.minimumUpdaterVersion) | Out-Null
     if ([int]$Manifest.schemaVersion -eq 2) {
         if ($BaseIdentityAssets.Count -ne 2) { throw 'Delta publication is missing its verified signed-base identity snapshot.' }
         Assert-PublishedBaseReleaseIdentity -BaseVersion ([string]$Manifest.base.version) -ExpectedAssets $BaseIdentityAssets | Out-Null
@@ -1181,7 +1243,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.11'
+            minimumUpdaterVersion = $RequiredUpdaterVersion
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             payload = $payloadResult.Payload
             files = @($authoritativeFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
@@ -1197,7 +1259,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.11'
+            minimumUpdaterVersion = $RequiredUpdaterVersion
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             base = [ordered]@{ version = $BaseVersion; manifestSha256 = $baseHash }
             payload = $payloadResult.Payload

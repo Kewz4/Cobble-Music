@@ -529,15 +529,29 @@ function Reserve-UpdaterTagRef([string]$Tag, [string]$Commit) {
     # Always re-fetch rather than trusting the create response. A concurrent
     # creator is idempotent only when the exact lightweight ref now points at
     # the same captured commit; a foreign target remains a hard failure.
-    try {
-        $reserved = Get-ExactUpdaterTagRef $Tag
-        $null = Assert-ExactUpdaterTagRef $reserved $Tag $Commit
-    }
-    catch {
-        if ($null -ne $creationFailure) {
-            throw "Updater tag reservation failed and the raced ref was not identical. Create error: $($creationFailure.Message) Re-fetch error: $($_.Exception.Message)"
+    $verificationFailure = $null
+    $reserved = $null
+    for ($attempt = 1; $attempt -le 6; $attempt++) {
+        try {
+            $reserved = Get-ExactUpdaterTagRef $Tag
+            $null = Assert-ExactUpdaterTagRef $reserved $Tag $Commit
+            $verificationFailure = $null
+            break
         }
-        throw
+        catch {
+            $verificationFailure = $_.Exception
+            # A visible foreign ref is definitive. Only retry the short window
+            # where GitHub accepted the create but matching-refs still returns
+            # no exact ref.
+            if ($null -ne $reserved -or $attempt -eq 6) { break }
+            Start-Sleep -Milliseconds ([Math]::Min(2000, 250 * $attempt))
+        }
+    }
+    if ($null -ne $verificationFailure) {
+        if ($null -ne $creationFailure) {
+            throw "Updater tag reservation failed and the raced ref was not identical. Create error: $($creationFailure.Message) Re-fetch error: $($verificationFailure.Message)"
+        }
+        throw $verificationFailure
     }
     if ($null -ne $creationFailure) {
         Write-Host "A concurrent creator reserved the identical updater tag $Tag at $Commit; continuing idempotently."
