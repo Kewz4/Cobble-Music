@@ -7,6 +7,20 @@ $script:PinnedUpdaterVersion = '1.2.12'
 $script:MaximumReleaseAssetCount = 999
 $script:ReservedReleaseMetadataAssetCount = 2
 $script:MaximumPublicReleaseCount = 499
+$script:ExactRetiredV1013SeedIdentities = @{
+    'config/cobbreeding/encryption' = [pscustomobject]@{ size = 24L; sha256 = '2bb06f85c37e816eef81cde4eb4fbac3cce07a70b96136d03fe17ba8d71f1c2d' }
+    'config/defaultoptions-common.toml.bak1' = [pscustomobject]@{ size = 333L; sha256 = 'a186d6ab6468353cb2a49f5a4229c16b004580a557d4bccaf12041e8a46f9d9e' }
+    'config/dreamdisplays/config.yml' = [pscustomobject]@{ size = 261L; sha256 = '7b6b2deac4a3b0e43023590f1005686cf0328b4c005d30faacd7e58038d258e7' }
+    'config/etf_warnings.json' = [pscustomobject]@{ size = 28L; sha256 = 'a5ba22e63061c1fb67f0f895f17681351eaeccc225faef966c29ee630593275e' }
+    'config/jade/usernamecache.json' = [pscustomobject]@{ size = 918L; sha256 = '038776e7dcab245d02c0df6227f4797b1a1e36f0063fc8787f2640f87dabc2ce' }
+    'config/sodium-fingerprint.json' = [pscustomobject]@{ size = 427L; sha256 = '7bb6d04a130e6c0826448c3d8531e81b90ba5fca2b3fb2ccaf95c7aa8f0f572c' }
+    'config/spark/activity.json' = [pscustomobject]@{ size = 2L; sha256 = '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945' }
+    'config/spark/tmp-client/about.txt' = [pscustomobject]@{ size = 585L; sha256 = 'd7514c0ddb6ae8611a281527bf04ca6cbcea1fa21758534fdcd08ed0f51c19c0' }
+    'config/spark/tmp/about.txt' = [pscustomobject]@{ size = 585L; sha256 = 'd7514c0ddb6ae8611a281527bf04ca6cbcea1fa21758534fdcd08ed0f51c19c0' }
+    'config/waystones-common.toml.bak1' = [pscustomobject]@{ size = 7899L; sha256 = '39b508ab2e4e5988b47d88869ecc349da01a95c86c5e71e5e14eddb4ba329f29' }
+    'config/waystones-common.toml.bak2' = [pscustomobject]@{ size = 8329L; sha256 = '3c25e82516228487159648f1e4692e5a4d92318892e86d71e1741b868e94eec8' }
+    'config/zoomify.json' = [pscustomobject]@{ size = 709L; sha256 = '18ad037a0087eea89db518710cc69fa750dcd2122c52219c1dd4182cb55e0a42' }
+}
 
 function Get-CobbleOptionalPropertyValue {
     param(
@@ -534,7 +548,7 @@ function ConvertTo-CobbleSeedFileRecordSet {
         [AllowEmptyCollection()]
         [Parameter(Mandatory)][object[]]$Entries,
         [Parameter(Mandatory)][string]$Context,
-        [switch]$AllowHistoricalCobbreedingEncryption
+        [switch]$AllowExactRetiredV1013Seeds
     )
 
     $byKey = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
@@ -542,13 +556,14 @@ function ConvertTo-CobbleSeedFileRecordSet {
     foreach ($entry in $Entries) {
         if ($null -eq $entry) { throw "$Context contains a null file entry." }
         $path = [string]$entry.path
-        $isHistoricalCobbreedingEncryption = $AllowHistoricalCobbreedingEncryption -and
-            $path.Replace('\', '/') -ieq 'config/cobbreeding/encryption'
-        if ($isHistoricalCobbreedingEncryption) {
-            # v1.0.13 accidentally shipped this generated key as a seed. It is
-            # accepted only while authenticating that exact signed base so a
-            # clean delta can retire it. It is never accepted into a new
-            # manifest or payload and is never deleted from a player's files.
+        $normalizedPath = $path.Replace('\', '/')
+        $isExactRetiredV1013Seed = $AllowExactRetiredV1013Seeds -and
+            $script:ExactRetiredV1013SeedIdentities.ContainsKey($normalizedPath)
+        if ($isExactRetiredV1013Seed) {
+            # v1.0.13 accidentally shipped a small, fixed set of generated
+            # files as seeds. They are accepted only while authenticating that
+            # exact signed base so a clean delta can retire them. They are
+            # never accepted into a new manifest/payload or deleted locally.
             Assert-CobbleManagedPath -Path $path -Context $Context | Out-Null
         }
         else {
@@ -566,6 +581,13 @@ function ConvertTo-CobbleSeedFileRecordSet {
         $sha256 = [string]$entry.sha256
         if ($sha256 -cnotmatch $script:Sha256Pattern) {
             throw "$Context contains a non-canonical SHA-256 for $path."
+        }
+        if ($isExactRetiredV1013Seed) {
+            $expectedRetiredIdentity = $script:ExactRetiredV1013SeedIdentities[$normalizedPath]
+            if ($size -ne [int64]$expectedRetiredIdentity.size -or
+                $sha256 -cne [string]$expectedRetiredIdentity.sha256) {
+                throw "$Context does not match the exact retired v1.0.13 seed identity: $path"
+            }
         }
 
         $key = Get-CobblePathKey $path
@@ -868,7 +890,7 @@ function Assert-CobbleBaseManifest {
     $seedFilesState = Get-CobbleRuntimeCollectionState $Manifest 'seedFiles' 'Signed base seedFiles'
     $seedSet = ConvertTo-CobbleSeedFileRecordSet -Entries @($seedFilesState.Entries) `
         -Context 'signed base create-only defaults' `
-        -AllowHistoricalCobbreedingEncryption:([string]$Manifest.version -ceq '1.0.13')
+        -AllowExactRetiredV1013Seeds:([string]$Manifest.version -ceq '1.0.13')
     foreach ($seed in $seedSet.Entries) {
         if ($fileSet.ByKey.ContainsKey((Get-CobblePathKey $seed.path))) {
             throw "Signed base overlaps managed files and create-only defaults: $($seed.path)"

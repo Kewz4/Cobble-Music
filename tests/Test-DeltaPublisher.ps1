@@ -172,7 +172,11 @@ $historicPrivateSeedBase = [pscustomobject]@{
     version = '1.0.13'
     releaseTag = 'modpack-v1.0.13'
     files = $base
-    seedFiles = @((New-Record 'config/cobbreeding/encryption' 32 '7'))
+    seedFiles = @([pscustomobject]@{
+        path = 'config/cobbreeding/encryption'
+        size = 24
+        sha256 = '2bb06f85c37e816eef81cde4eb4fbac3cce07a70b96136d03fe17ba8d71f1c2d'
+    })
 }
 Assert-True ($null -ne (Assert-CobbleBaseManifest -Manifest $historicPrivateSeedBase -ExpectedVersion '1.0.13' -TargetVersion '1.0.14')) `
     'The exact historical v1.0.13 Cobbreeding seed could not be authenticated for retirement.'
@@ -185,8 +189,12 @@ $wrongHistoricPrivateSeedBase.version = '1.0.12'
 $wrongHistoricPrivateSeedBase.releaseTag = 'modpack-v1.0.12'
 Assert-Throws { Assert-CobbleBaseManifest -Manifest $wrongHistoricPrivateSeedBase -ExpectedVersion '1.0.12' -TargetVersion '1.0.14' } `
     'The historical Cobbreeding seed exception was accepted outside exact base v1.0.13.'
+$wrongHistoricSeedIdentity = ($historicPrivateSeedBase | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$wrongHistoricSeedIdentity.seedFiles[0].sha256 = New-Hash '7'
+Assert-Throws { Assert-CobbleBaseManifest -Manifest $wrongHistoricSeedIdentity -ExpectedVersion '1.0.13' -TargetVersion '1.0.14' } `
+    'The exact historical exception accepted the right path with the wrong signed identity.'
 $otherPrivateSeedBase = ($historicPrivateSeedBase | ConvertTo-Json -Depth 12) | ConvertFrom-Json
-$otherPrivateSeedBase.seedFiles = @((New-Record 'config/jade/usernamecache.json' 32 '7'))
+$otherPrivateSeedBase.seedFiles = @((New-Record 'config/MCBrowser/tabs.json' 32 '7'))
 Assert-Throws { Assert-CobbleBaseManifest -Manifest $otherPrivateSeedBase -ExpectedVersion '1.0.13' -TargetVersion '1.0.14' } `
     'The exact historical exception broadened to unrelated private runtime state.'
 $deltaBaseInV1 = $baselineManifest.PSObject.Copy()
