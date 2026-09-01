@@ -17,6 +17,9 @@ function Assert-True([bool]$Condition, [string]$Message) {
 }
 
 Assert-True ($null -ne (Get-Command Get-CobblePathKey -ErrorAction SilentlyContinue)) 'The publisher path-key helper is not exported from the release core module.'
+Assert-True ($null -ne (Get-Command Test-CobbleSameFileRecord -ErrorAction SilentlyContinue)) 'The publisher exact-file comparison helper is not exported from the release core module.'
+Assert-True (Test-CobbleSameFileRecord -Left (New-Record 'mods/a.jar' 1 'a') -Right (New-Record 'mods/a.jar' 1 'a')) 'Equal signed file identities were not recognized.'
+Assert-True (-not (Test-CobbleSameFileRecord -Left (New-Record 'mods/a.jar' 1 'a') -Right (New-Record 'mods/a.jar' 2 'a'))) 'Different signed file identities were treated as equal.'
 
 function Assert-Throws([scriptblock]$Action, [string]$Message) {
     try { & $Action; throw "Expected failure did not occur: $Message" }

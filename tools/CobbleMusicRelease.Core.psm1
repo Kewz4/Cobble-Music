@@ -1351,6 +1351,7 @@ Export-ModuleMember -Function @(
     'Assert-CobbleLockedFileSnapshot',
     'Close-CobbleLockedFileSnapshot',
     'ConvertTo-CobbleFileRecordSet',
+    'Test-CobbleSameFileRecord',
     'ConvertTo-CobbleLegacyCleanupSet',
     'ConvertTo-CobbleSeedFileRecordSet',
     'Assert-CobbleSupportedMinimumUpdaterVersion',
