@@ -82,6 +82,13 @@ internal static class ManifestParser
         }
         else
         {
+            if (manifest.SeedTextReplacements.Any(replacement =>
+                    replacement is not null
+                    && string.Equals(replacement.Path, "options.txt", StringComparison.OrdinalIgnoreCase))
+                && requiredUpdater < new Version(1, 2, 11))
+            {
+                throw new InvalidDataException("Signed key-collision repairs require updater 1.2.11 or newer.");
+            }
             if (manifest.SeedTextReplacements.Count != 0 && requiredUpdater < new Version(1, 2, 10))
             {
                 throw new InvalidDataException("Signed seed text replacements require updater 1.2.10 or newer.");
@@ -218,7 +225,16 @@ internal static class ManifestParser
         IReadOnlyDictionary<string, ManifestFile> seedFiles,
         IReadOnlySet<string> reofferSeedPaths)
     {
-        var paths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        const string optionsMigrationId = "options-contest-tracker-k-collision-v1";
+        const string contestTrackerK = "key_key.companion_bonds.open_contest_tracker:key.keyboard.k";
+        const string irisToggleK = "key_iris.keybind.toggleShaders:key.keyboard.k";
+        const string irisToggleUnbound = "key_iris.keybind.toggleShaders:key.keyboard.unknown";
+        const string fancyToastsK = "key_key.fancytoasts.config_menu:key.keyboard.k";
+        const string fancyToastsUnbound = "key_key.fancytoasts.config_menu:key.keyboard.unknown";
+        var identities = new HashSet<string>(StringComparer.Ordinal);
+        int optionsReplacementCount = 0;
+        bool hasIrisToggleReplacement = false;
+        bool hasFancyToastsReplacement = false;
         foreach (SeedTextReplacement replacement in entries)
         {
             if (replacement is null)
@@ -226,29 +242,66 @@ internal static class ManifestParser
                 throw new InvalidDataException("Release manifest contains an empty seed text replacement.");
             }
             replacement.Path = PathSafety.NormalizeRelativePath(replacement.Path);
+            bool isIris = string.Equals(
+                replacement.Path,
+                "config/iris.properties",
+                StringComparison.OrdinalIgnoreCase);
+            bool isOptions = string.Equals(
+                replacement.Path,
+                "options.txt",
+                StringComparison.OrdinalIgnoreCase);
+            bool validText = IsSafeReplacementLine(replacement.OldText)
+                && IsSafeReplacementLine(replacement.NewText)
+                && !string.Equals(replacement.OldText, replacement.NewText, StringComparison.Ordinal);
+            bool validIrisReplacement = isIris
+                && replacement.RequiredLines is { Count: 0 }
+                && string.IsNullOrEmpty(replacement.MigrationId)
+                && replacement.OldText.StartsWith("shaderPack=", StringComparison.Ordinal)
+                && replacement.NewText.StartsWith("shaderPack=", StringComparison.Ordinal);
+            bool validOptionsReplacement = isOptions
+                && replacement.RequiredLines is { Count: 1 }
+                && string.Equals(replacement.MigrationId, optionsMigrationId, StringComparison.Ordinal)
+                && PathSafety.IsPlayerSettingMigrationIdAllowed(replacement.MigrationId)
+                && string.Equals(replacement.RequiredLines[0], contestTrackerK, StringComparison.Ordinal)
+                && ((string.Equals(replacement.OldText, irisToggleK, StringComparison.Ordinal)
+                        && string.Equals(replacement.NewText, irisToggleUnbound, StringComparison.Ordinal))
+                    || (string.Equals(replacement.OldText, fancyToastsK, StringComparison.Ordinal)
+                        && string.Equals(replacement.NewText, fancyToastsUnbound, StringComparison.Ordinal)));
+            string identity = replacement.Path.ToUpperInvariant() + "\0" + replacement.OldText;
             if (!PathSafety.IsSeedTextReplacementAllowed(replacement.Path)
                 || !seedFiles.ContainsKey(replacement.Path)
-                || !reofferSeedPaths.Contains(replacement.Path)
-                || !paths.Add(replacement.Path)
-                || string.IsNullOrEmpty(replacement.OldText)
-                || string.IsNullOrEmpty(replacement.NewText)
-                || string.Equals(replacement.OldText, replacement.NewText, StringComparison.Ordinal)
-                || replacement.OldText.Length > 4096
-                || replacement.NewText.Length > 4096
-                || replacement.OldText.Contains('\0')
-                || replacement.NewText.Contains('\0')
-                || replacement.OldText.Contains('\n')
-                || replacement.OldText.Contains('\r')
-                || replacement.NewText.Contains('\n')
-                || replacement.NewText.Contains('\r')
-                || !replacement.OldText.StartsWith("shaderPack=", StringComparison.Ordinal)
-                || !replacement.NewText.StartsWith("shaderPack=", StringComparison.Ordinal))
+                || (isIris && !reofferSeedPaths.Contains(replacement.Path))
+                || (isOptions && reofferSeedPaths.Contains(replacement.Path))
+                || !identities.Add(identity)
+                || !validText
+                || !(validIrisReplacement || validOptionsReplacement))
             {
                 throw new InvalidDataException(
                     $"Release manifest contains an unsafe, duplicate, or undeclared seed text replacement: {replacement.Path}");
             }
+            if (validOptionsReplacement)
+            {
+                optionsReplacementCount++;
+                hasIrisToggleReplacement |= string.Equals(replacement.OldText, irisToggleK, StringComparison.Ordinal);
+                hasFancyToastsReplacement |= string.Equals(replacement.OldText, fancyToastsK, StringComparison.Ordinal);
+            }
+        }
+        if (optionsReplacementCount is not 0
+            && (optionsReplacementCount != 2
+                || !hasIrisToggleReplacement
+                || !hasFancyToastsReplacement))
+        {
+            throw new InvalidDataException(
+                "The signed options migration must contain the complete reviewed Iris and Fancy Toasts repair pair.");
         }
     }
+
+    private static bool IsSafeReplacementLine(string value) =>
+        !string.IsNullOrEmpty(value)
+        && value.Length <= 4096
+        && !value.Contains('\0')
+        && !value.Contains('\n')
+        && !value.Contains('\r');
 
     private static void ValidateSchemaOne(
         UpdateManifest manifest,

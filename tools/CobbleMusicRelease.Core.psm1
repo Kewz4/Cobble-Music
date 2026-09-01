@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 $script:AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $script:Sha256Pattern = '^[0-9a-f]{64}$'
 $script:VersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-$script:PinnedUpdaterVersion = '1.2.10'
+$script:PinnedUpdaterVersion = '1.2.11'
 $script:MaximumReleaseAssetCount = 999
 $script:ReservedReleaseMetadataAssetCount = 2
 $script:MaximumPublicReleaseCount = 499
@@ -138,6 +138,10 @@ function Assert-CobbleSourcePathPolicy {
     if ($normalized -ieq 'config/dreamdisplays/config.toml') {
         throw "$Context is credential-bearing service configuration and may not be distributed: $normalized"
     }
+    if ($normalized -ieq 'config/cobbreeding/encryption' -or
+        $normalized -ieq 'config/jade/usernamecache.json') {
+        throw "$Context is generated private runtime state and may not be distributed: $normalized"
+    }
 
     $forbiddenSegments = @('.git', '.hg', '.svn', '.idea', '.vscode', 'node_modules', '__pycache__')
     foreach ($segment in $normalized.Split('/')) {
@@ -178,11 +182,35 @@ function Assert-CobbleSeedPathPolicy {
     if (-not $normalized.StartsWith('config/', [StringComparison]::OrdinalIgnoreCase)) {
         throw "$Context is outside the create-only allowlist: $normalized"
     }
-    if ($normalized -ieq 'config/dreamdisplays/config.toml') {
-        throw "$Context is a credential-bearing service configuration and may not be distributed: $normalized"
+    if (Test-CobbleNeverDistributePath -Path $normalized) {
+        throw "$Context is generated private runtime state and may not be distributed: $normalized"
     }
     Assert-CobbleSourcePathPolicy -Path $normalized -Context $Context -ExplicitSourceFile | Out-Null
     return $true
+}
+
+function Test-CobbleNeverDistributePath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $normalized = $Path.Replace('\', '/')
+    $segments = @($normalized.Split('/'))
+    $name = $segments[-1]
+    return $normalized -ieq 'config/MCBrowser/tabs.json' -or
+        $normalized -ieq 'config/packed_packs/__version.json' -or
+        $normalized -ieq 'config/dreamdisplays/config.toml' -or
+        $normalized -ieq 'config/dreamdisplays/config.yml' -or
+        $normalized -ieq 'config/cobbreeding/encryption' -or
+        $normalized -ieq 'config/jade/usernamecache.json' -or
+        $normalized -ieq 'config/zoomify.json' -or
+        $normalized -ieq 'config/etf_warnings.json' -or
+        $normalized -ieq 'config/sodium-fingerprint.json' -or
+        $normalized -ieq 'config/spark/activity.json' -or
+        $normalized -ieq 'config/spark/tmp/about.txt' -or
+        $normalized -ieq 'config/spark/tmp-client/about.txt' -or
+        ($segments[0] -ieq 'config' -and $segments -icontains 'cache') -or
+        $name -imatch '(?:\.bak(?:\d+|[-._].*)?|\.old(?:\d+|[-._].*)?|~)$' -or
+        $name -ieq 'thumbs.db' -or
+        $name -ieq '.ds_store'
 }
 
 function Assert-CobbleSeedTextReplacementPathPolicy {
@@ -193,8 +221,8 @@ function Assert-CobbleSeedTextReplacementPathPolicy {
 
     $normalized = $Path.Replace('\', '/')
     Assert-CobbleSeedPathPolicy -Path $normalized -Context $Context | Out-Null
-    if ($normalized -ine 'config/iris.properties') {
-        throw "$Context may only migrate the obsolete Iris shader selector: $normalized"
+    if ($normalized -ine 'config/iris.properties' -and $normalized -ine 'options.txt') {
+        throw "$Context may only migrate the obsolete Iris selector or the reviewed K-key collision: $normalized"
     }
     return $true
 }
@@ -202,19 +230,7 @@ function Assert-CobbleSeedTextReplacementPathPolicy {
 function Test-CobbleSeedTreeExclusion {
     param([Parameter(Mandatory)][string]$Path)
 
-    $normalized = $Path.Replace('\', '/')
-    $segments = @($normalized.Split('/'))
-    $name = $segments[-1]
-    if ($normalized -ieq 'config/MCBrowser/tabs.json' -or
-        $normalized -ieq 'config/packed_packs/__version.json' -or
-        $normalized -ieq 'config/dreamdisplays/config.toml' -or
-        ($segments[0] -ieq 'config' -and $segments -icontains 'cache') -or
-        $name -imatch '(?:\.bak(?:[-._].*)?|\.old(?:[-._].*)?|~)$' -or
-        $name -ieq 'thumbs.db' -or
-        $name -ieq '.ds_store') {
-        return $true
-    }
-    return $false
+    return Test-CobbleNeverDistributePath -Path $Path
 }
 
 function Get-CobbleManagedSourceFiles {
@@ -265,6 +281,9 @@ function Get-CobbleManagedSourceFiles {
             }
             $relative = [IO.Path]::GetRelativePath($sourceRoot, $file.FullName).Replace('\', '/')
             Assert-CobbleSourcePathPolicy -Path $relative -Context 'source file' | Out-Null
+            if (Test-CobbleNeverDistributePath -Path $relative) {
+                throw "Managed source includes generated private/runtime state: $relative"
+            }
             $key = $relative.Normalize([Text.NormalizationForm]::FormC)
             if (-not $byPath.TryAdd($key, [pscustomobject]@{ full = $file.FullName; path = $relative })) {
                 throw "Managed source contains a duplicate path: $relative"
@@ -275,6 +294,9 @@ function Get-CobbleManagedSourceFiles {
     foreach ($relativeInput in $IncludeFiles | Sort-Object -Unique) {
         $relative = $relativeInput.Replace('\', '/')
         Assert-CobbleSourcePathPolicy -Path $relative -Context 'included file' -ExplicitSourceFile | Out-Null
+        if (Test-CobbleNeverDistributePath -Path $relative) {
+            throw "Explicitly included source is generated private/runtime state: $relative"
+        }
         $full = Join-Path $sourceRoot $relative.Replace('/', [IO.Path]::DirectorySeparatorChar)
         if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { continue }
         $item = Get-Item -LiteralPath $full
@@ -920,30 +942,66 @@ function Assert-CobbleDeltaManifest {
         }
     }
     $seedTextReplacementKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $hasOptionsTextReplacement = $false
+    $optionsReplacementCount = 0
+    $hasIrisToggleReplacement = $false
+    $hasFancyToastsReplacement = $false
     foreach ($replacement in @($seedTextReplacementsState.Entries)) {
         $path = [string]$replacement.path
         Assert-CobbleSeedTextReplacementPathPolicy -Path $path -Context 'delta seed text replacement' | Out-Null
         $key = Get-CobblePathKey $path
         $oldText = [string]$replacement.oldText
         $newText = [string]$replacement.newText
-        if (-not $seedTextReplacementKeys.Add($key) -or
-            -not $seedFiles.ByKey.ContainsKey($key) -or -not $reofferSeedKeys.Contains($key) -or
-            [string]::IsNullOrEmpty($oldText) -or [string]::IsNullOrEmpty($newText) -or
-            $oldText -ceq $newText -or $oldText.Length -gt 4096 -or $newText.Length -gt 4096 -or
-            $oldText.Contains([char]0) -or $newText.Contains([char]0) -or
-            $oldText.Contains("`n") -or $oldText.Contains("`r") -or
-            $newText.Contains("`n") -or $newText.Contains("`r") -or
-            -not $oldText.StartsWith('shaderPack=', [StringComparison]::Ordinal) -or
-            -not $newText.StartsWith('shaderPack=', [StringComparison]::Ordinal)) {
+        $requiredLines = @(if ($replacement.PSObject.Properties.Name -contains 'requiredLines' -and $null -ne $replacement.requiredLines) {
+            @($replacement.requiredLines | ForEach-Object { [string]$_ })
+        } else { @() })
+        $migrationId = if ($replacement.PSObject.Properties.Name -contains 'migrationId') { [string]$replacement.migrationId } else { '' }
+        $identity = $key + [char]0 + $oldText
+        $safeText = -not [string]::IsNullOrEmpty($oldText) -and -not [string]::IsNullOrEmpty($newText) -and
+            $oldText -cne $newText -and $oldText.Length -le 4096 -and $newText.Length -le 4096 -and
+            -not $oldText.Contains([char]0) -and -not $newText.Contains([char]0) -and
+            -not $oldText.Contains("`n") -and -not $oldText.Contains("`r") -and
+            -not $newText.Contains("`n") -and -not $newText.Contains("`r")
+        $validIris = $path -ieq 'config/iris.properties' -and $requiredLines.Count -eq 0 -and
+            [string]::IsNullOrEmpty($migrationId) -and
+            $oldText.StartsWith('shaderPack=', [StringComparison]::Ordinal) -and
+            $newText.StartsWith('shaderPack=', [StringComparison]::Ordinal)
+        $contestTrackerK = 'key_key.companion_bonds.open_contest_tracker:key.keyboard.k'
+        $optionsMigrationId = 'options-contest-tracker-k-collision-v1'
+        $validOptions = $path -ieq 'options.txt' -and $requiredLines.Count -eq 1 -and
+            $migrationId -ceq $optionsMigrationId -and
+            $requiredLines[0] -ceq $contestTrackerK -and
+            (($oldText -ceq 'key_iris.keybind.toggleShaders:key.keyboard.k' -and
+                $newText -ceq 'key_iris.keybind.toggleShaders:key.keyboard.unknown') -or
+             ($oldText -ceq 'key_key.fancytoasts.config_menu:key.keyboard.k' -and
+                $newText -ceq 'key_key.fancytoasts.config_menu:key.keyboard.unknown'))
+        if (-not $seedTextReplacementKeys.Add($identity) -or
+            -not $seedFiles.ByKey.ContainsKey($key) -or
+            ($validIris -and -not $reofferSeedKeys.Contains($key)) -or
+            ($validOptions -and $reofferSeedKeys.Contains($key)) -or
+            -not $safeText -or -not ($validIris -or $validOptions)) {
             throw "Delta seedTextReplacements contains an unsafe, duplicate, or undeclared replacement: $path"
         }
+        if ($validOptions) {
+            $hasOptionsTextReplacement = $true
+            $optionsReplacementCount++
+            if ($oldText -ceq 'key_iris.keybind.toggleShaders:key.keyboard.k') { $hasIrisToggleReplacement = $true }
+            if ($oldText -ceq 'key_key.fancytoasts.config_menu:key.keyboard.k') { $hasFancyToastsReplacement = $true }
+        }
+    }
+    if ($optionsReplacementCount -ne 0 -and
+        ($optionsReplacementCount -ne 2 -or -not $hasIrisToggleReplacement -or -not $hasFancyToastsReplacement)) {
+        throw 'The options migration must contain the complete reviewed Iris and Fancy Toasts repair pair.'
     }
     $legacySet = ConvertTo-CobbleLegacyCleanupSet -Entries @($legacyCleanup.Entries) -Context 'delta legacyCleanup'
     $refreshesExactSeeds = @($legacySet.Entries | Where-Object {
         $key = Get-CobblePathKey $_.path
         $seedFiles.ByKey.ContainsKey($key) -and $reofferSeedKeys.Contains($key)
     }).Count -gt 0
-    $minimumFloor = if ($seedTextReplacementKeys.Count -gt 0 -or $refreshesExactSeeds) {
+    $minimumFloor = if ($hasOptionsTextReplacement) {
+        [Version]'1.2.11'
+    }
+    elseif ($seedTextReplacementKeys.Count -gt 0 -or $refreshesExactSeeds) {
         [Version]'1.2.10'
     }
     elseif ($reofferSeedKeys.Count -gt 0) {
@@ -1344,6 +1402,7 @@ Export-ModuleMember -Function @(
     'Assert-CobbleSourcePathPolicy',
     'Assert-CobbleSeedPathPolicy',
     'Assert-CobbleSeedTextReplacementPathPolicy',
+    'Test-CobbleNeverDistributePath',
     'Get-CobbleManagedSourceFiles',
     'Get-CobbleSeedSourceFiles',
     'Assert-CobblePrivateKeyIsolation',

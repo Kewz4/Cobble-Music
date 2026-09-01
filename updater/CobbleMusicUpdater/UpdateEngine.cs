@@ -181,7 +181,18 @@ internal sealed class UpdateEngine
         if (!string.IsNullOrWhiteSpace(state.Version)
             || !string.IsNullOrWhiteSpace(state.ManifestSha256)
             || state.ManagedFiles.Count != 0
-            || state.OfferedSeedPaths.Count != 0)
+            || state.OfferedSeedPaths.Count != 0
+            || state.AppliedPlayerSettingMigrationIds.Count != 0)
+        {
+            return false;
+        }
+
+        // A signed one-time migration must pass through the transactional
+        // path even when its current predicates are already false. That is
+        // what durably records the migration as inspected and prevents later
+        // player choices from making it applicable again.
+        if (manifest.SeedTextReplacements.Any(replacement =>
+                !string.IsNullOrEmpty(replacement.MigrationId)))
         {
             return false;
         }
@@ -217,7 +228,7 @@ internal sealed class UpdateEngine
         {
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, replacement.Path);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
-            if (await ContainsSeedTextAsync(target, replacement.OldText, cancellationToken))
+            if (await ContainsApplicableSeedTextAsync(target, replacement, cancellationToken))
             {
                 return false;
             }
@@ -250,7 +261,8 @@ internal sealed class UpdateEngine
                 .Select(file => file.Path)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
-                .ToList()
+                .ToList(),
+            AppliedPlayerSettingMigrationIds = []
         };
         await LocalStateStore.SaveStateAsync(_paths, adoptedState, cancellationToken);
         return true;
@@ -292,6 +304,7 @@ internal sealed class UpdateEngine
         CancellationToken cancellationToken)
     {
         var offeredSeeds = state.OfferedSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var appliedMigrationIds = state.AppliedPlayerSettingMigrationIds.ToHashSet(StringComparer.Ordinal);
         var reofferedSeeds = manifest.ReofferSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
         var seedFiles = manifest.SeedFiles.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase);
         foreach (ManifestFile seed in manifest.SeedFiles)
@@ -310,9 +323,17 @@ internal sealed class UpdateEngine
         }
         foreach (SeedTextReplacement replacement in manifest.SeedTextReplacements)
         {
+            if (!string.IsNullOrEmpty(replacement.MigrationId))
+            {
+                if (!appliedMigrationIds.Contains(replacement.MigrationId))
+                {
+                    return true;
+                }
+                continue;
+            }
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, replacement.Path);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
-            if (await ContainsSeedTextAsync(target, replacement.OldText, cancellationToken))
+            if (await ContainsApplicableSeedTextAsync(target, replacement, cancellationToken))
             {
                 return true;
             }
@@ -668,6 +689,7 @@ internal sealed class UpdateEngine
             || !string.IsNullOrWhiteSpace(previousState.ManifestSha256)
             || previousState.ManagedFiles.Count != 0;
         var previouslyOfferedSeeds = previousState.OfferedSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var previouslyAppliedMigrationIds = previousState.AppliedPlayerSettingMigrationIds.ToHashSet(StringComparer.Ordinal);
         var reofferSeedPaths = manifest.ReofferSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
         if (signedBase is not null)
         {
@@ -678,6 +700,10 @@ internal sealed class UpdateEngine
         }
         var nextOfferedSeeds = previouslyOfferedSeeds.ToHashSet(StringComparer.OrdinalIgnoreCase);
         nextOfferedSeeds.UnionWith(manifest.SeedFiles.Select(file => file.Path));
+        var nextAppliedMigrationIds = previouslyAppliedMigrationIds.ToHashSet(StringComparer.Ordinal);
+        nextAppliedMigrationIds.UnionWith(manifest.SeedTextReplacements
+            .Select(replacement => replacement.MigrationId)
+            .Where(migrationId => !string.IsNullOrEmpty(migrationId)));
         var newState = new InstalledState
         {
             Version = manifest.Version,
@@ -691,6 +717,9 @@ internal sealed class UpdateEngine
             }).ToList(),
             OfferedSeedPaths = nextOfferedSeeds
                 .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+                .ToList(),
+            AppliedPlayerSettingMigrationIds = nextAppliedMigrationIds
+                .OrderBy(migrationId => migrationId, StringComparer.Ordinal)
                 .ToList()
         };
         var journal = new TransactionJournal
@@ -768,6 +797,7 @@ internal sealed class UpdateEngine
 
             await ApplySeedTextReplacementsAsync(
                 manifest.SeedTextReplacements,
+                previouslyAppliedMigrationIds,
                 backupDirectory,
                 journal,
                 cancellationToken);
@@ -1021,93 +1051,169 @@ internal sealed class UpdateEngine
 
     private async Task ApplySeedTextReplacementsAsync(
         IReadOnlyCollection<SeedTextReplacement> replacements,
+        IReadOnlySet<string> appliedMigrationIds,
+        string backupDirectory,
+        TransactionJournal journal,
+        CancellationToken cancellationToken)
+    {
+        foreach (IGrouping<string, SeedTextReplacement> legacyGroup in replacements
+            .Where(replacement => string.IsNullOrEmpty(replacement.MigrationId))
+            .GroupBy(replacement => replacement.Path, StringComparer.OrdinalIgnoreCase))
+        {
+            await ApplySeedTextReplacementGroupAsync(
+                legacyGroup.ToArray(),
+                requireUnambiguousGroup: false,
+                backupDirectory,
+                journal,
+                cancellationToken);
+        }
+        foreach (IGrouping<string, SeedTextReplacement> migrationGroup in replacements
+            .Where(replacement => !string.IsNullOrEmpty(replacement.MigrationId)
+                && !appliedMigrationIds.Contains(replacement.MigrationId))
+            .GroupBy(replacement => replacement.MigrationId, StringComparer.Ordinal))
+        {
+            await ApplySeedTextReplacementGroupAsync(
+                migrationGroup.ToArray(),
+                requireUnambiguousGroup: true,
+                backupDirectory,
+                journal,
+                cancellationToken);
+        }
+    }
+
+    private async Task ApplySeedTextReplacementGroupAsync(
+        IReadOnlyCollection<SeedTextReplacement> replacements,
+        bool requireUnambiguousGroup,
         string backupDirectory,
         TransactionJournal journal,
         CancellationToken cancellationToken)
     {
         const long maximumTextSeedBytes = 4L * 1024 * 1024;
         var strictUtf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+        string[] paths = replacements
+            .Select(replacement => replacement.Path)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (paths.Length != 1)
+        {
+            throw new InvalidDataException("A player-setting migration unexpectedly spans multiple files.");
+        }
+        string path = paths[0];
+        string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, path);
+        PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+        if (!File.Exists(target) || Directory.Exists(target))
+        {
+            return;
+        }
+        var targetInfo = new FileInfo(target);
+        if (targetInfo.Length > maximumTextSeedBytes)
+        {
+            _log($"Keeping unusually large player-owned setting: {path}");
+            return;
+        }
+
+        byte[] originalBytes = await File.ReadAllBytesAsync(target, cancellationToken);
+        string originalText;
+        try
+        {
+            originalText = strictUtf8.GetString(originalBytes);
+        }
+        catch (DecoderFallbackException)
+        {
+            _log($"Keeping non-UTF-8 player-owned setting: {path}");
+            return;
+        }
+
+        if (requireUnambiguousGroup)
+        {
+            bool requiredStateMatches = replacements
+                .SelectMany(replacement => replacement.RequiredLines)
+                .Distinct(StringComparer.Ordinal)
+                .All(requiredLine => FindExactLine(originalText, requiredLine).Count == 1);
+            string[] involvedSettingPrefixes = replacements
+                .SelectMany(replacement => replacement.RequiredLines
+                    .Append(replacement.OldText)
+                    .Append(replacement.NewText))
+                .Select(GetSettingLinePrefix)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            bool hasAmbiguousSetting = involvedSettingPrefixes.Any(prefix =>
+                CountLinesWithPrefix(originalText, prefix) > 1);
+            if (!requiredStateMatches || hasAmbiguousSetting)
+            {
+                _log($"Keeping ambiguous or customized player-owned setting: {path}");
+                return;
+            }
+        }
+
+        string migratedText = originalText;
+        int appliedReplacementCount = 0;
         foreach (SeedTextReplacement replacement in replacements)
         {
-            string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, replacement.Path);
-            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
-            if (!File.Exists(target) || Directory.Exists(target))
+            if (replacement.RequiredLines.Any(requiredLine =>
+                    FindExactLine(originalText, requiredLine).Count != 1))
             {
                 continue;
             }
-            var targetInfo = new FileInfo(target);
-            if (targetInfo.Length > maximumTextSeedBytes)
-            {
-                _log($"Keeping unusually large player-owned setting: {replacement.Path}");
-                continue;
-            }
-
-            byte[] originalBytes = await File.ReadAllBytesAsync(target, cancellationToken);
-            string originalText;
-            try
-            {
-                originalText = strictUtf8.GetString(originalBytes);
-            }
-            catch (DecoderFallbackException)
-            {
-                _log($"Keeping non-UTF-8 player-owned setting: {replacement.Path}");
-                continue;
-            }
-            (int matchCount, int firstMatch) = FindExactLine(originalText, replacement.OldText);
+            (int matchCount, int firstMatch) = FindExactLine(migratedText, replacement.OldText);
             if (matchCount == 0)
             {
                 continue;
             }
             if (matchCount != 1)
             {
-                _log($"Keeping ambiguous player-owned setting with repeated legacy value: {replacement.Path}");
-                continue;
+                _log($"Keeping ambiguous player-owned setting with repeated legacy value: {path}");
+                return;
             }
 
-            string migratedText = originalText[..firstMatch]
+            migratedText = migratedText[..firstMatch]
                 + replacement.NewText
-                + originalText[(firstMatch + replacement.OldText.Length)..];
-            byte[] migratedBytes = strictUtf8.GetBytes(migratedText);
-            string migratedHash = Convert.ToHexString(SHA256.HashData(migratedBytes)).ToLowerInvariant();
-            var migratedState = new ManagedFileState
-            {
-                Path = replacement.Path,
-                Size = migratedBytes.LongLength,
-                Sha256 = migratedHash
-            };
-            journal.SeedFiles.Add(migratedState);
-
-            string backup = PathSafety.CombineUnder(backupDirectory, replacement.Path);
-            string originalHash = Convert.ToHexString(SHA256.HashData(originalBytes)).ToLowerInvariant();
-            var expectedOriginal = new ManifestFile
-            {
-                Path = replacement.Path,
-                Size = originalBytes.LongLength,
-                Sha256 = originalHash
-            };
-            TransactionOperation operation = await BackupForOperationAsync(
-                "replace",
-                target,
-                backup,
-                journal,
-                cancellationToken,
-                expectedOriginal);
-            await WriteDurableTemporaryAsync(operation.TargetTemporaryPath, migratedBytes, cancellationToken);
-            await VerifyFileAsync(
-                operation.TargetTemporaryPath,
-                migratedBytes.LongLength,
-                migratedHash,
-                replacement.Path,
-                cancellationToken);
-            File.Move(operation.TargetTemporaryPath, target);
-            await VerifyFileAsync(target, migratedBytes.LongLength, migratedHash, replacement.Path, cancellationToken);
-            _log($"Migrated obsolete player-owned setting value: {replacement.Path}");
+                + migratedText[(firstMatch + replacement.OldText.Length)..];
+            appliedReplacementCount++;
         }
+        if (appliedReplacementCount == 0)
+        {
+            return;
+        }
+        byte[] migratedBytes = strictUtf8.GetBytes(migratedText);
+        string migratedHash = Convert.ToHexString(SHA256.HashData(migratedBytes)).ToLowerInvariant();
+        journal.SeedFiles.Add(new ManagedFileState
+        {
+            Path = path,
+            Size = migratedBytes.LongLength,
+            Sha256 = migratedHash
+        });
+
+        string backup = PathSafety.CombineUnder(backupDirectory, path);
+        string originalHash = Convert.ToHexString(SHA256.HashData(originalBytes)).ToLowerInvariant();
+        var expectedOriginal = new ManifestFile
+        {
+            Path = path,
+            Size = originalBytes.LongLength,
+            Sha256 = originalHash
+        };
+        TransactionOperation operation = await BackupForOperationAsync(
+            "replace",
+            target,
+            backup,
+            journal,
+            cancellationToken,
+            expectedOriginal);
+        await WriteDurableTemporaryAsync(operation.TargetTemporaryPath, migratedBytes, cancellationToken);
+        await VerifyFileAsync(
+            operation.TargetTemporaryPath,
+            migratedBytes.LongLength,
+            migratedHash,
+            path,
+            cancellationToken);
+        File.Move(operation.TargetTemporaryPath, target);
+        await VerifyFileAsync(target, migratedBytes.LongLength, migratedHash, path, cancellationToken);
+        _log($"Migrated {appliedReplacementCount} obsolete player-owned setting value(s): {path}");
     }
 
-    private static async Task<bool> ContainsSeedTextAsync(
+    private static async Task<bool> ContainsApplicableSeedTextAsync(
         string target,
-        string oldText,
+        SeedTextReplacement replacement,
         CancellationToken cancellationToken)
     {
         const long maximumTextSeedBytes = 4L * 1024 * 1024;
@@ -1119,7 +1225,9 @@ internal sealed class UpdateEngine
         {
             byte[] bytes = await File.ReadAllBytesAsync(target, cancellationToken);
             string text = new UTF8Encoding(false, true).GetString(bytes);
-            return FindExactLine(text, oldText).Count > 0;
+            return FindExactLine(text, replacement.OldText).Count == 1
+                && replacement.RequiredLines.All(requiredLine =>
+                    FindExactLine(text, requiredLine).Count == 1);
         }
         catch (DecoderFallbackException)
         {
@@ -1154,6 +1262,36 @@ internal sealed class UpdateEngine
             lineStart = index + 1;
         }
         return (count, firstIndex);
+    }
+
+    private static string GetSettingLinePrefix(string line)
+    {
+        int separator = line.IndexOf(':');
+        return separator < 0 ? line : line[..(separator + 1)];
+    }
+
+    private static int CountLinesWithPrefix(string text, string prefix)
+    {
+        int count = 0;
+        int lineStart = 0;
+        for (int index = 0; index <= text.Length; index++)
+        {
+            bool endOfText = index == text.Length;
+            if (!endOfText && text[index] is not ('\r' or '\n'))
+            {
+                continue;
+            }
+            if (text.AsSpan(lineStart, index - lineStart).StartsWith(prefix.AsSpan(), StringComparison.Ordinal))
+            {
+                count++;
+            }
+            if (!endOfText && text[index] == '\r' && index + 1 < text.Length && text[index + 1] == '\n')
+            {
+                index++;
+            }
+            lineStart = index + 1;
+        }
+        return count;
     }
 
     private static async Task WriteDurableTemporaryAsync(

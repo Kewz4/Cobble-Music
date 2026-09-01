@@ -134,13 +134,13 @@ $badMinimumBaseline = $baselineManifest.PSObject.Copy()
 $badMinimumBaseline.minimumUpdaterVersion = '1.02.0'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $badMinimumBaseline } 'Non-canonical v1 minimumUpdaterVersion was accepted for staged resume.'
 $futureMinimumBaseline = $baselineManifest.PSObject.Copy()
-$futureMinimumBaseline.minimumUpdaterVersion = '1.2.11'
+$futureMinimumBaseline.minimumUpdaterVersion = '1.2.12'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $futureMinimumBaseline } 'V1 requiring a newer-than-pinned updater was accepted for staged resume.'
 $nonCanonicalDeltaMinimum = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 $nonCanonicalDeltaMinimum.minimumUpdaterVersion = '1.02.10'
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $nonCanonicalDeltaMinimum -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Non-canonical v2 minimumUpdaterVersion was accepted for staged resume.'
 $futureDeltaMinimum = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
-$futureDeltaMinimum.minimumUpdaterVersion = '1.2.11'
+$futureDeltaMinimum.minimumUpdaterVersion = '1.2.12'
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $futureDeltaMinimum -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'V2 requiring a newer-than-pinned updater was accepted for staged resume.'
 
 $seed = New-Record 'config/ReactiveMusic.json5' 42 '9'
@@ -163,6 +163,8 @@ Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'mods/required-mod.jar' } 'A n
 Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'servers.dat' } 'servers.dat was accepted as a create-only default.'
 Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'config/MCBrowser/tabs.json' } 'Browser state was accepted as a create-only default.'
 Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'config/dreamdisplays/config.toml' } 'Credential-bearing DreamDisplays config was accepted as a create-only default.'
+Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'config/cobbreeding/encryption' } 'Generated Cobbreeding AES key was accepted as a create-only default.'
+Assert-Throws { Assert-CobbleSeedPathPolicy -Path 'config/jade/usernamecache.json' } 'Jade username cache was accepted as a create-only default.'
 $deltaBaseInV1 = $baselineManifest.PSObject.Copy()
 $deltaBaseInV1 | Add-Member -NotePropertyName base -NotePropertyValue ([pscustomobject]@{ version = '1.0.3'; manifestSha256 = (New-Hash 'a') })
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $deltaBaseInV1 } 'V1 staged resume accepted a delta-only base.'
@@ -299,12 +301,44 @@ Assert-Throws { Assert-CobbleDeltaManifest -Manifest $oldUpdaterTextRepair -Base
 $undeclaredTextRepair = ($textRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 $undeclaredTextRepair.seedTextReplacements[0].path = 'config/not-a-seed.json'
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $undeclaredTextRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Seed text replacement accepted an undeclared seed path.'
-$optionsTextRepair = ($textRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$optionsTextRepair = ($repairManifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$optionsTextRepair.minimumUpdaterVersion = '1.2.11'
 $optionsSeed = New-Record 'options.txt' 44 '4'
-$optionsTextRepair.seedFiles += $optionsSeed
-$optionsTextRepair.reofferSeedPaths += $optionsSeed.path
-$optionsTextRepair.seedTextReplacements[0].path = $optionsSeed.path
-Assert-Throws { Assert-CobbleDeltaManifest -Manifest $optionsTextRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Seed text replacement was allowed to rewrite player keybind/video/sound settings.'
+$optionsTextRepair.seedFiles = @($repairSeed, $optionsSeed)
+$optionsTextRepair.reofferSeedPaths = @($repairSeed.path)
+$optionsTextRepair | Add-Member -NotePropertyName seedTextReplacements -NotePropertyValue @(
+    [pscustomobject]@{
+        path = $optionsSeed.path
+        oldText = 'key_iris.keybind.toggleShaders:key.keyboard.k'
+        newText = 'key_iris.keybind.toggleShaders:key.keyboard.unknown'
+        migrationId = 'options-contest-tracker-k-collision-v1'
+        requiredLines = @('key_key.companion_bonds.open_contest_tracker:key.keyboard.k')
+    },
+    [pscustomobject]@{
+        path = $optionsSeed.path
+        oldText = 'key_key.fancytoasts.config_menu:key.keyboard.k'
+        newText = 'key_key.fancytoasts.config_menu:key.keyboard.unknown'
+        migrationId = 'options-contest-tracker-k-collision-v1'
+        requiredLines = @('key_key.companion_bonds.open_contest_tracker:key.keyboard.k')
+    }
+)
+Assert-True (Assert-CobbleDeltaManifest -Manifest $optionsTextRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash) 'Reviewed conditional K-collision repair was rejected.'
+$oldUpdaterOptionsRepair = ($optionsTextRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$oldUpdaterOptionsRepair.minimumUpdaterVersion = '1.2.10'
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $oldUpdaterOptionsRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'K-collision repair accepted updater older than 1.2.11.'
+$unconditionalOptionsRepair = ($optionsTextRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$unconditionalOptionsRepair.seedTextReplacements[0].requiredLines = @()
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $unconditionalOptionsRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Unconditional options.txt migration was accepted.'
+$partialOptionsRepair = ($optionsTextRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$partialOptionsRepair.seedTextReplacements = @($partialOptionsRepair.seedTextReplacements[0])
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $partialOptionsRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Partial options.txt migration pair was accepted.'
+$reofferedOptionsRepair = ($optionsTextRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$reofferedOptionsRepair.reofferSeedPaths += $optionsSeed.path
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $reofferedOptionsRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Player-owned options.txt was accepted as both a one-time migration and a re-offered seed.'
+$arbitraryOptionsRepair = ($optionsTextRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$arbitraryOptionsRepair.seedTextReplacements[0].oldText = 'renderDistance:8'
+$arbitraryOptionsRepair.seedTextReplacements[0].newText = 'renderDistance:4'
+Assert-Throws { Assert-CobbleDeltaManifest -Manifest $arbitraryOptionsRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Arbitrary video-setting migration was accepted.'
 
 $tamperedPayload = $manifest.PSObject.Copy()
 $tamperedPayload.payloadFiles = @($plan.PayloadFiles | Where-Object path -ne 'config/changed.json')

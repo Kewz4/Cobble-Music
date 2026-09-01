@@ -422,22 +422,55 @@ function Read-SeedTextReplacementManifest([string]$Path) {
     $entries = @(Read-JsonFile -Path $Path -Description 'Seed text replacement manifest')
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $result = [Collections.Generic.List[object]]::new()
+    $optionsReplacementCount = 0
+    $hasIrisToggleReplacement = $false
+    $hasFancyToastsReplacement = $false
     foreach ($entry in $entries) {
         $pathValue = [string]$entry.path
         Assert-CobbleSeedTextReplacementPathPolicy -Path $pathValue -Context 'seed text replacement' | Out-Null
         $key = Get-CobblePathKey $pathValue
         $oldText = [string]$entry.oldText
         $newText = [string]$entry.newText
-        if (-not $seen.Add($key) -or [string]::IsNullOrEmpty($oldText) -or [string]::IsNullOrEmpty($newText) -or
-            $oldText -ceq $newText -or $oldText.Length -gt 4096 -or $newText.Length -gt 4096 -or
-            $oldText.Contains([char]0) -or $newText.Contains([char]0) -or
-            $oldText.Contains("`n") -or $oldText.Contains("`r") -or
-            $newText.Contains("`n") -or $newText.Contains("`r") -or
-            -not $oldText.StartsWith('shaderPack=', [StringComparison]::Ordinal) -or
-            -not $newText.StartsWith('shaderPack=', [StringComparison]::Ordinal)) {
+        $requiredLines = @(if ($entry.PSObject.Properties.Name -contains 'requiredLines' -and $null -ne $entry.requiredLines) {
+            @($entry.requiredLines | ForEach-Object { [string]$_ })
+        } else { @() })
+        $migrationId = if ($entry.PSObject.Properties.Name -contains 'migrationId') { [string]$entry.migrationId } else { '' }
+        $identity = $key + [char]0 + $oldText
+        $safeText = -not [string]::IsNullOrEmpty($oldText) -and -not [string]::IsNullOrEmpty($newText) -and
+            $oldText -cne $newText -and $oldText.Length -le 4096 -and $newText.Length -le 4096 -and
+            -not $oldText.Contains([char]0) -and -not $newText.Contains([char]0) -and
+            -not $oldText.Contains("`n") -and -not $oldText.Contains("`r") -and
+            -not $newText.Contains("`n") -and -not $newText.Contains("`r")
+        $validIris = $pathValue -ieq 'config/iris.properties' -and $requiredLines.Count -eq 0 -and
+            [string]::IsNullOrEmpty($migrationId) -and
+            $oldText.StartsWith('shaderPack=', [StringComparison]::Ordinal) -and
+            $newText.StartsWith('shaderPack=', [StringComparison]::Ordinal)
+        $validOptions = $pathValue -ieq 'options.txt' -and $requiredLines.Count -eq 1 -and
+            $migrationId -ceq 'options-contest-tracker-k-collision-v1' -and
+            $requiredLines[0] -ceq 'key_key.companion_bonds.open_contest_tracker:key.keyboard.k' -and
+            (($oldText -ceq 'key_iris.keybind.toggleShaders:key.keyboard.k' -and
+                $newText -ceq 'key_iris.keybind.toggleShaders:key.keyboard.unknown') -or
+             ($oldText -ceq 'key_key.fancytoasts.config_menu:key.keyboard.k' -and
+                $newText -ceq 'key_key.fancytoasts.config_menu:key.keyboard.unknown'))
+        if (-not $seen.Add($identity) -or -not $safeText -or -not ($validIris -or $validOptions)) {
             throw "Seed text replacement is unsafe or duplicated: $pathValue"
         }
-        $result.Add([ordered]@{ path = $pathValue; oldText = $oldText; newText = $newText })
+        if ($validOptions) {
+            $optionsReplacementCount++
+            if ($oldText -ceq 'key_iris.keybind.toggleShaders:key.keyboard.k') { $hasIrisToggleReplacement = $true }
+            if ($oldText -ceq 'key_key.fancytoasts.config_menu:key.keyboard.k') { $hasFancyToastsReplacement = $true }
+        }
+        $result.Add([ordered]@{
+            path = $pathValue
+            oldText = $oldText
+            newText = $newText
+            migrationId = $migrationId
+            requiredLines = @($requiredLines)
+        })
+    }
+    if ($optionsReplacementCount -ne 0 -and
+        ($optionsReplacementCount -ne 2 -or -not $hasIrisToggleReplacement -or -not $hasFancyToastsReplacement)) {
+        throw 'The options migration must contain the complete reviewed Iris and Fancy Toasts repair pair.'
     }
     return @($result)
 }
@@ -951,6 +984,17 @@ foreach ($rootName in $IncludeRoots | Sort-Object -Unique) {
 Assert-CobblePrivateKeyIsolation -PrivateKeyPath $PrivateKeyPath -SourceMinecraftDir $SourceMinecraftDir `
     -ReleaseOutputRoot $ReleaseOutputRoot -ManagedRoots @($managedRootPaths) | Out-Null
 
+$packVersionPath = Join-Path $SourceMinecraftDir 'config\cobble-music-pack-version.json'
+if (-not (Test-Path -LiteralPath $packVersionPath -PathType Leaf)) {
+    throw "Canonical DEV pack-version marker is missing: $packVersionPath"
+}
+$packVersionMarker = Read-JsonFile -Path $packVersionPath -Description 'Canonical DEV pack-version marker'
+if ([string]$packVersionMarker.pack -cne "Kewz's Cobblemon" -or
+    [string]$packVersionMarker.channel -cne 'stable' -or
+    [string]$packVersionMarker.version -cne $Version) {
+    throw "Canonical DEV pack-version marker does not match requested release $Version."
+}
+
 Get-PinnedUpdaterIdentity | Out-Null
 
 $baseArtifacts = $null
@@ -1036,8 +1080,11 @@ try {
     $seedTextReplacements = @(Read-SeedTextReplacementManifest $SeedTextReplacementManifest)
     foreach ($replacement in $seedTextReplacements) {
         $key = Get-CobblePathKey ([string]$replacement.path)
-        if (-not $seedSet.ByKey.ContainsKey($key) -or -not $reofferSeedKeys.Contains($key)) {
-            throw "Seed text replacement must reference a re-offered signed seed: $($replacement.path)"
+        $isOptionsMigration = [string]$replacement.path -ieq 'options.txt'
+        if (-not $seedSet.ByKey.ContainsKey($key) -or
+            ($isOptionsMigration -and $reofferSeedKeys.Contains($key)) -or
+            (-not $isOptionsMigration -and -not $reofferSeedKeys.Contains($key))) {
+            throw "Seed text replacement has an invalid seed/re-offer relationship: $($replacement.path)"
         }
     }
     if ($FullBaseline -and $seedTextReplacements.Count -ne 0) {
@@ -1134,7 +1181,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.10'
+            minimumUpdaterVersion = '1.2.11'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             payload = $payloadResult.Payload
             files = @($authoritativeFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
@@ -1150,7 +1197,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = '1.2.10'
+            minimumUpdaterVersion = '1.2.11'
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             base = [ordered]@{ version = $BaseVersion; manifestSha256 = $baseHash }
             payload = $payloadResult.Payload

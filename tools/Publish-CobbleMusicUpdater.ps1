@@ -459,7 +459,9 @@ function Assert-CleanReleaseInputs {
         'updater/CobbleMusicUpdater.Tests',
         'updater/channel',
         'tools/Build-CobbleMusicUpdater.ps1',
+        'tools/CobbleMusicRelease.Core.psm1',
         'tools/New-CobbleMusicPrismBootstrapCommand.ps1',
+        'tools/Publish-CobbleMusicRelease.ps1',
         'tools/Publish-CobbleMusicUpdater.ps1',
         'bootstrap/Bootstrap-CobbleMusicUpdater.ps1',
         'tests',
@@ -706,7 +708,7 @@ if ($VerifySourceBinding -and ($DryRun -or $GitHubMutation -or $ConfirmPublish -
     throw '-VerifySourceBinding is a standalone read-only diagnostic.'
 }
 $resolvedPrivateKeyPath = $null
-if (-not $DryRun -and -not $GitHubMutation -and -not $VerifySourceBinding) {
+if (-not $GitHubMutation -and -not $VerifySourceBinding) {
     $resolvedPrivateKeyPath = Assert-PrivateKeyIsolation $PrivateKeyPath
 }
 
@@ -786,7 +788,7 @@ try {
         }
         [IO.File]::Copy($sourceChannelSignaturePath, $stagedChannelSignature, $true)
     }
-    elseif (-not $DryRun) {
+    else {
         Invoke-UpdaterTool $stagedExe @(
             '--sign-manifest', $stagedChannel,
             '--private-key-file', $resolvedPrivateKeyPath,
@@ -799,16 +801,14 @@ try {
     Write-Host "Bootstrap: size=$((Get-Item -LiteralPath $stagedBootstrap).Length) sha256=$bootstrapSha256"
     Write-Host "Stable updater channel: version=$version executableSize=$((Get-Item -LiteralPath $stagedExe).Length)"
 
-    if (-not $DryRun) {
-        $verifiedChannel = Join-Path $TemporaryRoot 'verified-stable.json'
-        Invoke-UpdaterTool $stagedExe @(
-            '--verify-updater-channel', $stagedChannel,
-            '--signature-file', $stagedChannelSignature,
-            '--verified-output', $verifiedChannel
-        ) 'Verifying the signed stable updater channel'
-        if ([IO.File]::ReadAllText($verifiedChannel) -cne $channelText.TrimEnd("`r", "`n")) {
-            throw 'Updater channel verifier did not reproduce the exact canonical channel document.'
-        }
+    $verifiedChannel = Join-Path $TemporaryRoot 'verified-stable.json'
+    Invoke-UpdaterTool $stagedExe @(
+        '--verify-updater-channel', $stagedChannel,
+        '--signature-file', $stagedChannelSignature,
+        '--verified-output', $verifiedChannel
+    ) 'Verifying the signed stable updater channel'
+    if ([IO.File]::ReadAllText($verifiedChannel) -cne $channelText.TrimEnd("`r", "`n")) {
+        throw 'Updater channel verifier did not reproduce the exact canonical channel document.'
     }
 
     if ($GitHubMutation) {

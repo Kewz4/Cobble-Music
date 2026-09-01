@@ -43,9 +43,21 @@ try {
     Write-DummyFile (Join-Path $testRoot 'config\fancymenu\layouts\main.txt')
     Write-DummyFile (Join-Path $testRoot 'config\inventory-particles\cache\generated.bin')
     Write-DummyFile (Join-Path $testRoot 'config\example.json.bak')
+    Write-DummyFile (Join-Path $testRoot 'config\example.toml.bak1')
+    Write-DummyFile (Join-Path $testRoot 'config\example.toml.bak2')
+    Write-DummyFile (Join-Path $testRoot 'config\example.toml.old1')
+    Write-DummyFile (Join-Path $testRoot 'config\cobbreeding\encryption')
+    Write-DummyFile (Join-Path $testRoot 'config\jade\usernamecache.json')
+    Write-DummyFile (Join-Path $testRoot 'config\zoomify.json')
     Write-DummyFile (Join-Path $testRoot 'config\dreamdisplays\config.toml')
+    Write-DummyFile (Join-Path $testRoot 'config\dreamdisplays\config.yml')
     Write-DummyFile (Join-Path $testRoot 'config\MCBrowser\tabs.json')
     Write-DummyFile (Join-Path $testRoot 'config\packed_packs\__version.json')
+    Write-DummyFile (Join-Path $testRoot 'config\etf_warnings.json')
+    Write-DummyFile (Join-Path $testRoot 'config\sodium-fingerprint.json')
+    Write-DummyFile (Join-Path $testRoot 'config\spark\activity.json')
+    Write-DummyFile (Join-Path $testRoot 'config\spark\tmp\about.txt')
+    Write-DummyFile (Join-Path $testRoot 'config\spark\tmp-client\about.txt')
     Write-DummyFile (Join-Path $testRoot 'options.txt')
     Write-DummyFile (Join-Path $testRoot 'mods\Axiom-5.4.2-for-MC1.21.1.jar')
     $templateRoot = Join-Path $testRoot 'reviewed-templates'
@@ -79,6 +91,8 @@ try {
         'resourcepacks/unreviewed.zip.rpo',
         'config/MCBrowser/tabs.json',
         'config/dreamdisplays/config.toml',
+        'config/cobbreeding/encryption',
+        'config/jade/usernamecache.json',
         'resourcepacks/pack/.git/config'
     )) {
         Assert-Rejected { Assert-CobbleSourcePathPolicy -Path $unsafe | Out-Null } $unsafe
@@ -99,6 +113,31 @@ try {
     Assert-Rejected { Assert-CobbleSeedPathPolicy -Path 'mods/required.jar' | Out-Null } 'a non-Axiom optional mod'
     Assert-Rejected { Assert-CobbleSeedPathPolicy -Path 'servers.dat' | Out-Null } 'private server state as a default'
     Assert-Rejected { Assert-CobbleSeedPathPolicy -Path 'config/dreamdisplays/config.toml' | Out-Null } 'credential-bearing DreamDisplays config'
+    Assert-Rejected { Assert-CobbleSeedPathPolicy -Path 'config/cobbreeding/encryption' | Out-Null } 'generated Cobbreeding AES key'
+    Assert-Rejected { Assert-CobbleSeedPathPolicy -Path 'config/jade/usernamecache.json' | Out-Null } 'Jade username cache'
+
+    foreach ($generatedPath in @(
+        'config/example.json.bak',
+        'config/example.toml.bak1',
+        'config/example.toml.bak2',
+        'config/example.toml.old1',
+        'config/inventory-particles/cache/generated.bin',
+        'config/zoomify.json',
+        'config/dreamdisplays/config.yml',
+        'config/packed_packs/__version.json',
+        'config/etf_warnings.json',
+        'config/sodium-fingerprint.json',
+        'config/spark/activity.json',
+        'config/spark/tmp/about.txt',
+        'config/spark/tmp-client/about.txt'
+    )) {
+        Assert-Rejected { Assert-CobbleSeedPathPolicy -Path $generatedPath | Out-Null } "generated seed $generatedPath"
+        Assert-Rejected {
+            Get-CobbleManagedSourceFiles -SourceMinecraftDir $testRoot `
+                -IncludeRoots @('mods') -IncludeFiles @($generatedPath) `
+                -AllowedRoots @('mods', 'resourcepacks', 'config', 'defaultconfigs', 'kubejs', 'scripts') | Out-Null
+        } "explicit generated source $generatedPath"
+    }
 
     Assert-Rejected {
         Get-CobbleManagedSourceFiles -SourceMinecraftDir $testRoot `

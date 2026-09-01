@@ -34,6 +34,10 @@ internal sealed class InstalledState
     // Records which create-only defaults have already been offered. The files
     // themselves remain player-owned and are never integrity checked.
     public List<string> OfferedSeedPaths { get; set; } = [];
+    // Records narrowly scoped, signed migrations of player-owned settings.
+    // Once recorded, that migration is never evaluated again, so a player's
+    // later keybind/video/sound choices remain fully player-owned.
+    public List<string> AppliedPlayerSettingMigrationIds { get; set; } = [];
 }
 
 internal sealed class ManagedFileState
@@ -147,6 +151,14 @@ internal sealed class SeedTextReplacement
     public string Path { get; set; } = "";
     public string OldText { get; set; } = "";
     public string NewText { get; set; } = "";
+    // Empty only for the pre-1.2.11 Iris selector migration. New migrations
+    // of player-owned settings must carry a stable ID that is committed to the
+    // local one-time migration ledger with the surrounding transaction.
+    public string MigrationId { get; set; } = "";
+    // Every required line must occur exactly once before this replacement is
+    // eligible. This keeps corrective migrations conditional on the precise
+    // legacy state they were designed to repair.
+    public List<string> RequiredLines { get; set; } = [];
 }
 
 // Used only for a reviewed, one-time migration from a known older pack. The

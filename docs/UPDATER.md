@@ -88,6 +88,17 @@ sound, Sodium, Voxy, or arbitrary mod settings. Corrective reconciliation runs
 even when local state already names the target release, and committed seed
 refreshes remain recoverable across an interrupted launch.
 
+Updater 1.2.11 adds one deliberately narrow, ledgered exception for the legacy
+Contest Tracker `K` collision. A signed manifest may contain only the complete
+reviewed pair that unbinds Iris shader toggle and Fancy Toasts while Contest
+Tracker is still exactly bound to `K`. The updater inspects that migration once
+and commits its stable ID with the surrounding file transaction even when the
+player's layout is already custom, missing, duplicated, or otherwise ineligible.
+Afterward, `options.txt` is never reconsidered: later keybinds, video, sound,
+Sodium, and Voxy choices cannot trigger a repair or be undone. `options.txt`
+may not be re-offered in the same release, so an existing player-owned absence
+also remains respected.
+
 Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
 An **unrecoverable local transaction** is the sole fail-closed case: Prism is
@@ -542,10 +553,14 @@ without becoming integrity-enforced afterward. Reviewed files under
 Music home coordinates and comments/timestamps from the initial Iris choice.
 PackedPacks configuration and the `Default`/`Realistic` profiles also come from
 reviewed templates; its generated `config/packed_packs/__version.json` is never
-seeded into a release.
-Generated caches, backups, MCBrowser tab state, and the credential-bearing
-DreamDisplays service config are excluded. Only the music bridge, pack-version
-marker, Log Begone policy, and resource-pack policy remain managed configs.
+seeded into a release. Generated caches, numbered backups, ETF warning state,
+Sodium's machine fingerprint, Spark runtime files, Jade's username cache,
+Cobbreeding's generated encryption key, Zoomify residue, MCBrowser tab state,
+and both known DreamDisplays service-config names are excluded from automatic
+and explicit source collection. Only the music bridge, pack-version marker,
+Log Begone policy, and resource-pack policy remain managed configs. Staging
+also requires that the canonical DEV pack-version marker exactly match the
+requested target version.
 Shaderpack ZIPs and folders are managed pack content and therefore receive
 normal signed updates and repairs. Top-level Iris `.txt` option sidecars are
 create-only player settings, so later shader-option edits do not trigger a
@@ -554,7 +569,8 @@ from the immutable inventory and added to the create-only inventory. Historical
 seed releases require updater 1.2.6 or newer; releases using the one-time
 migration ledger require updater 1.2.8, corrective re-offers require updater
 1.2.9, and exact seed refreshes, managed-to-seed transitions, or Iris selector
-migrations require updater 1.2.10. The payload ZIP is checked against the
+migrations require updater 1.2.10. The one-time conditional `options.txt`
+migration requires updater 1.2.11. The payload ZIP is checked against the
 exact union of its managed payload files and seed files before signing.
 
 Review `release-output\1.0.5\cobble-music-update.json`, its signature, and all

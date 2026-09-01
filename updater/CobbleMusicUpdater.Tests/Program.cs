@@ -39,6 +39,7 @@ internal static class Program
             await TestSchemaOneSanitizedRecoveryAsync(Path.Combine(tempRoot, "sanitized-baseline"));
             await TestCreateOnlyDefaultsAsync(Path.Combine(tempRoot, "create-only-defaults"));
             await TestCorrectiveSeedRefreshAndAdoptionAsync(Path.Combine(tempRoot, "corrective-seed-refresh"));
+            await TestConditionalKeyCollisionMigrationAsync(Path.Combine(tempRoot, "key-collision-migration"));
             await TestJournalCommitBoundaryAsync(Path.Combine(tempRoot, "journal"));
             await TestCrossVolumeTransactionRecoveryAsync(Path.Combine(tempRoot, "cross-volume"));
             Console.WriteLine("Schema-v2 delta, release-chain, exact-baseline adoption, base-integrity, and journal commit-boundary checks passed.");
@@ -422,11 +423,56 @@ internal static class Program
         undeclaredTextMigration.SeedTextReplacements[0].Path = "config/not-a-seed.properties";
         Throws<InvalidDataException>(() => ManifestParser.Validate(undeclaredTextMigration, correctiveConfiguration, AssetUrls()));
 
-        UpdateManifest optionsTextMigration = CloneManifest(corrective);
-        optionsTextMigration.SeedFiles.Add(FileEntry("options.txt", "player-options"));
-        optionsTextMigration.ReofferSeedPaths.Add("options.txt");
-        optionsTextMigration.SeedTextReplacements[0].Path = "options.txt";
-        Throws<InvalidDataException>(() => ManifestParser.Validate(optionsTextMigration, correctiveConfiguration, AssetUrls()));
+        const string contestTrackerK = "key_key.companion_bonds.open_contest_tracker:key.keyboard.k";
+        const string optionsMigrationId = "options-contest-tracker-k-collision-v1";
+        UpdateManifest optionsTextMigration = DeltaManifest();
+        optionsTextMigration.MinimumUpdaterVersion = BuildInfo.Version;
+        optionsTextMigration.SeedFiles = [FileEntry("options.txt", "player-options")];
+        optionsTextMigration.SeedTextReplacements =
+        [
+            new SeedTextReplacement
+            {
+                Path = "options.txt",
+                OldText = "key_iris.keybind.toggleShaders:key.keyboard.k",
+                NewText = "key_iris.keybind.toggleShaders:key.keyboard.unknown",
+                MigrationId = optionsMigrationId,
+                RequiredLines = [contestTrackerK]
+            },
+            new SeedTextReplacement
+            {
+                Path = "options.txt",
+                OldText = "key_key.fancytoasts.config_menu:key.keyboard.k",
+                NewText = "key_key.fancytoasts.config_menu:key.keyboard.unknown",
+                MigrationId = optionsMigrationId,
+                RequiredLines = [contestTrackerK]
+            }
+        ];
+        ManifestParser.Validate(optionsTextMigration, correctiveConfiguration, AssetUrls());
+
+        UpdateManifest oldUpdaterOptionsMigration = CloneManifest(optionsTextMigration);
+        oldUpdaterOptionsMigration.MinimumUpdaterVersion = "1.2.10";
+        Throws<InvalidDataException>(() => ManifestParser.Validate(oldUpdaterOptionsMigration, correctiveConfiguration, AssetUrls()));
+
+        UpdateManifest unconditionalOptionsMigration = CloneManifest(optionsTextMigration);
+        unconditionalOptionsMigration.SeedTextReplacements[0].RequiredLines = [];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(unconditionalOptionsMigration, correctiveConfiguration, AssetUrls()));
+
+        UpdateManifest partialOptionsMigration = CloneManifest(optionsTextMigration);
+        partialOptionsMigration.SeedTextReplacements.RemoveAt(1);
+        Throws<InvalidDataException>(() => ManifestParser.Validate(partialOptionsMigration, correctiveConfiguration, AssetUrls()));
+
+        UpdateManifest replayableOptionsMigration = CloneManifest(optionsTextMigration);
+        replayableOptionsMigration.SeedTextReplacements[0].MigrationId = "";
+        Throws<InvalidDataException>(() => ManifestParser.Validate(replayableOptionsMigration, correctiveConfiguration, AssetUrls()));
+
+        UpdateManifest reofferedOptionsMigration = CloneManifest(optionsTextMigration);
+        reofferedOptionsMigration.ReofferSeedPaths = ["options.txt"];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(reofferedOptionsMigration, correctiveConfiguration, AssetUrls()));
+
+        UpdateManifest arbitraryOptionsMigration = CloneManifest(optionsTextMigration);
+        arbitraryOptionsMigration.SeedTextReplacements[0].OldText = "renderDistance:8";
+        arbitraryOptionsMigration.SeedTextReplacements[0].NewText = "renderDistance:4";
+        Throws<InvalidDataException>(() => ManifestParser.Validate(arbitraryOptionsMigration, correctiveConfiguration, AssetUrls()));
 
         UpdateManifest nonOptionalMod = DeltaManifest();
         nonOptionalMod.SeedFiles = [FileEntry("mods/required-mod.jar", "not-optional")];
@@ -443,6 +489,34 @@ internal static class Program
         UpdateManifest credentialState = DeltaManifest();
         credentialState.SeedFiles = [FileEntry("config/dreamdisplays/config.toml", "private-service-credential")];
         Throws<InvalidDataException>(() => ManifestParser.Validate(credentialState, configuration, AssetUrls()));
+
+        UpdateManifest encryptionState = DeltaManifest();
+        encryptionState.SeedFiles = [FileEntry("config/cobbreeding/encryption", "generated-aes-key")];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(encryptionState, configuration, AssetUrls()));
+
+        UpdateManifest usernameCacheState = DeltaManifest();
+        usernameCacheState.SeedFiles = [FileEntry("config/jade/usernamecache.json", "cached-usernames")];
+        Throws<InvalidDataException>(() => ManifestParser.Validate(usernameCacheState, configuration, AssetUrls()));
+
+        foreach (string generatedPath in new[]
+        {
+            "config/example.toml.bak1",
+            "config/example.toml.old1",
+            "config/inventory-particles/cache/generated.bin",
+            "config/zoomify.json",
+            "config/dreamdisplays/config.yml",
+            "config/packed_packs/__version.json",
+            "config/etf_warnings.json",
+            "config/sodium-fingerprint.json",
+            "config/spark/activity.json",
+            "config/spark/tmp/about.txt",
+            "config/spark/tmp-client/about.txt"
+        })
+        {
+            UpdateManifest generatedState = DeltaManifest();
+            generatedState.SeedFiles = [FileEntry(generatedPath, "generated-runtime-state")];
+            Throws<InvalidDataException>(() => ManifestParser.Validate(generatedState, configuration, AssetUrls()));
+        }
 
         UpdateManifest overlap = DeltaManifest();
         overlap.SeedFiles = [Copy(overlap.Files[0])];
@@ -626,6 +700,7 @@ internal static class Program
         InstalledState migratedState = LocalStateStore.LoadState(paths);
         Equal("1.0.6", migratedState.Version, "pre-ledger installed state remains valid");
         Equal(0, migratedState.OfferedSeedPaths.Count, "missing old ledger deserializes as empty");
+        Equal(0, migratedState.AppliedPlayerSettingMigrationIds.Count, "missing old migration ledger deserializes as empty");
 
         string nullLedgerState = JsonSerializer.Serialize(new
         {
@@ -637,6 +712,18 @@ internal static class Program
         });
         File.WriteAllText(paths.StatePath, nullLedgerState);
         Equal("", LocalStateStore.LoadState(paths).Version, "explicit-null seed ledger is rejected safely");
+
+        string nullMigrationLedgerState = JsonSerializer.Serialize(new
+        {
+            schemaVersion = 1,
+            version = "1.0.6",
+            manifestSha256 = HashText("legacy-state"),
+            managedFiles = Array.Empty<object>(),
+            offeredSeedPaths = Array.Empty<string>(),
+            appliedPlayerSettingMigrationIds = (string[]?)null
+        });
+        File.WriteAllText(paths.StatePath, nullMigrationLedgerState);
+        Equal("", LocalStateStore.LoadState(paths).Version, "explicit-null player-setting migration ledger is rejected safely");
     }
 
     private static void TestOfflineLaunchPolicy()
@@ -1746,6 +1833,136 @@ internal static class Program
 
     private static Task<string> ReadRelativeTextAsync(string root, string relativePath) =>
         File.ReadAllTextAsync(PathSafety.CombineUnder(root, relativePath));
+
+    private static async Task TestConditionalKeyCollisionMigrationAsync(string root)
+    {
+        const string managedPath = "mods/current.jar";
+        const string optionsPath = "options.txt";
+        const string contestTrackerK = "key_key.companion_bonds.open_contest_tracker:key.keyboard.k";
+        const string irisK = "key_iris.keybind.toggleShaders:key.keyboard.k";
+        const string irisUnbound = "key_iris.keybind.toggleShaders:key.keyboard.unknown";
+        const string fancyK = "key_key.fancytoasts.config_menu:key.keyboard.k";
+        const string fancyUnbound = "key_key.fancytoasts.config_menu:key.keyboard.unknown";
+        const string migrationId = "options-contest-tracker-k-collision-v1";
+        const string officialOldOptions = "renderDistance:8\n" + contestTrackerK + "\n" + irisK + "\n" + fancyK + "\n";
+        const string officialNewOptions = "renderDistance:8\n" + contestTrackerK + "\n" + irisUnbound + "\n" + fancyUnbound + "\n";
+
+        ManifestFile managed = FileEntry(managedPath, "managed");
+        ManifestFile oldOptions = FileEntry(optionsPath, officialOldOptions);
+        ManifestFile newOptions = FileEntry(optionsPath, officialNewOptions);
+        var signedBase = new UpdateManifest
+        {
+            SchemaVersion = 2,
+            Version = "1.0.13",
+            Files = [managed],
+            SeedFiles = [oldOptions]
+        };
+        string baseHash = HashText("key-collision-base");
+        var delta = new UpdateManifest
+        {
+            SchemaVersion = 2,
+            Version = "1.0.14",
+            Files = [managed],
+            SeedFiles = [newOptions],
+            SeedTextReplacements =
+            [
+                new SeedTextReplacement
+                {
+                    Path = optionsPath,
+                    OldText = irisK,
+                    NewText = irisUnbound,
+                    MigrationId = migrationId,
+                    RequiredLines = [contestTrackerK]
+                },
+                new SeedTextReplacement
+                {
+                    Path = optionsPath,
+                    OldText = fancyK,
+                    NewText = fancyUnbound,
+                    MigrationId = migrationId,
+                    RequiredLines = [contestTrackerK]
+                }
+            ]
+        };
+        string extract = Path.Combine(root, "extract");
+        await WriteRelativeTextAsync(extract, optionsPath, officialNewOptions);
+
+        UpdaterPaths affectedPaths = Paths(Path.Combine(root, "affected"));
+        await WriteRelativeTextAsync(affectedPaths.MinecraftDirectory, managedPath, "managed");
+        string customAffected = "renderDistance:23\r\nsoundCategory_music:0.42\r\n"
+            + contestTrackerK + "\r\n" + irisK + "\r\n" + fancyK
+            + "\r\nkey_key.jump:key.keyboard.space\r\n";
+        await WriteRelativeTextAsync(affectedPaths.MinecraftDirectory, optionsPath, customAffected);
+        InstalledState affectedState = StateFrom(signedBase, baseHash);
+        affectedState.OfferedSeedPaths = [optionsPath];
+        var affectedEngine = new UpdateEngine(affectedPaths, new UpdaterConfiguration { AllowedRoots = ["mods"] }, _ => { });
+        Equal(true, await affectedEngine.HasPendingCorrectiveWorkAsync(
+            delta, affectedState, NoCancellation), "exact K collision is pending corrective work");
+        await affectedEngine.ApplyTransactionAsync(
+            delta,
+            HashText("key-collision-delta"),
+            extract,
+            affectedState,
+            signedBase,
+            NoCancellation);
+        string migrated = await ReadRelativeTextAsync(affectedPaths.MinecraftDirectory, optionsPath);
+        string expected = customAffected.Replace(irisK, irisUnbound, StringComparison.Ordinal)
+            .Replace(fancyK, fancyUnbound, StringComparison.Ordinal);
+        Equal(expected, migrated, "only colliding K bindings changed while CRLF and unrelated settings stayed byte-stable");
+        Equal(true, migrated.Contains("renderDistance:23\r\n", StringComparison.Ordinal), "custom video setting preserved");
+        Equal(true, migrated.Contains("soundCategory_music:0.42\r\n", StringComparison.Ordinal), "custom sound setting preserved");
+        Equal(true, migrated.Contains(contestTrackerK, StringComparison.Ordinal), "contest tracker remains bound to K");
+        InstalledState migratedState = LocalStateStore.LoadState(affectedPaths);
+        Equal(migrationId, migratedState.AppliedPlayerSettingMigrationIds.Single(), "one-time options migration is committed to local state");
+
+        string laterPlayerChoice = migrated.Replace(irisUnbound, irisK, StringComparison.Ordinal);
+        await WriteRelativeTextAsync(affectedPaths.MinecraftDirectory, optionsPath, laterPlayerChoice);
+        Equal(false, await affectedEngine.HasPendingCorrectiveWorkAsync(
+            delta, migratedState, NoCancellation), "later intentional Iris K binding is never undone by the completed migration");
+
+        UpdaterPaths customPaths = Paths(Path.Combine(root, "custom-no-contest"));
+        await WriteRelativeTextAsync(customPaths.MinecraftDirectory, managedPath, "managed");
+        string contestElsewhere = "renderDistance:31\nkey_key.companion_bonds.open_contest_tracker:key.keyboard.o\n"
+            + irisK + "\n" + fancyK + "\n";
+        await WriteRelativeTextAsync(customPaths.MinecraftDirectory, optionsPath, contestElsewhere);
+        InstalledState customState = StateFrom(signedBase, baseHash);
+        customState.OfferedSeedPaths = [optionsPath];
+        var customEngine = new UpdateEngine(customPaths, new UpdaterConfiguration { AllowedRoots = ["mods"] }, _ => { });
+        Equal(true, await customEngine.HasPendingCorrectiveWorkAsync(
+            delta, customState, NoCancellation), "unprocessed migration is inspected once even for a custom non-colliding layout");
+        await customEngine.ApplyTransactionAsync(
+            delta,
+            HashText("key-collision-custom-delta"),
+            extract,
+            customState,
+            signedBase,
+            NoCancellation);
+        Equal(contestElsewhere, await ReadRelativeTextAsync(customPaths.MinecraftDirectory, optionsPath),
+            "player key choices survive when Contest Tracker is not on K");
+        InstalledState customInstalledState = LocalStateStore.LoadState(customPaths);
+        Equal(migrationId, customInstalledState.AppliedPlayerSettingMigrationIds.Single(), "custom layout records migration inspection once");
+        Equal(false, await customEngine.HasPendingCorrectiveWorkAsync(
+            delta, customInstalledState, NoCancellation), "custom layout is not reinspected after its ledger commit");
+
+        UpdaterPaths duplicatePaths = Paths(Path.Combine(root, "duplicate-key"));
+        await WriteRelativeTextAsync(duplicatePaths.MinecraftDirectory, managedPath, "managed");
+        string duplicateKey = contestTrackerK + "\n" + irisK + "\n" + irisK + "\n" + fancyK + "\n";
+        await WriteRelativeTextAsync(duplicatePaths.MinecraftDirectory, optionsPath, duplicateKey);
+        InstalledState duplicateState = StateFrom(signedBase, baseHash);
+        duplicateState.OfferedSeedPaths = [optionsPath];
+        var duplicateEngine = new UpdateEngine(duplicatePaths, new UpdaterConfiguration { AllowedRoots = ["mods"] }, _ => { });
+        await duplicateEngine.ApplyTransactionAsync(
+            delta,
+            HashText("key-collision-duplicate-delta"),
+            extract,
+            duplicateState,
+            signedBase,
+            NoCancellation);
+        Equal(duplicateKey, await ReadRelativeTextAsync(duplicatePaths.MinecraftDirectory, optionsPath),
+            "ambiguous duplicate bindings make the whole migration preserve the file");
+        Equal(migrationId, LocalStateStore.LoadState(duplicatePaths).AppliedPlayerSettingMigrationIds.Single(),
+            "ambiguous file is still marked inspected so it cannot loop");
+    }
 
     private static async Task TestJournalCommitBoundaryAsync(string root)
     {

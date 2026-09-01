@@ -180,7 +180,8 @@ internal static class LocalStateStore
         if (state is null
             || state.SchemaVersion != 1
             || state.ManagedFiles is null
-            || state.OfferedSeedPaths is null)
+            || state.OfferedSeedPaths is null
+            || state.AppliedPlayerSettingMigrationIds is null)
         {
             return new InstalledState();
         }
@@ -192,7 +193,9 @@ internal static class LocalStateStore
         {
             return new InstalledState();
         }
-        if (!hasIdentity && (state.ManagedFiles.Count != 0 || state.OfferedSeedPaths.Count != 0))
+        if (!hasIdentity && (state.ManagedFiles.Count != 0
+            || state.OfferedSeedPaths.Count != 0
+            || state.AppliedPlayerSettingMigrationIds.Count != 0))
         {
             return new InstalledState();
         }
@@ -241,6 +244,16 @@ internal static class LocalStateStore
                 return new InstalledState();
             }
             state.OfferedSeedPaths[index] = seedPath;
+        }
+
+        var seenMigrationIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string migrationId in state.AppliedPlayerSettingMigrationIds)
+        {
+            if (!PathSafety.IsPlayerSettingMigrationIdAllowed(migrationId)
+                || !seenMigrationIds.Add(migrationId))
+            {
+                return new InstalledState();
+            }
         }
         return state;
     }

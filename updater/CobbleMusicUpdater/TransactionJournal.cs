@@ -377,7 +377,8 @@ internal static class TransactionStore
     {
         if (state.SchemaVersion != 1
             || state.ManagedFiles is null
-            || state.OfferedSeedPaths is null)
+            || state.OfferedSeedPaths is null
+            || state.AppliedPlayerSettingMigrationIds is null)
         {
             throw new TransactionRecoveryException("The updater transaction journal contains an invalid state snapshot.");
         }
@@ -412,6 +413,15 @@ internal static class TransactionStore
             }
             state.OfferedSeedPaths[index] = path;
         }
+        var migrationIds = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string migrationId in state.AppliedPlayerSettingMigrationIds)
+        {
+            if (!PathSafety.IsPlayerSettingMigrationIdAllowed(migrationId)
+                || !migrationIds.Add(migrationId))
+            {
+                throw new TransactionRecoveryException("The updater transaction journal contains an unsafe player-setting migration ledger.");
+            }
+        }
     }
 
     private static bool StateEquivalent(InstalledState left, InstalledState right)
@@ -419,7 +429,8 @@ internal static class TransactionStore
         if (!string.Equals(left.Version, right.Version, StringComparison.Ordinal)
             || !string.Equals(left.ManifestSha256, right.ManifestSha256, StringComparison.OrdinalIgnoreCase)
             || left.ManagedFiles.Count != right.ManagedFiles.Count
-            || left.OfferedSeedPaths.Count != right.OfferedSeedPaths.Count)
+            || left.OfferedSeedPaths.Count != right.OfferedSeedPaths.Count
+            || left.AppliedPlayerSettingMigrationIds.Count != right.AppliedPlayerSettingMigrationIds.Count)
         {
             return false;
         }
@@ -431,7 +442,12 @@ internal static class TransactionStore
             return false;
         }
         var rightSeeds = right.OfferedSeedPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        return left.OfferedSeedPaths.All(rightSeeds.Contains);
+        if (!left.OfferedSeedPaths.All(rightSeeds.Contains))
+        {
+            return false;
+        }
+        var rightMigrationIds = right.AppliedPlayerSettingMigrationIds.ToHashSet(StringComparer.Ordinal);
+        return left.AppliedPlayerSettingMigrationIds.All(rightMigrationIds.Contains);
     }
 
     private static async Task RestoreAsync(

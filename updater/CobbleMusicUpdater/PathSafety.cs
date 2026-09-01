@@ -56,20 +56,76 @@ internal static class PathSafety
             return false;
         }
 
-        // Browser state and credential-bearing service configuration must
-        // never be copied into another player's instance, even create-only.
-        return !string.Equals(
-                normalizedRelativePath,
-                "config/MCBrowser/tabs.json",
-                StringComparison.OrdinalIgnoreCase)
-            && !string.Equals(
-                normalizedRelativePath,
-                "config/dreamdisplays/config.toml",
-                StringComparison.OrdinalIgnoreCase);
+        // Browser/account state, generated caches/fingerprints, private keys,
+        // and editor backups must never be copied into another player's
+        // instance, even as create-only defaults.
+        return !IsNeverDistributableSeed(normalizedRelativePath);
     }
 
     public static bool IsSeedTextReplacementAllowed(string normalizedRelativePath) =>
-        string.Equals(normalizedRelativePath, "config/iris.properties", StringComparison.OrdinalIgnoreCase);
+        string.Equals(normalizedRelativePath, "config/iris.properties", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(normalizedRelativePath, "options.txt", StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsPlayerSettingMigrationIdAllowed(string value)
+    {
+        if (string.IsNullOrEmpty(value)
+            || value.Length > 128
+            || !IsLowerAlphaNumeric(value[0]))
+        {
+            return false;
+        }
+        return value.All(character =>
+            IsLowerAlphaNumeric(character) || character is '.' or '_' or '-');
+    }
+
+    private static bool IsLowerAlphaNumeric(char character) =>
+        character is >= 'a' and <= 'z' or >= '0' and <= '9';
+
+    private static bool IsNeverDistributableSeed(string path)
+    {
+        string[] segments = path.Split('/');
+        string name = segments[^1];
+        return path.Equals("config/MCBrowser/tabs.json", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("config/packed_packs/__version.json", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("config/dreamdisplays/config.toml", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("config/dreamdisplays/config.yml", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("config/cobbreeding/encryption", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("config/jade/usernamecache.json", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("config/zoomify.json", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("config/etf_warnings.json", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("config/sodium-fingerprint.json", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("config/spark/activity.json", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("config/spark/tmp/about.txt", StringComparison.OrdinalIgnoreCase)
+            || path.Equals("config/spark/tmp-client/about.txt", StringComparison.OrdinalIgnoreCase)
+            || segments.Any(segment => segment.Equals("cache", StringComparison.OrdinalIgnoreCase))
+            || IsBackupName(name)
+            || name.Equals("thumbs.db", StringComparison.OrdinalIgnoreCase)
+            || name.Equals(".ds_store", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsBackupName(string name)
+    {
+        if (name.EndsWith('~'))
+        {
+            return true;
+        }
+        foreach (string marker in new[] { ".bak", ".old" })
+        {
+            int markerIndex = name.LastIndexOf(marker, StringComparison.OrdinalIgnoreCase);
+            if (markerIndex < 0)
+            {
+                continue;
+            }
+            string suffix = name[(markerIndex + marker.Length)..];
+            if (suffix.Length == 0
+                || suffix.All(char.IsDigit)
+                || suffix[0] is '-' or '.' or '_')
+            {
+                return true;
+            }
+        }
+        return false;
+    }
 
     public static bool IsOptionalPlayerMod(string normalizedRelativePath)
     {
