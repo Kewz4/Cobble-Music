@@ -190,6 +190,11 @@
     "sha256": "4b7a2d9129fba06a691d1633c60f848f3ac41d7ab5433916b12b5ee99f1bcfaf"
   },
   {
+    "path": "shaderpacks/Balanced - Good Graphics + 60 FPS.zip",
+    "size": 47120098,
+    "sha256": "2eae422e91fd2626370ec572e05f5f75c0a774e549c14e2ecdb946c61db91e40"
+  },
+  {
     "path": "shaderpacks/Balanced - Good Graphics + 60 FPS.zip.txt",
     "size": 242,
     "sha256": "ccab6fb4582ce35e1fd9c3618a366ed6d90534fccb6d1e3c5c1083fd7d776ccf"
@@ -238,6 +243,26 @@
     "path": "shaderpacks/Max Quality (Complementary Ultra).txt",
     "size": 794,
     "sha256": "ed438fe93924ab98bb9eff5d1c38c4b66fe4ebb77bad2769ae2584ce81e8e752"
+  },
+  {
+    "path": "shaderpacks/Max Quality (Iteration RP - Path Traced).zip",
+    "size": 22036235,
+    "sha256": "2a8ec52351afa6884cb27c05e99333e3dc848026f3d782c17038c2fee5e8f428"
+  },
+  {
+    "path": "shaderpacks/Max Quality (Iteration RP - Path Traced).zip",
+    "size": 47101326,
+    "sha256": "aa6ad8b83d3c435f03efbdd9f297611be27c5f9df4d6926684ed105f641c2748"
+  },
+  {
+    "path": "shaderpacks/Max Quality (Iteration RP - Path Traced).zip",
+    "size": 47120098,
+    "sha256": "2eae422e91fd2626370ec572e05f5f75c0a774e549c14e2ecdb946c61db91e40"
+  },
+  {
+    "path": "shaderpacks/Max Quality (Iteration RP - Path Traced).zip",
+    "size": 64396093,
+    "sha256": "7ea97a69a88d64d5eda01003f09531264c3a6aa0224cb4ced961ff94018281c5"
   },
   {
     "path": "shaderpacks/Max Quality (Iteration RP - Path Traced).txt",
