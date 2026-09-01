@@ -355,6 +355,20 @@ $optionsTextRepair | Add-Member -NotePropertyName seedTextReplacements -NoteProp
     }
 )
 Assert-True (Assert-CobbleDeltaManifest -Manifest $optionsTextRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash) 'Reviewed conditional K-collision repair was rejected.'
+$orderedPublisherOptionsRepair = ($optionsTextRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
+$orderedPublisherOptionsRepair.seedTextReplacements = @(
+    foreach ($replacement in @($orderedPublisherOptionsRepair.seedTextReplacements)) {
+        [ordered]@{
+            path = [string]$replacement.path
+            oldText = [string]$replacement.oldText
+            newText = [string]$replacement.newText
+            migrationId = [string]$replacement.migrationId
+            requiredLines = @($replacement.requiredLines)
+        }
+    }
+)
+Assert-True (Assert-CobbleDeltaManifest -Manifest $orderedPublisherOptionsRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash) `
+    'Publisher-shaped ordered migration records lost requiredLines or migrationId during validation.'
 $oldUpdaterOptionsRepair = ($optionsTextRepair | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 $oldUpdaterOptionsRepair.minimumUpdaterVersion = '1.2.10'
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $oldUpdaterOptionsRepair -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'K-collision repair accepted updater older than 1.2.11.'

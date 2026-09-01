@@ -28,6 +28,10 @@ function Get-CobbleOptionalPropertyValue {
         [Parameter(Mandatory)][string]$Name
     )
 
+    if ($Object -is [Collections.IDictionary]) {
+        if (-not $Object.Contains($Name)) { return $null }
+        return $Object[$Name]
+    }
     $property = $Object.PSObject.Properties[$Name]
     if ($null -eq $property) { return $null }
     return $property.Value
@@ -988,10 +992,12 @@ function Assert-CobbleDeltaManifest {
         $key = Get-CobblePathKey $path
         $oldText = [string]$replacement.oldText
         $newText = [string]$replacement.newText
-        $requiredLines = @(if ($replacement.PSObject.Properties.Name -contains 'requiredLines' -and $null -ne $replacement.requiredLines) {
-            @($replacement.requiredLines | ForEach-Object { [string]$_ })
+        $requiredLinesValue = Get-CobbleOptionalPropertyValue $replacement 'requiredLines'
+        $requiredLines = @(if ($null -ne $requiredLinesValue) {
+            @($requiredLinesValue | ForEach-Object { [string]$_ })
         } else { @() })
-        $migrationId = if ($replacement.PSObject.Properties.Name -contains 'migrationId') { [string]$replacement.migrationId } else { '' }
+        $migrationIdValue = Get-CobbleOptionalPropertyValue $replacement 'migrationId'
+        $migrationId = if ($null -eq $migrationIdValue) { '' } else { [string]$migrationIdValue }
         $identity = $key + [char]0 + $oldText
         $safeText = -not [string]::IsNullOrEmpty($oldText) -and -not [string]::IsNullOrEmpty($newText) -and
             $oldText -cne $newText -and $oldText.Length -le 4096 -and $newText.Length -le 4096 -and
