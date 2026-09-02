@@ -105,7 +105,7 @@ internal static class DeltaValidator
                 && legacyCleanup[path].Any(transitionIdentity =>
                     transitionIdentity.Size == baseFile.Size
                     && string.Equals(transitionIdentity.Sha256, baseFile.Sha256, StringComparison.OrdinalIgnoreCase));
-            if (becomesPlayerOwned)
+            if (becomesPlayerOwned || HistoricalManifestPolicy.IsPlayerOwned(signedBase, baseFile))
             {
                 continue;
             }

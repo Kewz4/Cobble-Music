@@ -202,6 +202,7 @@ internal sealed class UpdateEngine
         // cleanup whose omission would leave the instance non-canonical.
         foreach (ManifestFile file in manifest.Files)
         {
+            if (HistoricalManifestPolicy.IsPlayerOwned(manifest, file)) continue;
             cancellationToken.ThrowIfCancellationRequested();
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
@@ -275,6 +276,7 @@ internal sealed class UpdateEngine
     {
         foreach (ManifestFile file in manifest.Files)
         {
+            if (HistoricalManifestPolicy.IsPlayerOwned(manifest, file)) continue;
             cancellationToken.ThrowIfCancellationRequested();
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
@@ -412,7 +414,8 @@ internal sealed class UpdateEngine
                 return false;
             }
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, manifestFile.Path);
-            if (!PathSafety.IsOptionalPlayerMod(manifestFile.Path)
+            if (!HistoricalManifestPolicy.IsPlayerOwned(manifest, manifestFile)
+                && !PathSafety.IsOptionalPlayerMod(manifestFile.Path)
                 && (!File.Exists(target) || new FileInfo(target).Length != manifestFile.Size))
             {
                 return false;
@@ -738,6 +741,12 @@ internal sealed class UpdateEngine
             int totalFiles = payloadFiles.Count + manifest.SeedFiles.Count + manifest.DeletedFiles.Count;
             foreach (ManifestFile file in payloadFiles)
             {
+                if (HistoricalManifestPolicy.IsPlayerOwned(manifest, file))
+                {
+                    _log($"Preserving player-owned shader settings through historical update: {file.Path}");
+                    appliedFiles++;
+                    continue;
+                }
                 Report(UpdatePhase.Applying, "Installing verified files", 0, 0, appliedFiles, totalFiles);
                 string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
                 string source = PathSafety.CombineUnder(extractDirectory, file.Path);
@@ -873,6 +882,11 @@ internal sealed class UpdateEngine
             {
                 foreach (ManifestFile deletedFile in manifest.DeletedFiles)
                 {
+                    if (signedBase is not null && HistoricalManifestPolicy.IsPlayerOwned(signedBase, deletedFile))
+                    {
+                        appliedFiles++;
+                        continue;
+                    }
                     string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, deletedFile.Path);
                     if (signedBase is null)
                     {
@@ -1027,6 +1041,7 @@ internal sealed class UpdateEngine
         {
             if (!postFiles.TryGetValue(baseFile.Path, out ManifestFile? postFile))
             {
+                if (HistoricalManifestPolicy.IsPlayerOwned(signedBase, baseFile)) continue;
                 bool becamePlayerOwned = seedFiles.ContainsKey(baseFile.Path)
                     && reofferSeedPaths.Contains(baseFile.Path)
                     && legacyCleanup[baseFile.Path].Any(transitionIdentity =>
@@ -1045,6 +1060,7 @@ internal sealed class UpdateEngine
                 continue;
             }
 
+            if (HistoricalManifestPolicy.IsPlayerOwned(delta, postFile)) continue;
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, postFile.Path);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
             await ValidateExactTargetAsync(
@@ -1060,6 +1076,7 @@ internal sealed class UpdateEngine
         var basePaths = signedBase.Files.Select(file => file.Path).ToHashSet(StringComparer.OrdinalIgnoreCase);
         foreach (ManifestFile newFile in delta.Files.Where(file => !basePaths.Contains(file.Path)))
         {
+            if (HistoricalManifestPolicy.IsPlayerOwned(delta, newFile)) continue;
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, newFile.Path);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
             await ValidateExactTargetAsync(target, newFile, "Installed delta file changed before commit", cancellationToken);
@@ -1072,6 +1089,7 @@ internal sealed class UpdateEngine
     {
         foreach (ManifestFile file in manifest.Files)
         {
+            if (HistoricalManifestPolicy.IsPlayerOwned(manifest, file)) continue;
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
             await ValidateExactTargetAsync(target, file, "Adopted managed file changed before commit", cancellationToken);

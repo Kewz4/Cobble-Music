@@ -88,6 +88,7 @@ internal sealed class DetachedSignature
 internal sealed class UpdateManifest
 {
     internal HashSet<string> VerifiedRetiredSeedIdentities { get; } = new(StringComparer.Ordinal);
+    internal HashSet<string> VerifiedPlayerOwnedIdentities { get; } = new(StringComparer.Ordinal);
     public int SchemaVersion { get; set; }
     public string ModpackId { get; set; } = "";
     public string Channel { get; set; } = "";

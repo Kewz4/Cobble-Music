@@ -22,6 +22,7 @@ internal static class Program
             {
                 TestPublishedHistoricalManifests(args[1]);
                 await TestPreexistingDeltaPayloadAsync(Path.Combine(tempRoot, "existing-payload"));
+                await TestHistoricalShaderSettingsChainAsync(Path.Combine(tempRoot, "shader-chain"), args[1]);
                 Console.WriteLine("Log regressions passed: real signed historical manifests, exact pre-existing payload adoption, unknown-copy rejection, retired-default skipping, and old-state preservation.");
                 return 0;
             }
@@ -71,6 +72,19 @@ internal static class Program
             var urls = (manifest.Payload?.Parts ?? []).ToDictionary(part => part.Name,
                 part => new Uri("https://example.invalid/" + part.Name), StringComparer.OrdinalIgnoreCase);
             ManifestParser.Validate(manifest, new UpdaterConfiguration(), urls);
+            if (Version.Parse(manifest.Version) >= new Version(1, 0, 7)
+                && Version.Parse(manifest.Version) <= new Version(1, 0, 12))
+            {
+                Equal(18, manifest.VerifiedPlayerOwnedIdentities.Count, "all historical mutable shader sidecars recognized");
+                ManifestFile setting = manifest.Files.First(file => HistoricalManifestPolicy.IsPlayerOwned(manifest, file));
+                ManifestFile changed = Copy(setting);
+                changed.Size++;
+                Equal(false, HistoricalManifestPolicy.IsPlayerOwned(manifest, changed), "exception bound to exact signed identity");
+                var unsigned = JsonSerializer.Deserialize<UpdateManifest>(JsonSerializer.Serialize(manifest))!;
+                Equal(0, unsigned.VerifiedPlayerOwnedIdentities.Count, "unsigned JSON cannot grant ownership exceptions");
+                Equal(false, manifest.Files.Any(file => file.Path.EndsWith(".zip")
+                    && HistoricalManifestPolicy.IsPlayerOwned(manifest, file)), "shader archives remain integrity checked");
+            }
             if (manifest.VerifiedRetiredSeedIdentities.Count > 0)
             {
                 ManifestFile retired = manifest.SeedFiles.First(file => !PathSafety.IsSeedAllowed(file.Path));
@@ -108,6 +122,76 @@ internal static class Program
             HashText("delta-manifest"), other.Extract, other.State, other.SignedBase, NoCancellation));
         Equal("own-file", await File.ReadAllTextAsync(unknown), "different same-size local copy preserved");
         Equal(other.State.Version, LocalStateStore.LoadState(other.Paths).Version, "collision rollback retains state");
+    }
+
+    private static async Task TestHistoricalShaderSettingsChainAsync(string root, string publishedDirectory)
+    {
+        string publishedPath = Path.Combine(publishedDirectory, "1.0.7", "cobble-music-update.json");
+        UpdateManifest published = ManifestParser.VerifyAndParse(File.ReadAllBytes(publishedPath),
+            File.ReadAllBytes(Path.ChangeExtension(publishedPath, ".sig")));
+        string[] settings = published.Files.Where(file => HistoricalManifestPolicy.IsPlayerOwned(published, file))
+            .Select(file => file.Path).ToArray();
+        UpdaterPaths paths = Paths(root);
+        var configuration = new UpdaterConfiguration();
+        var engine = new UpdateEngine(paths, configuration, _ => { });
+        var previous = new UpdateManifest { SchemaVersion = 1, Version = "1.0.6", Files = [FileEntry("mods/required.jar", "required")] };
+        string previousHash = HashText("base");
+        var state = StateFrom(previous, previousHash);
+        Directory.CreateDirectory(Path.Combine(paths.MinecraftDirectory, "mods"));
+        Directory.CreateDirectory(Path.Combine(paths.MinecraftDirectory, "shaderpacks"));
+        await File.WriteAllTextAsync(Path.Combine(paths.MinecraftDirectory, "mods/required.jar"), "required");
+        for (int i = 0; i < settings.Length - 1; i++)
+            await File.WriteAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, settings[i]), "custom-player-setting-" + i);
+        await LocalStateStore.SaveStateAsync(paths, state, NoCancellation);
+
+        for (int version = 7; version <= 13; version++)
+        {
+            string extract = Path.Combine(root, "extract-" + version);
+            Directory.CreateDirectory(Path.Combine(extract, "shaderpacks"));
+            var next = new UpdateManifest
+            {
+                SchemaVersion = 2, Version = "1.0." + version,
+                Base = new ManifestBase { Version = previous.Version, ManifestSha256 = previousHash },
+                Files = [Copy(previous.Files[0])]
+            };
+            // Change settings in .7/.8, then carry them unchanged until ownership
+            // is officially corrected. One sidecar is deliberately absent.
+            foreach (string path in settings)
+            {
+                ManifestFile file = FileEntry(path, "stock-" + Math.Min(version, 8));
+                if (version < 13)
+                {
+                    next.Files.Add(file);
+                    next.VerifiedPlayerOwnedIdentities.Add(HistoricalManifestPolicy.Identity(file));
+                    if (version <= 8)
+                    {
+                        next.PayloadFiles.Add(Copy(file));
+                        await File.WriteAllTextAsync(PathSafety.CombineUnder(extract, path), "stock-" + version);
+                    }
+                }
+                else
+                {
+                    next.SeedFiles.Add(file);
+                    next.ReofferSeedPaths.Add(path);
+                    ManifestFile old = previous.Files.Single(entry => entry.Path == path);
+                    next.LegacyCleanup.Add(new LegacyCleanupFile { Path = path, Size = old.Size, Sha256 = old.Sha256 });
+                    await File.WriteAllTextAsync(PathSafety.CombineUnder(extract, path), "stock-8");
+                }
+            }
+            await DeltaValidator.ValidateBaseAsync(next, previous, previousHash, state, paths, configuration, NoCancellation);
+            string nextHash = HashText("manifest-" + version);
+            await engine.ApplyTransactionAsync(next, nextHash, extract, state, previous, NoCancellation);
+            state = LocalStateStore.LoadState(paths);
+            Equal(next.Version, state.Version, "historical settings transaction commits " + version);
+            Equal(true, engine.StateMatchesManifestAndSizes(state, next), "historical settings do not trigger repair " + version);
+            for (int i = 0; i < settings.Length - 1; i++)
+                Equal("custom-player-setting-" + i, await File.ReadAllTextAsync(PathSafety.CombineUnder(paths.MinecraftDirectory, settings[i])), "custom settings preserved " + version);
+            Equal(version == 13, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, settings[^1])), "missing sidecar offered only at ownership transition");
+            previous = next;
+            previousHash = nextHash;
+        }
+        Equal(1, state.ManagedFiles.Count, "final state manages only required mod");
+        Console.WriteLine("Shader settings regression passed: all 18 real sidecar paths, changed/unchanged historical deltas, missing setting, ownership transition, and restart integrity.");
     }
 
     private static void TestCalculatedUpdaterWindowLayoutAt120Dpi()

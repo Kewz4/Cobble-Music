@@ -42,12 +42,28 @@ internal static class HistoricalManifestPolicy
     internal static void RegisterVerifiedManifest(UpdateManifest manifest, byte[] bytes)
     {
         if (!ManifestHashes.Contains(Convert.ToHexString(SHA256.HashData(bytes)))) return;
+        // Releases 1.0.7-1.0.12 accidentally managed Iris's mutable sidecars.
+        // Honor the ownership correction while crossing those immutable releases,
+        // not only after reaching 1.0.13. Missing defaults are offered by 1.0.13.
+        // Registration is bound to exact signed manifest bytes AND file identity;
+        // it cannot exempt arbitrary files in a newly published manifest.
+        foreach (ManifestFile file in manifest.Files)
+        {
+            if (file.Path.StartsWith("shaderpacks/", StringComparison.Ordinal)
+                && file.Path.EndsWith(".txt", StringComparison.Ordinal)
+                && file.Path.Count(character => character == '/') == 1
+                && PathSafety.IsSeedAllowed(file.Path))
+                manifest.VerifiedPlayerOwnedIdentities.Add(Identity(file));
+        }
         foreach (ManifestFile file in manifest.SeedFiles)
         {
             if (RetiredPaths.Contains(file.Path))
                 manifest.VerifiedRetiredSeedIdentities.Add(Identity(file));
         }
     }
+
+    internal static bool IsPlayerOwned(UpdateManifest manifest, ManifestFile file) =>
+        manifest.VerifiedPlayerOwnedIdentities.Contains(Identity(file));
 
     // A ledger is metadata, not authority to read, copy, or delete a file.
     internal static bool IsLedgerPathAllowed(string path) =>
