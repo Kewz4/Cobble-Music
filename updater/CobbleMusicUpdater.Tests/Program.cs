@@ -12,12 +12,19 @@ internal static class Program
 {
     private static readonly CancellationToken NoCancellation = CancellationToken.None;
 
-    public static async Task<int> Main()
+    public static async Task<int> Main(string[] args)
     {
         string tempRoot = Path.Combine(Path.GetTempPath(), "cobble-updater-delta-tests-" + Guid.NewGuid().ToString("N"));
         try
         {
             Directory.CreateDirectory(tempRoot);
+            if (args.Length == 2 && args[0] == "--log-regressions")
+            {
+                TestPublishedHistoricalManifests(args[1]);
+                await TestPreexistingDeltaPayloadAsync(Path.Combine(tempRoot, "existing-payload"));
+                Console.WriteLine("Log regressions passed: real signed historical manifests, exact pre-existing payload adoption, unknown-copy rejection, retired-default skipping, and old-state preservation.");
+                return 0;
+            }
             TestCalculatedUpdaterWindowLayoutAt120Dpi();
             TestUpdaterWindowLayout();
             TestAggregateDownloadProgressAndTransferMetrics();
@@ -52,6 +59,55 @@ internal static class Program
                 Directory.Delete(tempRoot, recursive: true);
             }
         }
+    }
+
+    private static void TestPublishedHistoricalManifests(string directory)
+    {
+        int count = 0;
+        foreach (string path in Directory.EnumerateFiles(directory, "cobble-music-update.json", SearchOption.AllDirectories))
+        {
+            UpdateManifest manifest = ManifestParser.VerifyAndParse(File.ReadAllBytes(path),
+                File.ReadAllBytes(Path.ChangeExtension(path, ".sig")));
+            var urls = (manifest.Payload?.Parts ?? []).ToDictionary(part => part.Name,
+                part => new Uri("https://example.invalid/" + part.Name), StringComparer.OrdinalIgnoreCase);
+            ManifestParser.Validate(manifest, new UpdaterConfiguration(), urls);
+            if (manifest.VerifiedRetiredSeedIdentities.Count > 0)
+            {
+                ManifestFile retired = manifest.SeedFiles.First(file => !PathSafety.IsSeedAllowed(file.Path));
+                retired.Size++;
+                Throws<InvalidDataException>(() => ManifestParser.Validate(manifest, new UpdaterConfiguration(), urls));
+            }
+            count++;
+        }
+        Equal(true, count >= 10, "all published historical manifests exercised");
+    }
+
+    private static async Task TestPreexistingDeltaPayloadAsync(string root)
+    {
+        var (paths, signedBase, delta, state, extract) = await PrepareDeltaApplyFixtureAsync(root);
+        string added = PathSafety.CombineUnder(paths.MinecraftDirectory, "mods/added.jar");
+        await File.WriteAllTextAsync(added, "new-file");
+        state.OfferedSeedPaths.Add("config/cobbreeding/encryption");
+        await LocalStateStore.SaveStateAsync(paths, state, NoCancellation);
+        Equal(state.Version, LocalStateStore.LoadState(paths).Version, "old retired ledger keeps installed version");
+        delta.SeedFiles.Add(FileEntry("config/cobbreeding/encryption", "never-install"));
+        var engine = new UpdateEngine(paths, Configuration(), _ => { });
+        await DeltaValidator.ValidateBaseAsync(delta, signedBase, delta.Base!.ManifestSha256,
+            state, paths, Configuration(), NoCancellation);
+        await engine.ApplyTransactionAsync(delta, HashText("delta-manifest"), extract, state, signedBase, NoCancellation);
+        Equal(delta.Version, LocalStateStore.LoadState(paths).Version, "matching pre-existing new file commits");
+        Equal("new-file", await File.ReadAllTextAsync(added), "matching pre-existing file retained");
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, "config/cobbreeding/encryption")), "retired secret never installed");
+        Equal(false, File.Exists(TransactionStore.JournalPath(paths)), "successful migration clears journal");
+
+        var other = await PrepareDeltaApplyFixtureAsync(root + "-unknown");
+        string unknown = PathSafety.CombineUnder(other.Paths.MinecraftDirectory, "mods/added.jar");
+        await File.WriteAllTextAsync(unknown, "own-file");
+        var otherEngine = new UpdateEngine(other.Paths, Configuration(), _ => { });
+        await ThrowsAsync<InvalidDataException>(() => otherEngine.ApplyTransactionAsync(other.Delta,
+            HashText("delta-manifest"), other.Extract, other.State, other.SignedBase, NoCancellation));
+        Equal("own-file", await File.ReadAllTextAsync(unknown), "different same-size local copy preserved");
+        Equal(other.State.Version, LocalStateStore.LoadState(other.Paths).Version, "collision rollback retains state");
     }
 
     private static void TestCalculatedUpdaterWindowLayoutAt120Dpi()

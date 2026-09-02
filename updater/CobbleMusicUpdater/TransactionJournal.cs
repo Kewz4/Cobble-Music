@@ -405,7 +405,7 @@ internal static class TransactionStore
         for (int index = 0; index < state.OfferedSeedPaths.Count; index++)
         {
             string path = PathSafety.NormalizeRelativePath(state.OfferedSeedPaths[index]);
-            if (!PathSafety.IsSeedAllowed(path)
+            if (!HistoricalManifestPolicy.IsLedgerPathAllowed(path)
                 || !offeredSeeds.Add(path)
                 || paths.Contains(path))
             {

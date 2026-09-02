@@ -237,7 +237,7 @@ internal static class LocalStateStore
             {
                 return new InstalledState();
             }
-            if (!PathSafety.IsSeedAllowed(seedPath)
+            if (!HistoricalManifestPolicy.IsLedgerPathAllowed(seedPath)
                 || !seenSeeds.Add(seedPath)
                 || seenPaths.Contains(seedPath))
             {

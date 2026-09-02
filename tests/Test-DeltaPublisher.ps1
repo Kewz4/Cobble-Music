@@ -134,13 +134,13 @@ $badMinimumBaseline = $baselineManifest.PSObject.Copy()
 $badMinimumBaseline.minimumUpdaterVersion = '1.02.0'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $badMinimumBaseline } 'Non-canonical v1 minimumUpdaterVersion was accepted for staged resume.'
 $futureMinimumBaseline = $baselineManifest.PSObject.Copy()
-$futureMinimumBaseline.minimumUpdaterVersion = '1.2.14'
+$futureMinimumBaseline.minimumUpdaterVersion = '1.2.15'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $futureMinimumBaseline } 'V1 requiring a newer-than-pinned updater was accepted for staged resume.'
 $nonCanonicalDeltaMinimum = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 $nonCanonicalDeltaMinimum.minimumUpdaterVersion = '1.02.10'
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $nonCanonicalDeltaMinimum -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Non-canonical v2 minimumUpdaterVersion was accepted for staged resume.'
 $futureDeltaMinimum = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
-$futureDeltaMinimum.minimumUpdaterVersion = '1.2.14'
+$futureDeltaMinimum.minimumUpdaterVersion = '1.2.15'
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $futureDeltaMinimum -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'V2 requiring a newer-than-pinned updater was accepted for staged resume.'
 
 $seed = New-Record 'config/ReactiveMusic.json5' 42 '9'

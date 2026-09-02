@@ -22,6 +22,7 @@ internal static class ManifestParser
         {
             throw new InvalidDataException("Signed release manifest is empty.");
         }
+        HistoricalManifestPolicy.RegisterVerifiedManifest(manifest, rawManifest);
         return manifest;
     }
 
@@ -63,7 +64,7 @@ internal static class ManifestParser
         }
 
         Dictionary<string, ManifestFile> files = ValidateFileSet(manifest.Files, configuration, "managed file");
-        Dictionary<string, ManifestFile> seedFiles = ValidateSeedFileSet(manifest.SeedFiles);
+        Dictionary<string, ManifestFile> seedFiles = ValidateSeedFileSet(manifest.SeedFiles, manifest.VerifiedRetiredSeedIdentities);
         HashSet<string> reofferSeedPaths = ValidateReofferSeedPaths(manifest.ReofferSeedPaths, seedFiles);
         ValidateSeedTextReplacements(manifest.SeedTextReplacements, seedFiles, reofferSeedPaths);
         if (seedFiles.Keys.Any(files.ContainsKey))
@@ -179,7 +180,7 @@ internal static class ManifestParser
     }
 
     private static Dictionary<string, ManifestFile> ValidateSeedFileSet(
-        IEnumerable<ManifestFile> entries)
+        IEnumerable<ManifestFile> entries, IReadOnlySet<string> verifiedRetiredIdentities)
     {
         var files = new Dictionary<string, ManifestFile>(StringComparer.OrdinalIgnoreCase);
         foreach (ManifestFile file in entries)
@@ -189,7 +190,8 @@ internal static class ManifestParser
                 throw new InvalidDataException("Release manifest contains an empty create-only default entry.");
             }
             file.Path = PathSafety.NormalizeRelativePath(file.Path);
-            if (!PathSafety.IsSeedAllowed(file.Path)
+            if ((!PathSafety.IsSeedAllowed(file.Path)
+                    && !verifiedRetiredIdentities.Contains(HistoricalManifestPolicy.Identity(file)))
                 || file.Size < 0
                 || !files.TryAdd(file.Path, file))
             {

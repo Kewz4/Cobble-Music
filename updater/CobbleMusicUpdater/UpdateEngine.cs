@@ -696,10 +696,10 @@ internal sealed class UpdateEngine
             // State written by 1.2.6/1.2.7 has no seed ledger. A signed delta
             // base proves those defaults were already offered under the old
             // create-only policy, so deleted optional/default files stay gone.
-            previouslyOfferedSeeds.UnionWith(signedBase.SeedFiles.Select(file => file.Path));
+            previouslyOfferedSeeds.UnionWith(signedBase.SeedFiles.Select(file => file.Path).Where(PathSafety.IsSeedAllowed));
         }
         var nextOfferedSeeds = previouslyOfferedSeeds.ToHashSet(StringComparer.OrdinalIgnoreCase);
-        nextOfferedSeeds.UnionWith(manifest.SeedFiles.Select(file => file.Path));
+        nextOfferedSeeds.UnionWith(manifest.SeedFiles.Select(file => file.Path).Where(PathSafety.IsSeedAllowed));
         var nextAppliedMigrationIds = previouslyAppliedMigrationIds.ToHashSet(StringComparer.Ordinal);
         nextAppliedMigrationIds.UnionWith(manifest.SeedTextReplacements
             .Select(replacement => replacement.MigrationId)
@@ -752,7 +752,8 @@ internal sealed class UpdateEngine
                         signedBase,
                         manifest.LegacyCleanup,
                         allowExactLegacyRepair: true,
-                        cancellationToken);
+                        cancellationToken,
+                        incomingFile: file);
 
                 TransactionOperation operation;
                 if (File.Exists(target))
@@ -800,6 +801,12 @@ internal sealed class UpdateEngine
 
             foreach (ManifestFile seedFile in manifest.SeedFiles)
             {
+                if (!PathSafety.IsSeedAllowed(seedFile.Path))
+                {
+                    _log($"Skipping retired historical default: {seedFile.Path}");
+                    appliedFiles++;
+                    continue;
+                }
                 Report(UpdatePhase.Applying, "Installing first-run defaults", 0, 0, appliedFiles, totalFiles);
                 string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, seedFile.Path);
                 string source = PathSafety.CombineUnder(extractDirectory, seedFile.Path);
@@ -953,7 +960,8 @@ internal sealed class UpdateEngine
         UpdateManifest signedBase,
         IReadOnlyCollection<LegacyCleanupFile> legacyCleanup,
         bool allowExactLegacyRepair,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        ManifestFile? incomingFile = null)
     {
         string normalized = PathSafety.NormalizeRelativePath(relativePath);
         string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, normalized);
@@ -962,6 +970,15 @@ internal sealed class UpdateEngine
             file => string.Equals(file.Path, normalized, StringComparison.OrdinalIgnoreCase));
         if (expectedBase is null)
         {
+            // Older mrpacks already included some files first tracked in 1.0.7.
+            // Adopt only the exact signed incoming bytes; unknown copies remain
+            // protected. Backup/revalidation and rollback still apply normally.
+            if (incomingFile is not null && File.Exists(target))
+            {
+                await ValidateExactTargetAsync(target, incomingFile,
+                    "Pre-existing new delta target differs from signed payload", cancellationToken);
+                return incomingFile;
+            }
             if (File.Exists(target) || Directory.Exists(target))
             {
                 throw new InvalidDataException($"New delta target appeared after base validation: {normalized}");
