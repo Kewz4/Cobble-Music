@@ -5,6 +5,16 @@ namespace CobbleMusicUpdater;
 
 internal sealed partial class UpdateEngine
 {
+    // Packed Packs itself saves these files on profile changes/menu close.
+    // Deliver each signed revision once, then tolerate its runtime serialization.
+    private static bool IsOfficialPackProfile(string path) =>
+        path.Equals("config/packed_packs/profiles/resourcepacks/Default.profile.json", StringComparison.OrdinalIgnoreCase)
+        || path.Equals("config/packed_packs/profiles/resourcepacks/Realistic.profile.json", StringComparison.OrdinalIgnoreCase);
+
+    private static string ProfileRevisionId(ManifestFile file) =>
+        "packedpacks-" + (file.Path.EndsWith("/Default.profile.json", StringComparison.OrdinalIgnoreCase) ? "default-" : "realistic-")
+        + file.Sha256.ToLowerInvariant();
+
     // Reconcile only signed managed destinations. Player defaults stay create-only.
     // The transaction retains every displaced file in its recovery directory.
     internal async Task ConvergeToLatestAsync(IReadOnlyList<RemoteRelease> catalog,
@@ -19,11 +29,16 @@ internal sealed partial class UpdateEngine
         if (IsDowngradeOrMutation(state, target, latest.ManifestSha256))
             throw new InvalidDataException($"Published {target.Version} cannot validate local {state.Version}: downgrade or changed manifest identity.");
         var needed = new List<ManifestFile>();
+        var appliedRevisions = state.AppliedPlayerSettingMigrationIds.ToHashSet(StringComparer.Ordinal);
+        bool profileRevisionPending = target.Files.Where(f => IsOfficialPackProfile(f.Path))
+            .Any(f => !appliedRevisions.Contains(ProfileRevisionId(f)));
         int checkedFiles = 0;
         foreach (ManifestFile file in target.Files)
         {
             token.ThrowIfCancellationRequested();
             if (HistoricalManifestPolicy.IsPlayerOwned(target, file) || PathSafety.IsOptionalPlayerMod(file.Path)) continue;
+            if (IsOfficialPackProfile(file.Path) && appliedRevisions.Contains(ProfileRevisionId(file))
+                && File.Exists(SafeLocal(file.Path))) continue;
             if (!await MatchesLocalAsync(file, token))
             {
                 needed.Add(file);
@@ -57,9 +72,9 @@ internal sealed partial class UpdateEngine
         bool corrective = await HasPendingCorrectiveWorkAsync(target, state, token);
         var duplicates = needed.Count == 0
             ? await FindConflictingModsAsync(target, null, token) : new List<LegacyCleanupFile>();
-        if (needed.Count == 0 && seeds.Count == 0 && duplicates.Count == 0 && sameIdentity && !corrective)
+        if (needed.Count == 0 && seeds.Count == 0 && duplicates.Count == 0 && sameIdentity && !corrective && !profileRevisionPending)
         {
-            _log($"Verified all {target.Files.Count} managed files against signed release {target.Version}.");
+            _log($"Verified release {target.Version} inventory; applied Packed Packs revisions preserve their mutable runtime settings.");
             Report(UpdatePhase.Complete, $"Verified {target.Version} — starting Minecraft.");
             return;
         }

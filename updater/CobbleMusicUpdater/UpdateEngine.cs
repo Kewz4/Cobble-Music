@@ -724,10 +724,15 @@ internal sealed partial class UpdateEngine
         }
         var nextOfferedSeeds = previouslyOfferedSeeds.ToHashSet(StringComparer.OrdinalIgnoreCase);
         nextOfferedSeeds.UnionWith(manifest.SeedFiles.Select(file => file.Path).Where(PathSafety.IsSeedAllowed));
+        // A signed release can promote a formerly create-only default into
+        // release content. Do not leave it in both ownership ledgers, which
+        // would invalidate the installed-state identity on the next launch.
+        nextOfferedSeeds.ExceptWith(manifest.Files.Select(file => file.Path));
         var nextAppliedMigrationIds = previouslyAppliedMigrationIds.ToHashSet(StringComparer.Ordinal);
         nextAppliedMigrationIds.UnionWith(manifest.SeedTextReplacements
             .Select(replacement => replacement.MigrationId)
             .Where(migrationId => !string.IsNullOrEmpty(migrationId)));
+        nextAppliedMigrationIds.UnionWith(manifest.Files.Where(file => IsOfficialPackProfile(file.Path)).Select(ProfileRevisionId));
         var newState = new InstalledState
         {
             Version = manifest.Version,
@@ -1122,6 +1127,7 @@ internal sealed partial class UpdateEngine
             if (HistoricalManifestPolicy.IsPlayerOwned(manifest, file) || PathSafety.IsOptionalPlayerMod(file.Path)) continue;
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            if (IsOfficialPackProfile(file.Path) && File.Exists(target)) continue;
             await ValidateExactTargetAsync(target, file, "Adopted managed file changed before commit", cancellationToken);
         }
         foreach (string path in manifest.DeletePaths.Concat(manifest.DeletedFiles.Select(file => file.Path)))

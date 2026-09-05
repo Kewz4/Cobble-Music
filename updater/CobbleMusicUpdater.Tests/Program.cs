@@ -959,6 +959,8 @@ internal static class Program
         await TestCatalogPreviousPayloadOriginAsync(Path.Combine(root, "previous-origin"), signer);
         await TestCatalogManagedAxiomPreservedAsync(Path.Combine(root, "custom-axiom"), signer, removed: false);
         await TestCatalogManagedAxiomPreservedAsync(Path.Combine(root, "removed-axiom"), signer, removed: true);
+        await TestCatalogOfficialProfilesAsync(Path.Combine(root, "fresh-profiles"), signer, upgrade: false);
+        await TestCatalogOfficialProfilesAsync(Path.Combine(root, "upgrade-profiles"), signer, upgrade: true);
     }
 
     private static async Task TestCatalogRepairAndDuplicateQuarantineAsync(string root, ConvergenceTestSigner signer)
@@ -1074,8 +1076,167 @@ internal static class Program
         if (!removed) Equal(HashBytes(playerAxiom), await PathSafety.Sha256Async(axiomTarget, NoCancellation), "catalog never replaces player's Axiom bytes");
     }
 
+    private static async Task TestCatalogOfficialProfilesAsync(string root, ConvergenceTestSigner signer, bool upgrade)
+    {
+        UpdaterPaths paths = Paths(root);
+        var configuration = new UpdaterConfiguration { AllowedRoots = ["mods", "config"] };
+        const string defaultPath = "config/packed_packs/profiles/resourcepacks/Default.profile.json";
+        const string realisticPath = "config/packed_packs/profiles/resourcepacks/Realistic.profile.json";
+        const string managedPath = "mods/profile-regression.jar";
+        var prefixes = new Dictionary<string, string>
+        {
+            [defaultPath] = "packedpacks-default-", [realisticPath] = "packedpacks-realistic-"
+        };
+        byte[] required = ConvergenceFabricJar("profile_regression", "1.0.0");
+        var profiles = prefixes.Keys.ToDictionary(path => path, path => JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            name = Path.GetFileNameWithoutExtension(path), packIds = new[] { "vanilla", "file/MegaStorm.zip" }
+        }));
+        var playerFiles = new Dictionary<string, byte[]>
+        {
+            ["config/packed_packs/profiles/resourcepacks/My Custom.profile.json"] = System.Text.Encoding.UTF8.GetBytes("{\"name\":\"My Custom\",\"packIds\":[\"vanilla\",\"file/player.zip\"]}"),
+            ["config/packed_packs/config.json"] = System.Text.Encoding.UTF8.GetBytes("{\"resourcePacks\":{\"lastViewedProfile\":\"My Custom\"}}"),
+            ["config/iris.properties"] = System.Text.Encoding.UTF8.GetBytes("enableShaders=true\nshaderPack=Player Shader.zip\n"),
+            ["options.txt"] = System.Text.Encoding.UTF8.GetBytes("key_key.attack:key.mouse.right\nmusic:0.37\nresourcePacks:[\"vanilla\",\"file/player.zip\"]\n")
+        };
+        var stockSeeds = playerFiles.Keys.ToDictionary(path => path, _ => System.Text.Encoding.UTF8.GetBytes("publisher default"));
+        foreach ((string path, byte[] bytes) in playerFiles) await WriteConvergenceFileAsync(paths, path, bytes);
+        var catalog = new List<RemoteRelease>();
+        if (upgrade)
+        {
+            var legacy = prefixes.Keys.ToDictionary(path => path, path => JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                name = Path.GetFileNameWithoutExtension(path), packIds = new[] { "vanilla", "file/old.zip" }
+            }));
+            var previousPayload = new Dictionary<string, byte[]>(legacy) { [managedPath] = required };
+            RemoteRelease previous = await CreateSignedConvergenceReleaseAsync(paths, new UpdateManifest
+            {
+                SchemaVersion = 1, Version = "1.0.13", Files = [ConvergenceFile(managedPath, required)],
+                SeedFiles = legacy.Select(pair => ConvergenceFile(pair.Key, pair.Value)).ToList()
+            }, previousPayload, signer, configuration);
+            catalog.Add(previous);
+            foreach ((string path, byte[] bytes) in previousPayload) await WriteConvergenceFileAsync(paths, path, bytes);
+            InstalledState oldState = StateFrom(previous.Manifest, previous.ManifestSha256);
+            oldState.OfferedSeedPaths = legacy.Keys.ToList();
+            await LocalStateStore.SaveStateAsync(paths, oldState, NoCancellation);
+        }
+
+        async Task<RemoteRelease> PublishFixtureAsync(string version)
+        {
+            var payload = new Dictionary<string, byte[]>(profiles) { [managedPath] = required };
+            foreach ((string path, byte[] bytes) in stockSeeds) payload.Add(path, bytes);
+            RemoteRelease release = await CreateSignedConvergenceReleaseAsync(paths, new UpdateManifest
+            {
+                SchemaVersion = 1, Version = version,
+                Files = profiles.Select(pair => ConvergenceFile(pair.Key, pair.Value)).Append(ConvergenceFile(managedPath, required)).ToList(),
+                SeedFiles = stockSeeds.Select(pair => ConvergenceFile(pair.Key, pair.Value)).ToList()
+            }, payload, signer, configuration);
+            catalog.Add(release);
+            return release;
+        }
+
+        var logs = new List<string>();
+        async Task LaunchAsync()
+        {
+            logs.Clear();
+            // A fresh engine must honor the on-disk revision ledger, not in-memory state.
+            await new UpdateEngine(paths, configuration, logs.Add, verifiedCatalog: catalog)
+                .CheckAndUpdateAsync([], checkOnly: false, NoCancellation);
+            foreach ((string path, byte[] bytes) in playerFiles)
+                Equal(HashBytes(bytes), HashBytes(File.ReadAllBytes(PathSafety.CombineUnder(paths.MinecraftDirectory, path))), $"official profiles preserve player file: {path}");
+            Equal(false, File.Exists(TransactionStore.JournalPath(paths)), "profile convergence completes its journal");
+        }
+
+        string BackupSnapshot()
+        {
+            string rollback = Path.Combine(paths.LocalDataDirectory, "rollback");
+            return !Directory.Exists(rollback) ? "" : string.Join("\n", Directory.GetFiles(rollback, "*", SearchOption.AllDirectories)
+                .OrderBy(path => path, StringComparer.Ordinal).Select(path => path + ":" + HashBytes(File.ReadAllBytes(path))));
+        }
+
+        async Task AssertNoOpLaunchAsync(string context)
+        {
+            string backups = BackupSnapshot();
+            string stateHash = HashBytes(File.ReadAllBytes(paths.StatePath));
+            await LaunchAsync();
+            Equal(backups, BackupSnapshot(), context + ": no new or changed recovery backup");
+            Equal(stateHash, HashBytes(File.ReadAllBytes(paths.StatePath)), context + ": no state rewrite");
+            Equal(false, logs.Any(line => line.StartsWith("Repair needed:", StringComparison.Ordinal)
+                || line.StartsWith("Converging directly", StringComparison.Ordinal)), context + ": no repair transaction");
+        }
+
+        void AssertRevisionLedger(RemoteRelease release, int expectedRevisionCount)
+        {
+            InstalledState state = LocalStateStore.LoadState(paths);
+            Equal(release.ManifestSha256, state.ManifestSha256, "official profiles retain the signed installed identity");
+            Equal(expectedRevisionCount, state.AppliedPlayerSettingMigrationIds.Count, "profile revision ledger is cumulative and unique");
+            foreach (ManifestFile file in release.Manifest.Files.Where(file => prefixes.ContainsKey(file.Path)))
+            {
+                Equal(true, state.AppliedPlayerSettingMigrationIds.Contains(prefixes[file.Path] + file.Sha256), "revision ID derives from signed source SHA: " + file.Path);
+                ManagedFileState managed = state.ManagedFiles.Single(item => item.Path == file.Path);
+                Equal(file.Sha256, managed.Sha256, "mutable profile retains signed managed SHA");
+                Equal(file.Size, managed.Size, "mutable profile retains signed managed size");
+            }
+        }
+
+        RemoteRelease latest = await PublishFixtureAsync("1.0.15");
+        await LaunchAsync();
+        foreach ((string path, byte[] bytes) in profiles)
+            Equal(HashBytes(bytes), HashBytes(File.ReadAllBytes(PathSafety.CombineUnder(paths.MinecraftDirectory, path))), $"{(upgrade ? "legacy default upgrade" : "fresh default install")} delivers signed profile: {path}");
+        AssertRevisionLedger(latest, expectedRevisionCount: 2);
+
+        var runtimeProfiles = new Dictionary<string, byte[]>();
+        async Task RewriteProfileAsync(string path)
+        {
+            // Same logical JSON, different serialization: reproduces Packed Packs autosave.
+            byte[] rewritten = JsonSerializer.SerializeToUtf8Bytes(JsonSerializer.Deserialize<JsonElement>(profiles[path]), new JsonSerializerOptions { WriteIndented = true });
+            Equal(false, rewritten.Length == profiles[path].Length, "runtime profile fixture changes size");
+            Equal(false, HashBytes(rewritten) == HashBytes(profiles[path]), "runtime profile fixture changes SHA");
+            runtimeProfiles[path] = rewritten;
+            await WriteConvergenceFileAsync(paths, path, rewritten);
+        }
+        foreach (string path in prefixes.Keys) await RewriteProfileAsync(path);
+        await AssertNoOpLaunchAsync("second launch after automatic JSON rewrite");
+        foreach ((string path, byte[] bytes) in runtimeProfiles)
+            Equal(HashBytes(bytes), HashBytes(File.ReadAllBytes(PathSafety.CombineUnder(paths.MinecraftDirectory, path))), "runtime serialization remains intact: " + path);
+
+        int revisionCount = 2;
+        foreach (string changedPath in prefixes.Keys)
+        {
+            string unchangedPath = prefixes.Keys.Single(path => path != changedPath);
+            byte[] displaced = runtimeProfiles[changedPath];
+            profiles[changedPath] = JsonSerializer.SerializeToUtf8Bytes(new
+            {
+                name = Path.GetFileNameWithoutExtension(changedPath), packIds = new[] { "vanilla", "file/MegaStorm.zip", "file/new-official.zip" }
+            });
+            latest = await PublishFixtureAsync("1.0." + (14 + revisionCount));
+            await LaunchAsync();
+            Equal(HashBytes(profiles[changedPath]), HashBytes(File.ReadAllBytes(PathSafety.CombineUnder(paths.MinecraftDirectory, changedPath))), "changed signed profile revision is delivered once");
+            Equal(HashBytes(runtimeProfiles[unchangedPath]), HashBytes(File.ReadAllBytes(PathSafety.CombineUnder(paths.MinecraftDirectory, unchangedPath))), "unchanged official revision preserves runtime bytes across release upgrade");
+            string suffix = Path.Combine("files", changedPath.Replace('/', Path.DirectorySeparatorChar));
+            Equal(1, Directory.GetFiles(Path.Combine(paths.LocalDataDirectory, "rollback"), "*", SearchOption.AllDirectories)
+                .Count(path => path.EndsWith(Path.DirectorySeparatorChar + suffix, StringComparison.OrdinalIgnoreCase)
+                    && HashBytes(File.ReadAllBytes(path)) == HashBytes(displaced)), "new signed revision backs up exact displaced runtime profile once");
+            AssertRevisionLedger(latest, ++revisionCount);
+            await RewriteProfileAsync(changedPath);
+            await AssertNoOpLaunchAsync("repeat launch after new signed profile revision");
+        }
+
+        foreach (string missingPath in prefixes.Keys)
+        {
+            // Delete only this fixture's exact file; existence remains required after the revision is applied.
+            File.Delete(PathSafety.CombineUnder(paths.MinecraftDirectory, missingPath));
+            await LaunchAsync();
+            Equal(HashBytes(profiles[missingPath]), HashBytes(File.ReadAllBytes(PathSafety.CombineUnder(paths.MinecraftDirectory, missingPath))), "deleted official profile is repaired despite existing revision ledger");
+            AssertRevisionLedger(latest, revisionCount);
+            await RewriteProfileAsync(missingPath);
+            await AssertNoOpLaunchAsync("repeat launch after missing profile repair");
+        }
+    }
+
     private static async Task<RemoteRelease> CreateSignedConvergenceReleaseAsync(UpdaterPaths paths,
-        UpdateManifest manifest, Dictionary<string, byte[]> payloadFiles, ConvergenceTestSigner signer)
+        UpdateManifest manifest, Dictionary<string, byte[]> payloadFiles, ConvergenceTestSigner signer,
+        UpdaterConfiguration? configuration = null)
     {
         manifest.ModpackId = BuildInfo.DefaultModpackId;
         manifest.Channel = "stable";
@@ -1089,7 +1250,7 @@ internal static class Program
             Parts = [new PayloadPart { Name = partName, Size = archive.LongLength, Sha256 = HashBytes(archive) }]
         };
         var urls = new Dictionary<string, Uri> { [partName] = new("https://example.invalid/convergence/" + manifest.Version + "/" + partName) };
-        ManifestParser.Validate(manifest, Configuration(), urls);
+        ManifestParser.Validate(manifest, configuration ?? Configuration(), urls);
         byte[] raw = JsonSerializer.SerializeToUtf8Bytes(manifest);
         byte[] signature = signer.Sign(raw);
         UpdateManifest verified = ManifestParser.VerifyAndParse(raw, signature);

@@ -15,8 +15,11 @@ The minimize button and taskbar minimize/restore work during updates. The
 window is not always-on-top. The former 30-minute whole-operation timeout is
 removed; individual network requests retain their configured timeout.
 
-The two official Packed Packs profiles (Default and Realistic) are managed
-release content; custom profiles and selections remain player-owned. Data
+The two official Packed Packs profiles (Default and Realistic) are versioned
+defaults: each signed profile revision is installed once, then ordinary runtime
+rewrites are preserved without integrity repairs. A new published profile hash
+delivers that changed profile once; unrelated releases leave it alone. Custom
+profiles and selections remain player-owned. Data
 packs in the dedicated datapacks directory are now supported. options.txt,
 keybinds, video/audio settings, mutable shader option sidecars and ordinary
 config defaults retain their existing ownership rules.
