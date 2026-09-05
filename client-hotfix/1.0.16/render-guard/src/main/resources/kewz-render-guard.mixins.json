@@ -1,0 +1,8 @@
+{
+  "required": true,
+  "minVersion": "0.8.7",
+  "package": "dev.kewz.renderguard.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": ["GameRendererMixin", "LightmapTextureManagerMixin"],
+  "injectors": {"defaultRequire": 1}
+}

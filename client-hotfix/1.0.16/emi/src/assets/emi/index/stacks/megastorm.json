@@ -1,0 +1,78 @@
+{
+  "removed": [
+    {
+      "type": "item",
+      "id": "minecraft:paper",
+      "nbt": "{\"minecraft:custom_model_data\":770006,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.golduckite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.golduckite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:golduckite\"}"
+    },
+    {
+      "type": "item",
+      "id": "minecraft:paper",
+      "nbt": "{\"minecraft:custom_model_data\":770007,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.laprasite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.laprasite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:laprasite\"}"
+    },
+    {
+      "type": "item",
+      "id": "minecraft:paper",
+      "nbt": "{\"minecraft:custom_model_data\":770002,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.noivernite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.noivernite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:noivernite\"}"
+    },
+    {
+      "type": "item",
+      "id": "minecraft:paper",
+      "nbt": "{\"minecraft:custom_model_data\":770008,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.rapidashite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.rapidashite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:rapidashite\"}"
+    },
+    {
+      "type": "item",
+      "id": "minecraft:paper",
+      "nbt": "{\"minecraft:custom_model_data\":770004,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.typhlosionite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.typhlosionite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:typhlosionite\"}"
+    },
+    {
+      "type": "item",
+      "id": "minecraft:paper",
+      "nbt": "{\"minecraft:custom_model_data\":770003,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.walreinite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.walreinite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:walreinite\"}"
+    }
+  ],
+  "added": [
+    {
+      "stack": {
+        "type": "item",
+        "id": "minecraft:paper",
+        "nbt": "{\"minecraft:custom_model_data\":770006,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.golduckite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.golduckite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:golduckite\"}"
+      }
+    },
+    {
+      "stack": {
+        "type": "item",
+        "id": "minecraft:paper",
+        "nbt": "{\"minecraft:custom_model_data\":770007,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.laprasite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.laprasite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:laprasite\"}"
+      }
+    },
+    {
+      "stack": {
+        "type": "item",
+        "id": "minecraft:paper",
+        "nbt": "{\"minecraft:custom_model_data\":770002,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.noivernite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.noivernite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:noivernite\"}"
+      }
+    },
+    {
+      "stack": {
+        "type": "item",
+        "id": "minecraft:paper",
+        "nbt": "{\"minecraft:custom_model_data\":770008,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.rapidashite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.rapidashite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:rapidashite\"}"
+      }
+    },
+    {
+      "stack": {
+        "type": "item",
+        "id": "minecraft:paper",
+        "nbt": "{\"minecraft:custom_model_data\":770004,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.typhlosionite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.typhlosionite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:typhlosionite\"}"
+      }
+    },
+    {
+      "stack": {
+        "type": "item",
+        "id": "minecraft:paper",
+        "nbt": "{\"minecraft:custom_model_data\":770003,\"minecraft:item_name\":\"{\\\"translate\\\":\\\"item.name.walreinite\\\", \\\"italic\\\":false}\",\"minecraft:lore\":[\"{\\\"translate\\\":\\\"item.desc.walreinite\\\", \\\"color\\\":\\\"gray\\\", \\\"italic\\\":false}\"],\"mega_showdown:registry_type_component\":\"mega\",\"mega_showdown:registry_location_component\":\"megastorm:walreinite\"}"
+      }
+    }
+  ]
+}

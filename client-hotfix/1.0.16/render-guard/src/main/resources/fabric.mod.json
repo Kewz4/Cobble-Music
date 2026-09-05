@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "kewz_render_guard",
+  "version": "1.0.0+mc1.21.1",
+  "name": "Kewz Client Render Guard",
+  "description": "Guards incomplete world-render state and migrates NEC gameplay crash recovery once, with backup.",
+  "authors": ["Kewz"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {"client": ["dev.kewz.renderguard.RenderGuardClient"]},
+  "mixins": ["kewz-render-guard.mixins.json"],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": "1.21.1",
+    "java": ">=21"
+  }
+}

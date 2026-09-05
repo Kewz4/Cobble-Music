@@ -47,6 +47,10 @@ param(
     [string]$BaseVersion,
     [string]$BaseManifestPath,
     [string]$BaseSignaturePath,
+    # Maintainer DEV may have authored changes without running the updater.
+    # Keep its real receipt; an explicit signed-parent receipt is verified below.
+    [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
+    [string]$SourceReceiptVersion,
     [switch]$FullBaseline,
 
     [int]$ChunkSizeMiB = 256,
@@ -1054,6 +1058,7 @@ if ($ResumePublish) {
 }
 
 if ($FullBaseline -and -not [string]::IsNullOrWhiteSpace($BaseVersion)) { throw 'Choose either -FullBaseline (schema v1) or -BaseVersion (schema v2), not both.' }
+if ($FullBaseline -and -not [string]::IsNullOrWhiteSpace($SourceReceiptVersion)) { throw '-SourceReceiptVersion is only valid for a signed delta.' }
 if (-not $FullBaseline -and [string]::IsNullOrWhiteSpace($BaseVersion)) {
     throw 'Choose an explicit release mode: use -BaseVersion <published version> for a small signed delta, or -FullBaseline for a complete schema-v1 baseline.'
 }
@@ -1091,6 +1096,7 @@ if ([string]$packVersionMarker.pack -cne "Kewz's Cobblemon" -or
 Get-PinnedUpdaterIdentity | Out-Null
 
 $baseArtifacts = $null
+$sourceReceiptArtifacts = $null
 $stagedIdentity = $null
 try {
     $baseManifest = $null
@@ -1103,8 +1109,30 @@ try {
         $baseManifest = Read-JsonSnapshot $baseArtifacts.Identity.Manifest 'Signed base manifest'
         $baseSet = Assert-CobbleBaseManifest -Manifest $baseManifest -ExpectedVersion $BaseVersion -TargetVersion $Version
         $baseFiles = @($baseSet.Entries)
-        Assert-SourceStateBoundToBase -MinecraftDirectory $SourceMinecraftDir -ExpectedVersion $BaseVersion `
-            -ExpectedManifestSha256 $baseHash -ExpectedFiles $baseFiles | Out-Null
+        if ([string]::IsNullOrWhiteSpace($SourceReceiptVersion) -or $SourceReceiptVersion -ceq $BaseVersion) {
+            Assert-SourceStateBoundToBase -MinecraftDirectory $SourceMinecraftDir -ExpectedVersion $BaseVersion `
+                -ExpectedManifestSha256 $baseHash -ExpectedFiles $baseFiles | Out-Null
+        }
+        else {
+            # This is not an unbound-source bypass. Only the signed base's own
+            # parent is accepted, with a matching published signature, hash,
+            # version and complete source-receipt inventory. No receipt is edited.
+            if ($null -eq $baseManifest.PSObject.Properties['base'] -or $null -eq $baseManifest.base -or
+                [string]$baseManifest.base.version -cne $SourceReceiptVersion) {
+                throw 'Alternate source receipt must be the direct signed parent of the delta base.'
+            }
+            $sourceReceiptArtifacts = Resolve-BaseArtifacts -RequestedVersion $SourceReceiptVersion -ManifestPath '' -SignaturePath ''
+            Assert-ManifestSignatureIdentity $sourceReceiptArtifacts.Identity | Out-Null
+            $receiptHash = [string]$sourceReceiptArtifacts.Identity.Manifest.sha256
+            if ($receiptHash -cne [string]$baseManifest.base.manifestSha256) {
+                throw 'Published source-receipt manifest does not match the signed delta-base parent hash.'
+            }
+            $receiptManifest = Read-JsonSnapshot $sourceReceiptArtifacts.Identity.Manifest 'Signed source-receipt manifest'
+            $receiptSet = Assert-CobbleBaseManifest -Manifest $receiptManifest -ExpectedVersion $SourceReceiptVersion -TargetVersion $BaseVersion
+            Assert-SourceStateBoundToBase -MinecraftDirectory $SourceMinecraftDir -ExpectedVersion $SourceReceiptVersion `
+                -ExpectedManifestSha256 $receiptHash -ExpectedFiles @($receiptSet.Entries) | Out-Null
+            Write-Host "Verified authored DEV receipt $SourceReceiptVersion; delta is against $BaseVersion. Review changed/new and deleted files before publishing."
+        }
         Write-Host "Verified signed base $BaseVersion ($baseHash)."
     }
 
@@ -1372,5 +1400,6 @@ This release is a signed update payload for the Kewz's Cobblemon Prism updater.
 }
 finally {
     Close-ManifestSignatureIdentity $stagedIdentity
+    Remove-BaseTemp $sourceReceiptArtifacts
     Remove-BaseTemp $baseArtifacts
 }

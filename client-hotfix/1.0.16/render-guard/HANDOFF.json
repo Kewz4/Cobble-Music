@@ -1,0 +1,26 @@
+{
+  "status": "staged-not-deployed",
+  "artifact": "dist/kewz-render-guard-1.0.0+mc1.21.1.jar",
+  "bytes": 8616,
+  "sha256": "07ab5272f6f39126a3c6d0bd1ba241f0dcf7294e4e26f94a01a6d5bc7522f5c7",
+  "modId": "kewz_render_guard",
+  "environment": "client",
+  "minecraft": "1.21.1",
+  "java": 21,
+  "renderGuardCount": 2,
+  "headlessAssertionsPassed": 40,
+  "staticTargetChecks": "PASS",
+  "repeatBuildIdentical": true,
+  "necMigration": {
+    "config": "config/notenoughcrashes.json",
+    "change": {"catchGameloop": false},
+    "backup": "config/kewz-render-guard/notenoughcrashes.pre-catch-gameloop-v1.json",
+    "marker": "config/kewz-render-guard/nec-catch-gameloop-v1.done",
+    "memoryField": "fudge.notenoughcrashes.config.NecMidnightConfig.catchGameloop",
+    "respectsLaterEdits": true,
+    "absentNecNoOp": true,
+    "malformedConfig": "warn-and-leave-untouched"
+  },
+  "notRun": ["Minecraft launch", "server access", "live Mixin application", "real loaded-client NEC migration"],
+  "doesNotClaim": ["Root mod identified", "Noivern repair", "All invalid render-state paths covered"]
+}
