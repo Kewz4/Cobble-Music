@@ -18,6 +18,12 @@ internal static class Program
         try
         {
             Directory.CreateDirectory(tempRoot);
+            if (args.Length == 1 && args[0] == "--convergence-regressions")
+            {
+                await TestCatalogConvergenceAsync(Path.Combine(tempRoot, "catalog"));
+                Console.WriteLine("Catalog convergence regressions passed.");
+                return 0;
+            }
             if (args.Length == 2 && args[0] == "--log-regressions")
             {
                 TestPublishedHistoricalManifests(args[1]);
@@ -36,6 +42,9 @@ internal static class Program
             TestInstanceIdentityNormalization(Path.Combine(tempRoot, "identity"));
             TestLegacyConfigurationRootMigration(Path.Combine(tempRoot, "configuration-migration"));
             TestOfflineLaunchPolicy();
+            TestManagedFileIntegrity(Path.Combine(tempRoot, "managed-integrity"));
+            await TestCatalogConvergenceAsync(Path.Combine(tempRoot, "catalog"));
+            await TestUpdaterSetupFailureBlocksAsync(Path.Combine(tempRoot, "missing-instance"));
             TestResumeStagingPreparation(Path.Combine(tempRoot, "staging"));
             await TestExtractAndVerifyReleasesDestinationHandleAsync(Path.Combine(tempRoot, "extract-lock"));
             await TestReusableAssembledArchiveAsync(Path.Combine(tempRoot, "assembled-retry"));
@@ -206,7 +215,8 @@ internal static class Program
             showCloseButton: false);
 
         Equal(new Size(650, 218), layout.ClientSize, "120 DPI client size");
-        Equal(new Rectangle(31, 28, 588, 35), layout.TitleBounds, "120 DPI title bounds");
+        Equal(new Rectangle(31, 28, 533, 35), layout.TitleBounds, "120 DPI title bounds");
+        Equal(new Rectangle(574, 28, 45, 35), layout.MinimizeBounds, "120 DPI minimize bounds");
         Equal(new Rectangle(32, 67, 587, 21), layout.SubtitleBounds, "120 DPI subtitle bounds");
         Equal(new Rectangle(31, 107, 588, 29), layout.StatusBounds, "120 DPI status bounds");
         Equal(new Rectangle(32, 137, 587, 22), layout.DetailBounds, "120 DPI detail bounds");
@@ -222,6 +232,7 @@ internal static class Program
             closePreferredSize: new Size(100, 35),
             showCloseButton: true);
         Equal(new Size(650, 221), failureLayout.ClientSize, "120 DPI failure client size");
+        Equal(layout.MinimizeBounds, failureLayout.MinimizeBounds, "minimize remains available in the failure layout");
         Equal(new Rectangle(518, 175, 100, 35), failureLayout.CloseBounds, "120 DPI visible close bounds");
 
         UpdateStatusLayout largeButtonLayout = UpdateStatusForm.CalculateLayout(
@@ -362,10 +373,14 @@ internal static class Program
     private static void AssertStatusLayout(UpdateStatusForm form, string context)
     {
         Equal(AutoScaleMode.Dpi, form.AutoScaleMode, $"{context}: DPI autoscaling mode");
+        Equal(false, form.TopMost, $"{context}: updater does not stay above other windows");
+        Equal(true, form.ShowInTaskbar, $"{context}: updater can be restored from the taskbar");
+        Equal(true, form.MinimizeBox, $"{context}: minimizing is enabled");
         int minimumDpiWidth = (int)Math.Round(520 * form.DeviceDpi / 96D);
         Equal(true, form.ClientSize.Width >= minimumDpiWidth, $"{context}: DPI-scaled minimum width");
 
         Control title = FindControl(form, "titleLabel");
+        Control minimize = FindControl(form, "minimizeButton");
         Control subtitle = FindControl(form, "subtitleLabel");
         Control status = FindControl(form, "statusLabel");
         Control detail = FindControl(form, "detailLabel");
@@ -383,18 +398,23 @@ internal static class Program
             showCloseButton: false);
         Equal(expected.ClientSize, form.ClientSize, $"{context}: exact client size");
         Equal(expected.TitleBounds, title.Bounds, $"{context}: exact title bounds");
+        Equal(expected.MinimizeBounds, minimize.Bounds, $"{context}: exact minimize bounds");
+        Equal("Minimize", minimize.AccessibleName!, $"{context}: accessible minimize label");
+        Equal(true, minimize.TabStop, $"{context}: minimize is keyboard accessible");
         Equal(expected.SubtitleBounds, subtitle.Bounds, $"{context}: exact subtitle bounds");
         Equal(expected.StatusBounds, status.Bounds, $"{context}: exact status bounds");
         Equal(expected.DetailBounds, detail.Bounds, $"{context}: exact detail bounds");
         Equal(expected.ProgressBounds, progress.Bounds, $"{context}: exact progress bounds");
         Equal(expected.CloseBounds, close.Bounds, $"{context}: exact close bounds");
 
-        foreach (Control control in new[] { title, subtitle, status, detail, progress, close })
+        foreach (Control control in new[] { title, minimize, subtitle, status, detail, progress, close })
         {
             Equal(true, form.ClientRectangle.Contains(control.Bounds), $"{context}: {control.Name} inside client bounds");
         }
 
         Equal(true, title.Bottom <= subtitle.Top, $"{context}: title/subtitle separation");
+        Equal(true, title.Right < minimize.Left, $"{context}: title/minimize separation");
+        Equal(true, minimize.Bottom <= subtitle.Top, $"{context}: minimize/subtitle separation");
         Equal(true, subtitle.Bottom <= status.Top, $"{context}: subtitle/status separation");
         Equal(true, status.Bottom <= detail.Top, $"{context}: status/detail separation");
         Equal(true, detail.Bottom <= progress.Top, $"{context}: detail/progress separation");
@@ -809,6 +829,16 @@ internal static class Program
         File.WriteAllText(paths.ConfigurationPath, legacy);
         UpdaterConfiguration migrated = LocalStateStore.LoadConfiguration(paths);
         Equal(true, migrated.AllowedRoots.Contains("shaderpacks"), "immutable 1.2.7 bootstrap config gains shaderpacks in memory");
+        Equal(true, migrated.AllowedRoots.Contains("datapacks"), "legacy six-root config gains datapacks in memory");
+        Equal(8, migrated.AllowedRoots.Count, "legacy six-root config expands to eight roots");
+        var sevenRoot = new UpdaterConfiguration
+        {
+            AllowedRoots = ["mods", "resourcepacks", "shaderpacks", "config", "defaultconfigs", "kubejs", "scripts"]
+        };
+        File.WriteAllText(paths.ConfigurationPath, JsonSerializer.Serialize(sevenRoot));
+        UpdaterConfiguration migratedSeven = LocalStateStore.LoadConfiguration(paths);
+        Equal(true, migratedSeven.AllowedRoots.Contains("datapacks"), "legacy seven-root config gains datapacks in memory");
+        Equal(8, migratedSeven.AllowedRoots.Count, "legacy seven-root config expands to eight roots");
 
         string narrowed = JsonSerializer.Serialize(new
         {
@@ -825,6 +855,8 @@ internal static class Program
         File.WriteAllText(paths.ConfigurationPath, narrowed);
         UpdaterConfiguration custom = LocalStateStore.LoadConfiguration(paths);
         Equal(false, custom.AllowedRoots.Contains("shaderpacks"), "deliberately narrowed custom config remains narrow");
+        Equal(false, custom.AllowedRoots.Contains("datapacks"), "custom root policy does not gain datapacks");
+        Equal(1, custom.AllowedRoots.Count, "custom root policy remains exactly one root");
 
         string oldState = JsonSerializer.Serialize(new
         {
@@ -874,6 +906,268 @@ internal static class Program
         configuration.AllowOfflineLaunch = false;
         Equal(1, CobbleMusicUpdater.Program.NetworkFailureExitCode(configuration, new TimeoutException("offline")), "blocked offline launch");
         Throws<ArgumentException>(() => CobbleMusicUpdater.Program.NetworkFailureExitCode(configuration, new InvalidDataException("not network")));
+    }
+
+    private static void TestManagedFileIntegrity(string root)
+    {
+        UpdaterPaths paths = Paths(root);
+        Directory.CreateDirectory(Path.Combine(paths.MinecraftDirectory, "mods"));
+        var manifest = new UpdateManifest
+        {
+            Version = "1.0.5",
+            Files = [FileEntry("mods/required.jar", "verified-content")]
+        };
+        InstalledState state = StateFrom(manifest, HashText("managed-integrity-manifest"));
+        var engine = new UpdateEngine(paths, Configuration(), _ => { });
+        string target = PathSafety.CombineUnder(paths.MinecraftDirectory, "mods/required.jar");
+        File.WriteAllText(target, "verified-content");
+        Equal(true, engine.StateMatchesManifestAndSizes(state, manifest), "exact managed bytes pass integrity validation");
+
+        File.WriteAllText(target, "modified-content");
+        Equal(manifest.Files[0].Size, new FileInfo(target).Length, "corrupted managed file retains its signed size");
+        Equal(false, engine.StateMatchesManifestAndSizes(state, manifest), "same-size managed corruption fails SHA256 validation despite matching recorded state");
+
+        File.WriteAllText(target, "verified-content");
+        Equal(true, engine.StateMatchesManifestAndSizes(state, manifest), "restoring exact bytes passes the next integrity check");
+    }
+
+    private static async Task TestUpdaterSetupFailureBlocksAsync(string root)
+    {
+        UpdaterPaths paths = Paths(root);
+        foreach (bool prismPrelaunch in new[] { false, true })
+        {
+            var progress = new CapturedUpdateProgress();
+            int exitCode = await CobbleMusicUpdater.Program.RunUpdaterAsync(
+                new CommandLine(paths.InstanceDirectory, paths.MinecraftDirectory, prismPrelaunch, CheckOnly: false, NoUi: true),
+                progress);
+            Equal(1, exitCode, $"missing instance blocks launch (PrismPrelaunch={prismPrelaunch})");
+            Equal(UpdatePhase.Blocked, progress.Updates[^1].Phase, "setup failure reports Blocked");
+            Equal(false, progress.Updates.Any(update => update.Phase == UpdatePhase.Fallback), "setup failure never reports successful fallback");
+        }
+    }
+
+    private sealed class CapturedUpdateProgress : IProgress<UpdateProgress>
+    {
+        public List<UpdateProgress> Updates { get; } = [];
+        public void Report(UpdateProgress value) => Updates.Add(value);
+    }
+
+    private static async Task TestCatalogConvergenceAsync(string root)
+    {
+        using var signer = new ConvergenceTestSigner();
+        await TestCatalogRepairAndDuplicateQuarantineAsync(Path.Combine(root, "repair"), signer);
+        await TestCatalogPreviousPayloadOriginAsync(Path.Combine(root, "previous-origin"), signer);
+        await TestCatalogManagedAxiomPreservedAsync(Path.Combine(root, "custom-axiom"), signer, removed: false);
+        await TestCatalogManagedAxiomPreservedAsync(Path.Combine(root, "removed-axiom"), signer, removed: true);
+    }
+
+    private static async Task TestCatalogRepairAndDuplicateQuarantineAsync(string root, ConvergenceTestSigner signer)
+    {
+        UpdaterPaths paths = Paths(root);
+        const string canonicalPath = "mods/required-current.jar";
+        const string oldPath = "mods/required-old.jar";
+        const string axiomPath = "mods/axiom-player.jar";
+        const string unrelatedPath = "mods/player-addon.jar";
+        byte[] canonical = ConvergenceFabricJar("required_mod", "2.0.0");
+        byte[] old = ConvergenceFabricJar("required_mod", "1.0.0");
+        byte[] axiom = ConvergenceFabricJar("axiom", "9.0.0");
+        byte[] unrelated = ConvergenceFabricJar("player_addon", "1.0.0");
+        byte[] options = System.Text.Encoding.UTF8.GetBytes("music:0.37\r\nfov:0.71\r\n");
+        byte[] stockOptions = System.Text.Encoding.UTF8.GetBytes("music:1.0\n");
+        byte[] stockAxiom = ConvergenceFabricJar("axiom", "1.0.0");
+        var manifest = new UpdateManifest
+        {
+            SchemaVersion = 1, Version = "1.0.9",
+            Files = [ConvergenceFile(canonicalPath, canonical)],
+            SeedFiles = [ConvergenceFile(axiomPath, stockAxiom), ConvergenceFile("options.txt", stockOptions)]
+        };
+        RemoteRelease latest = await CreateSignedConvergenceReleaseAsync(paths, manifest,
+            new() { [canonicalPath] = canonical, [axiomPath] = stockAxiom, ["options.txt"] = stockOptions }, signer);
+        byte[] corrupted = canonical.ToArray();
+        corrupted[^1] ^= 1;
+        Equal(canonical.Length, corrupted.Length, "catalog repair fixture retains exact signed size");
+        await WriteConvergenceFileAsync(paths, canonicalPath, corrupted);
+        await WriteConvergenceFileAsync(paths, oldPath, old);
+        await WriteConvergenceFileAsync(paths, axiomPath, axiom);
+        await WriteConvergenceFileAsync(paths, unrelatedPath, unrelated);
+        await WriteConvergenceFileAsync(paths, "options.txt", options);
+        await LocalStateStore.SaveStateAsync(paths, StateFrom(latest.Manifest, latest.ManifestSha256), NoCancellation);
+        var logs = new List<string>();
+        var engine = new UpdateEngine(paths, Configuration(), logs.Add, verifiedCatalog: [latest]);
+
+        // An empty sequential chain must still run the complete catalog path.
+        await engine.CheckAndUpdateAsync([], checkOnly: false, NoCancellation);
+        Equal(HashBytes(canonical), await PathSafety.Sha256Async(PathSafety.CombineUnder(paths.MinecraftDirectory, canonicalPath), NoCancellation), "catalog repairs same-size corruption even when installed identity is already latest");
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, oldPath)), "old filename with canonical Fabric ID is no longer active");
+        AssertConvergenceBackup(paths, canonicalPath, corrupted, expectedCount: 1);
+        AssertConvergenceBackup(paths, oldPath, old, expectedCount: 1);
+        foreach ((string path, byte[] expected) in new Dictionary<string, byte[]>
+            { [axiomPath] = axiom, [unrelatedPath] = unrelated, ["options.txt"] = options })
+            Equal(HashBytes(expected), await PathSafety.Sha256Async(PathSafety.CombineUnder(paths.MinecraftDirectory, path), NoCancellation), $"catalog preserves player-owned bytes: {path}");
+        Equal(latest.ManifestSha256, LocalStateStore.LoadState(paths).ManifestSha256, "catalog commits latest signed identity");
+        Equal(false, File.Exists(TransactionStore.JournalPath(paths)), "successful catalog repair finishes its journal");
+        Equal(false, logs.Any(line => line.StartsWith("Downloading repair source", StringComparison.Ordinal)), "verified cached fixture archive avoids network requests");
+
+        // Cover duplicate-only reconciliation when every managed hash is exact.
+        await WriteConvergenceFileAsync(paths, oldPath, old);
+        await engine.CheckAndUpdateAsync([], checkOnly: false, NoCancellation);
+        Equal(false, File.Exists(PathSafety.CombineUnder(paths.MinecraftDirectory, oldPath)), "duplicate-only catalog run still quarantines the old filename");
+        AssertConvergenceBackup(paths, oldPath, old, expectedCount: 2);
+        AssertConvergenceBackup(paths, canonicalPath, corrupted, expectedCount: 1);
+    }
+
+    private static async Task TestCatalogPreviousPayloadOriginAsync(string root, ConvergenceTestSigner signer)
+    {
+        UpdaterPaths paths = Paths(root);
+        const string unchangedPath = "mods/unchanged.jar";
+        const string changedPath = "mods/latest.jar";
+        byte[] unchanged = ConvergenceFabricJar("unchanged_mod", "1.0.0");
+        byte[] changed = ConvergenceFabricJar("latest_mod", "2.0.0");
+        RemoteRelease previous = await CreateSignedConvergenceReleaseAsync(paths,
+            new UpdateManifest { SchemaVersion = 1, Version = "1.0.4", Files = [ConvergenceFile(unchangedPath, unchanged)] },
+            new() { [unchangedPath] = unchanged }, signer);
+        RemoteRelease latest = await CreateSignedConvergenceReleaseAsync(paths, new UpdateManifest
+        {
+            SchemaVersion = 2, Version = "1.0.9",
+            Base = new ManifestBase { Version = "1.0.8", ManifestSha256 = HashText("unavailable-intermediate") },
+            Files = [ConvergenceFile(unchangedPath, unchanged), ConvergenceFile(changedPath, changed)],
+            PayloadFiles = [ConvergenceFile(changedPath, changed)]
+        }, new() { [changedPath] = changed }, signer);
+        Equal(false, ManifestParser.PayloadContents(latest.Manifest).Any(file => file.Path == unchangedPath), "unchanged file is absent from latest delta payload");
+        Directory.CreateDirectory(paths.MinecraftDirectory);
+        await LocalStateStore.SaveStateAsync(paths, new InstalledState(), NoCancellation);
+        var logs = new List<string>();
+        // Catalog order is deliberate: select latest by version, not position.
+        var engine = new UpdateEngine(paths, Configuration(), logs.Add, verifiedCatalog: [latest, previous]);
+        await engine.CheckAndUpdateAsync([], checkOnly: false, NoCancellation);
+        Equal(HashBytes(unchanged), await PathSafety.Sha256Async(PathSafety.CombineUnder(paths.MinecraftDirectory, unchangedPath), NoCancellation), "latest inventory repairs unchanged file from previous signed payload origin");
+        Equal(HashBytes(changed), await PathSafety.Sha256Async(PathSafety.CombineUnder(paths.MinecraftDirectory, changedPath), NoCancellation), "latest changed file comes from latest signed payload");
+        InstalledState installed = LocalStateStore.LoadState(paths);
+        Equal(latest.Manifest.Version, installed.Version, "missing intermediate does not prevent direct latest catalog install");
+        Equal(latest.ManifestSha256, installed.ManifestSha256, "direct install commits latest signed identity");
+        Equal(2, installed.ManagedFiles.Count, "direct install records complete latest inventory");
+        Equal(false, logs.Any(line => line.StartsWith("Downloading repair source", StringComparison.Ordinal)), "both signed origins use cached archives");
+    }
+
+    private static async Task TestCatalogManagedAxiomPreservedAsync(string root, ConvergenceTestSigner signer, bool removed)
+    {
+        UpdaterPaths paths = Paths(root);
+        const string requiredPath = "mods/required.jar";
+        const string axiomPath = "mods/axiom-legacy.jar";
+        byte[] required = ConvergenceFabricJar("required_mod", "2.0.0");
+        byte[] stockAxiom = ConvergenceFabricJar("axiom", "1.0.0");
+        byte[] playerAxiom = ConvergenceFabricJar("axiom", "9.0.0");
+        RemoteRelease latest = await CreateSignedConvergenceReleaseAsync(paths, new UpdateManifest
+        {
+            SchemaVersion = 1, Version = "1.0.9",
+            Files = [ConvergenceFile(requiredPath, required), ConvergenceFile(axiomPath, stockAxiom)]
+        }, new() { [requiredPath] = required, [axiomPath] = stockAxiom }, signer);
+        Directory.CreateDirectory(paths.MinecraftDirectory);
+        if (!removed) await WriteConvergenceFileAsync(paths, axiomPath, playerAxiom);
+        await LocalStateStore.SaveStateAsync(paths, StateFrom(latest.Manifest, latest.ManifestSha256), NoCancellation);
+        var engine = new UpdateEngine(paths, Configuration(), _ => { }, verifiedCatalog: [latest]);
+        // Missing required mod forces a commit, where optional exemptions must still hold.
+        await engine.CheckAndUpdateAsync([], checkOnly: false, NoCancellation);
+        Equal(HashBytes(required), await PathSafety.Sha256Async(PathSafety.CombineUnder(paths.MinecraftDirectory, requiredPath), NoCancellation), "required mod repairs alongside optional Axiom");
+        string axiomTarget = PathSafety.CombineUnder(paths.MinecraftDirectory, axiomPath);
+        Equal(!removed, File.Exists(axiomTarget), "catalog preserves removed or customized formerly managed Axiom");
+        if (!removed) Equal(HashBytes(playerAxiom), await PathSafety.Sha256Async(axiomTarget, NoCancellation), "catalog never replaces player's Axiom bytes");
+    }
+
+    private static async Task<RemoteRelease> CreateSignedConvergenceReleaseAsync(UpdaterPaths paths,
+        UpdateManifest manifest, Dictionary<string, byte[]> payloadFiles, ConvergenceTestSigner signer)
+    {
+        manifest.ModpackId = BuildInfo.DefaultModpackId;
+        manifest.Channel = "stable";
+        manifest.ReleaseTag = "modpack-v" + manifest.Version;
+        manifest.MinimumUpdaterVersion = BuildInfo.Version;
+        byte[] archive = ConvergenceZip(payloadFiles);
+        const string partName = "payload.part001";
+        manifest.Payload = new UpdatePayload
+        {
+            ArchiveName = "payload.zip", Size = archive.LongLength, Sha256 = HashBytes(archive),
+            Parts = [new PayloadPart { Name = partName, Size = archive.LongLength, Sha256 = HashBytes(archive) }]
+        };
+        var urls = new Dictionary<string, Uri> { [partName] = new("https://example.invalid/convergence/" + manifest.Version + "/" + partName) };
+        ManifestParser.Validate(manifest, Configuration(), urls);
+        byte[] raw = JsonSerializer.SerializeToUtf8Bytes(manifest);
+        byte[] signature = signer.Sign(raw);
+        UpdateManifest verified = ManifestParser.VerifyAndParse(raw, signature);
+        string hash = HashBytes(raw);
+        string cache = Path.Combine(paths.LocalDataDirectory, "staging", hash);
+        Directory.CreateDirectory(cache);
+        await File.WriteAllBytesAsync(Path.Combine(cache, "payload.zip"), archive, NoCancellation);
+        return new RemoteRelease(new GitHubRelease { TagName = manifest.ReleaseTag }, raw, signature, urls, verified, hash);
+    }
+
+    private static ManifestFile ConvergenceFile(string path, byte[] bytes) =>
+        new() { Path = path, Size = bytes.LongLength, Sha256 = HashBytes(bytes) };
+
+    private static byte[] ConvergenceFabricJar(string id, string version) => ConvergenceZip(new()
+    {
+        ["fabric.mod.json"] = JsonSerializer.SerializeToUtf8Bytes(new { schemaVersion = 1, id, version })
+    });
+
+    private static byte[] ConvergenceZip(Dictionary<string, byte[]> files)
+    {
+        using var output = new MemoryStream();
+        using (var archive = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: true))
+            foreach ((string path, byte[] bytes) in files)
+            {
+                ZipArchiveEntry entry = archive.CreateEntry(path, CompressionLevel.NoCompression);
+                entry.LastWriteTime = new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero);
+                using Stream stream = entry.Open();
+                stream.Write(bytes);
+            }
+        return output.ToArray();
+    }
+
+    private static async Task WriteConvergenceFileAsync(UpdaterPaths paths, string relative, byte[] bytes)
+    {
+        string target = PathSafety.CombineUnder(paths.MinecraftDirectory, relative);
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        await File.WriteAllBytesAsync(target, bytes, NoCancellation);
+    }
+
+    private static void AssertConvergenceBackup(UpdaterPaths paths, string relative, byte[] expected, int expectedCount)
+    {
+        string rollback = Path.Combine(paths.LocalDataDirectory, "rollback");
+        Equal(true, Directory.Exists(rollback), "successful reconciliation retains recovery backups");
+        string suffix = Path.Combine("files", relative.Replace('/', Path.DirectorySeparatorChar));
+        string[] copies = Directory.GetFiles(rollback, "*", SearchOption.AllDirectories)
+            .Where(path => path.EndsWith(Path.DirectorySeparatorChar + suffix, StringComparison.OrdinalIgnoreCase)).ToArray();
+        Equal(expectedCount, copies.Length, $"retained backup count for {relative}");
+        foreach (string copy in copies)
+            Equal(HashBytes(expected), HashBytes(File.ReadAllBytes(copy)), $"retained exact displaced bytes for {relative}");
+    }
+
+    private sealed class ConvergenceTestSigner : IDisposable
+    {
+        private readonly byte[] _seed;
+        private readonly string _keyId = "convergence-test-" + Guid.NewGuid().ToString("N");
+        private readonly IDictionary<string, byte[]> _keys;
+
+        public ConvergenceTestSigner()
+        {
+            // Test-process-only trust entry: production keys and signature checks stay intact.
+            _keys = (IDictionary<string, byte[]>)(typeof(TrustedKeyRing).GetField("Keys",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)?.GetValue(null)
+                ?? throw new InvalidOperationException("Could not install isolated convergence fixture public key."));
+            var pair = ManifestSecurity.GenerateKeyPair();
+            _seed = pair.PrivateSeed;
+            _keys.Add(_keyId, pair.PublicKey);
+        }
+
+        public byte[] Sign(byte[] manifest) => JsonSerializer.SerializeToUtf8Bytes(new DetachedSignature
+        {
+            KeyId = _keyId, Signature = Convert.ToBase64String(ManifestSecurity.Sign(manifest, _seed))
+        });
+
+        public void Dispose()
+        {
+            _keys.Remove(_keyId);
+            CryptographicOperations.ZeroMemory(_seed);
+        }
     }
 
     private static void TestResumeStagingPreparation(string root)

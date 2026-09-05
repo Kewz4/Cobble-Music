@@ -3,7 +3,7 @@ namespace CobbleMusicUpdater;
 internal static class BuildInfo
 {
     public const string ProductName = "Kewz's Cobblemon Updater";
-    public const string Version = "1.2.15";
+    public const string Version = "1.2.16";
     public const string UserAgent = "CobbleMusicUpdater/" + Version;
     public const string DefaultRepository = "Kewz4/Cobble-Music";
     public const string DefaultModpackId = "cobble-music";
@@ -16,6 +16,7 @@ internal static class BuildInfo
         "mods",
         "resourcepacks",
         "shaderpacks",
+        "datapacks",
         "config",
         "defaultconfigs",
         "kubejs",

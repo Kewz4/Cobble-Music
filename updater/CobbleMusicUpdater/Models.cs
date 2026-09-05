@@ -17,6 +17,7 @@ internal sealed class UpdaterConfiguration
         "mods",
         "resourcepacks",
         "shaderpacks",
+        "datapacks",
         "config",
         "defaultconfigs",
         "kubejs",

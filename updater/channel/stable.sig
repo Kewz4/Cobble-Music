@@ -2,5 +2,5 @@
   "schemaVersion": 1,
   "algorithm": "Ed25519",
   "keyId": "cobble-music-release-1",
-  "signature": "xdwX8lDdzW3WeWuJmbFTW5l2I7gM69YMIYDpBp8paQm\u002BFRvIHU5mO9jDVy42MJ7xUd0lUi2TUjjFdoCTizjiDQ=="
+  "signature": "Ulq\u002BqOTHCDpNRLrM0yIDTN4I/1wQ5JEDAm7f6ueJBqXj7N5qq8W5cn\u002BBGEPX5nkkLxa8qf2x7VLOsu8FT5k6DQ=="
 }

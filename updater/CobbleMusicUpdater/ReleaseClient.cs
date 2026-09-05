@@ -16,6 +16,7 @@ internal sealed class ReleaseClient : IDisposable
     private const int MaxAssetPagesPerRelease = 10;
 
     private readonly HttpClient _http;
+    internal IReadOnlyList<RemoteRelease> VerifiedReleases { get; private set; } = [];
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -75,6 +76,7 @@ internal sealed class ReleaseClient : IDisposable
             }
         }).ToArray();
         RemoteRelease[] verified = await Task.WhenAll(tasks);
+        VerifiedReleases = verified;
         return BuildSequentialChain(verified, installedState);
     }
 

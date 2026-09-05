@@ -4,7 +4,7 @@ using System.Text;
 
 namespace CobbleMusicUpdater;
 
-internal sealed class UpdateEngine
+internal sealed partial class UpdateEngine
 {
     private const long DiskReserveBytes = 256L * 1024 * 1024;
 
@@ -12,17 +12,20 @@ internal sealed class UpdateEngine
     private readonly UpdaterConfiguration _configuration;
     private readonly Action<string> _log;
     private readonly IProgress<UpdateProgress>? _progress;
+    private readonly IReadOnlyList<RemoteRelease>? _verifiedCatalog;
 
     public UpdateEngine(
         UpdaterPaths paths,
         UpdaterConfiguration configuration,
         Action<string> log,
-        IProgress<UpdateProgress>? progress = null)
+        IProgress<UpdateProgress>? progress = null,
+        IReadOnlyList<RemoteRelease>? verifiedCatalog = null)
     {
         _paths = paths;
         _configuration = configuration;
         _log = log;
         _progress = progress;
+        _verifiedCatalog = verifiedCatalog;
     }
 
     public async Task CheckAndUpdateAsync(
@@ -31,6 +34,11 @@ internal sealed class UpdateEngine
         CancellationToken cancellationToken)
     {
         await TransactionStore.RecoverIfNeededAsync(_paths, BuildInfo.SupportedRoots, _log);
+        if (_verifiedCatalog is not null)
+        {
+            await ConvergeToLatestAsync(_verifiedCatalog, checkOnly, cancellationToken);
+            return;
+        }
         if (releaseChain.Count == 0)
         {
             _log("No applicable published update chain; launching the installed pack.");
@@ -413,10 +421,21 @@ internal sealed class UpdateEngine
             {
                 return false;
             }
+            if (HistoricalManifestPolicy.IsPlayerOwned(manifest, manifestFile)
+                || PathSafety.IsOptionalPlayerMod(manifestFile.Path))
+            {
+                continue;
+            }
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, manifestFile.Path);
-            if (!HistoricalManifestPolicy.IsPlayerOwned(manifest, manifestFile)
-                && !PathSafety.IsOptionalPlayerMod(manifestFile.Path)
-                && (!File.Exists(target) || new FileInfo(target).Length != manifestFile.Size))
+            if (!File.Exists(target))
+            {
+                return false;
+            }
+            PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
+            using var stream = new FileStream(
+                target, FileMode.Open, FileAccess.Read, FileShare.Read, 1024 * 1024, FileOptions.SequentialScan);
+            if (stream.Length != manifestFile.Size
+                || !PathSafety.IsExpectedHash(Convert.ToHexString(SHA256.HashData(stream)), manifestFile.Sha256))
             {
                 return false;
             }
@@ -680,9 +699,11 @@ internal sealed class UpdateEngine
         InstalledState previousState,
         UpdateManifest? signedBase,
         CancellationToken cancellationToken,
-        bool adoptExistingPostState = false)
+        bool adoptExistingPostState = false,
+        IReadOnlyCollection<ManifestFile>? reconciledFiles = null,
+        IReadOnlyCollection<LegacyCleanupFile>? reconciledCleanup = null)
     {
-        if (manifest.SchemaVersion == 2 && signedBase is null && !adoptExistingPostState)
+        if (manifest.SchemaVersion == 2 && signedBase is null && !adoptExistingPostState && reconciledFiles is null)
         {
             throw new InvalidDataException("Delta transaction is missing its signed base manifest.");
         }
@@ -734,9 +755,9 @@ internal sealed class UpdateEngine
 
         try
         {
-            IReadOnlyCollection<ManifestFile> payloadFiles = adoptExistingPostState
+            IReadOnlyCollection<ManifestFile> payloadFiles = reconciledFiles ?? (adoptExistingPostState
                 ? Array.Empty<ManifestFile>()
-                : ManifestParser.ManagedPayloadContents(manifest);
+                : ManifestParser.ManagedPayloadContents(manifest));
             int appliedFiles = 0;
             int totalFiles = payloadFiles.Count + manifest.SeedFiles.Count + manifest.DeletedFiles.Count;
             foreach (ManifestFile file in payloadFiles)
@@ -807,6 +828,8 @@ internal sealed class UpdateEngine
                 journal,
                 cancellationToken);
             await ApplyLegacyCleanupAsync(manifest.LegacyCleanup, backupDirectory, journal, cancellationToken);
+            if (reconciledCleanup is not null)
+                await ApplyLegacyCleanupAsync(reconciledCleanup, backupDirectory, journal, cancellationToken);
 
             foreach (ManifestFile seedFile in manifest.SeedFiles)
             {
@@ -837,7 +860,7 @@ internal sealed class UpdateEngine
                     continue;
                 }
                 bool canInitialize = !hasPreviousIdentity
-                    || (manifest.SchemaVersion == 2
+                    || ((manifest.SchemaVersion == 2 || reconciledFiles is not null)
                         && (!previouslyOfferedSeeds.Contains(seedFile.Path)
                             || reofferSeedPaths.Contains(seedFile.Path)));
                 if (!canInitialize)
@@ -874,7 +897,11 @@ internal sealed class UpdateEngine
                 appliedFiles++;
             }
 
-            if (manifest.SchemaVersion == 1)
+            if (reconciledFiles is not null)
+            {
+                await ValidateAdoptedPostStateBeforeCommitAsync(manifest, cancellationToken);
+            }
+            else if (manifest.SchemaVersion == 1)
             {
                 await ApplySchemaOneDeletesAsync(manifest, previousState, backupDirectory, journal, cancellationToken);
             }
@@ -913,7 +940,10 @@ internal sealed class UpdateEngine
             await TransactionStore.SaveAsync(_paths, journal, cancellationToken);
             await LocalStateStore.SaveStateAsync(_paths, newState, cancellationToken);
             File.Delete(TransactionStore.JournalPath(_paths));
-            TryDeleteDirectory(Path.GetDirectoryName(backupDirectory)!);
+            if (reconciledFiles is null)
+                TryDeleteDirectory(Path.GetDirectoryName(backupDirectory)!);
+            else
+                _log($"Previous files retained for recovery: {backupDirectory}");
         }
         catch
         {
@@ -1089,13 +1119,14 @@ internal sealed class UpdateEngine
     {
         foreach (ManifestFile file in manifest.Files)
         {
-            if (HistoricalManifestPolicy.IsPlayerOwned(manifest, file)) continue;
+            if (HistoricalManifestPolicy.IsPlayerOwned(manifest, file) || PathSafety.IsOptionalPlayerMod(file.Path)) continue;
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
             await ValidateExactTargetAsync(target, file, "Adopted managed file changed before commit", cancellationToken);
         }
         foreach (string path in manifest.DeletePaths.Concat(manifest.DeletedFiles.Select(file => file.Path)))
         {
+            if (PathSafety.IsOptionalPlayerMod(path)) continue;
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, path);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
             if (File.Exists(target) || Directory.Exists(target))
@@ -1391,6 +1422,7 @@ internal sealed class UpdateEngine
         var emptiedParents = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (LegacyCleanupFile legacyFile in legacyCleanup)
         {
+            if (PathSafety.IsOptionalPlayerMod(legacyFile.Path)) continue;
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, legacyFile.Path);
             if (!File.Exists(target))
             {

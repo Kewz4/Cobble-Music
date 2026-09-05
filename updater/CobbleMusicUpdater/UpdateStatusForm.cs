@@ -9,6 +9,7 @@ namespace CobbleMusicUpdater;
 internal readonly record struct UpdateStatusLayout(
     Size ClientSize,
     Rectangle TitleBounds,
+    Rectangle MinimizeBounds,
     Rectangle SubtitleBounds,
     Rectangle StatusBounds,
     Rectangle DetailBounds,
@@ -29,6 +30,7 @@ internal sealed class UpdateStatusForm : Form
     private readonly Label _statusLabel;
     private readonly Label _detailLabel;
     private readonly SmoothProgressIndicator _progressIndicator;
+    private readonly Button _minimizeButton;
     private readonly Button _closeButton;
     private readonly System.Windows.Forms.Timer _closeTimer;
     private readonly TransferMetricsTracker _transferMetrics = new(Stopwatch.Frequency);
@@ -51,10 +53,10 @@ internal sealed class UpdateStatusForm : Form
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterScreen;
         MaximizeBox = false;
-        MinimizeBox = false;
+        MinimizeBox = true;
         ControlBox = false;
-        ShowInTaskbar = false;
-        TopMost = true;
+        ShowInTaskbar = true;
+        TopMost = false;
         BackColor = Color.FromArgb(22, 21, 31);
         ForeColor = Color.FromArgb(247, 245, 255);
         Font = new Font("Segoe UI", 9F, FontStyle.Regular, GraphicsUnit.Point);
@@ -97,6 +99,22 @@ internal sealed class UpdateStatusForm : Form
             Name = "progressIndicator",
             IsIndeterminate = true
         };
+        _minimizeButton = new Button
+        {
+            Name = "minimizeButton",
+            Text = "−",
+            AccessibleName = "Minimize",
+            AccessibleDescription = "Minimize to the taskbar while the update continues.",
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.FromArgb(57, 53, 73),
+            ForeColor = Color.FromArgb(239, 230, 255),
+            Font = new Font("Segoe UI", 9F, FontStyle.Bold, GraphicsUnit.Point),
+            TabIndex = 0
+        };
+        _minimizeButton.FlatAppearance.BorderSize = 0;
+        _minimizeButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(84, 72, 113);
+        _minimizeButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(43, 38, 58);
+        _minimizeButton.Click += (_, _) => WindowState = FormWindowState.Minimized;
         _closeButton = new Button
         {
             Name = "closeButton",
@@ -131,6 +149,7 @@ internal sealed class UpdateStatusForm : Form
         Controls.Add(_statusLabel);
         Controls.Add(_detailLabel);
         Controls.Add(_progressIndicator);
+        Controls.Add(_minimizeButton);
         Controls.Add(_closeButton);
         AutoScaleDimensions = new SizeF(DesignDpi, DesignDpi);
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -142,8 +161,13 @@ internal sealed class UpdateStatusForm : Form
         get
         {
             const int CsDropShadow = 0x00020000;
+            const int WsSysMenu = 0x00080000;
+            const int WsMinimizeBox = 0x00020000;
             CreateParams parameters = base.CreateParams;
             parameters.ClassStyle |= CsDropShadow;
+            // Borderless forms omit these styles even when MinimizeBox is true.
+            // Keep native taskbar minimize/restore support without a title bar.
+            parameters.Style |= WsSysMenu | WsMinimizeBox;
             return parameters;
         }
     }
@@ -191,9 +215,19 @@ internal sealed class UpdateStatusForm : Form
 
         int top = Scale(22);
         int titleHeight = Math.Max(Scale(25), titlePreferredHeight);
-        var titleBounds = new Rectangle(outerLeft, top, contentWidth, titleHeight);
+        int minimizeWidth = Scale(36);
+        var minimizeBounds = new Rectangle(
+            clientWidth - outerRight - minimizeWidth,
+            top,
+            minimizeWidth,
+            Math.Max(Scale(28), titleHeight));
+        var titleBounds = new Rectangle(
+            outerLeft,
+            top,
+            Math.Max(1, contentWidth - minimizeWidth - Scale(8)),
+            titleHeight);
 
-        top = titleBounds.Bottom + Scale(3);
+        top = Math.Max(titleBounds.Bottom, minimizeBounds.Bottom) + Scale(3);
         int subtitleHeight = Math.Max(Scale(17), subtitlePreferredHeight);
         var subtitleBounds = new Rectangle(
             outerLeft + insetLeft,
@@ -232,6 +266,7 @@ internal sealed class UpdateStatusForm : Form
         return new UpdateStatusLayout(
             new Size(clientWidth, clientHeight),
             titleBounds,
+            minimizeBounds,
             subtitleBounds,
             statusBounds,
             detailBounds,
@@ -268,6 +303,8 @@ internal sealed class UpdateStatusForm : Form
     protected override void OnSizeChanged(EventArgs eventArgs)
     {
         base.OnSizeChanged(eventArgs);
+        // Reapply deferred progress/error layout when restored from the taskbar.
+        PerformLayout();
         ApplyRoundedRegion();
     }
 
@@ -394,7 +431,8 @@ internal sealed class UpdateStatusForm : Form
 
     private void ApplyRoundedRegion()
     {
-        if (!IsHandleCreated || ClientSize.Width <= 0 || ClientSize.Height <= 0)
+        if (!IsHandleCreated || WindowState == FormWindowState.Minimized
+            || ClientSize.Width <= 0 || ClientSize.Height <= 0)
         {
             return;
         }
@@ -404,7 +442,8 @@ internal sealed class UpdateStatusForm : Form
 
     private void LayoutContent()
     {
-        if (!IsHandleCreated || _layingOutContent || _titleLabel is null)
+        if (!IsHandleCreated || WindowState == FormWindowState.Minimized
+            || _layingOutContent || _titleLabel is null)
         {
             return;
         }
@@ -416,10 +455,11 @@ internal sealed class UpdateStatusForm : Form
             int activeClosePreferredWidth = _showCloseButton ? closePreferredSize.Width : 0;
             int expectedWidth = CalculateClientWidth(DeviceDpi, activeClosePreferredWidth);
             int contentWidth = Math.Max(1, expectedWidth - ScaleLogical(25) - ScaleLogical(25));
+            int titleWidth = Math.Max(1, contentWidth - ScaleLogical(36) - ScaleLogical(8));
             int insetContentWidth = Math.Max(1, contentWidth - ScaleLogical(1));
             UpdateStatusLayout layout = CalculateLayout(
                 DeviceDpi,
-                PreferredHeight(_titleLabel, contentWidth),
+                PreferredHeight(_titleLabel, titleWidth),
                 PreferredHeight(_subtitleLabel, insetContentWidth),
                 PreferredHeight(_statusLabel, contentWidth),
                 PreferredHeight(_detailLabel, insetContentWidth),
@@ -431,6 +471,7 @@ internal sealed class UpdateStatusForm : Form
                 ClientSize = layout.ClientSize;
             }
             _titleLabel.Bounds = layout.TitleBounds;
+            _minimizeButton.Bounds = layout.MinimizeBounds;
             _subtitleLabel.Bounds = layout.SubtitleBounds;
             _statusLabel.Bounds = layout.StatusBounds;
             _detailLabel.Bounds = layout.DetailBounds;

@@ -56,12 +56,15 @@ internal static class Program
 
     internal static async Task<int> RunUpdaterAsync(CommandLine options, IProgress<UpdateProgress>? progress)
     {
-        using var cancellation = new CancellationTokenSource(TimeSpan.FromMinutes(30));
+        _diagnosticLogPath = null;
         try
         {
             Report(progress, UpdatePhase.Checking, "Checking for updates…");
             UpdaterPaths paths = LocalStateStore.ResolvePaths(options.InstanceDirectory, options.MinecraftDirectory);
             _diagnosticLogPath = Path.Combine(paths.InstallationDirectory, "updater.log");
+            Log($"Updater executable version: {typeof(Program).Assembly.GetName().Version}");
+            Log($"Resolved instance root: {paths.InstanceDirectory}");
+            Log($"Resolved Minecraft directory: {paths.MinecraftDirectory}");
             using FileStream updateLock = LocalStateStore.AcquireOperationLock(paths);
             // Recover before opening mutable local configuration. A corrupt
             // configuration must not conceal an interrupted file transaction.
@@ -74,51 +77,25 @@ internal static class Program
             try
             {
                 Log("Checking GitHub Releases...");
-                releaseChain = await releaseClient.GetUpdateChainAsync(configuration, installedState, cancellation.Token);
+                releaseChain = await releaseClient.GetUpdateChainAsync(configuration, installedState, CancellationToken.None);
             }
             catch (Exception exception) when (configuration.AllowOfflineLaunch && IsExpectedNetworkFailure(exception))
             {
-                Log($"GitHub is unavailable ({exception.GetType().Name}); launching the last known-good pack.");
+                // Offline success is permitted only during the initial release check.
+                Log($"Initial release check is unavailable ({exception.GetType().Name}); offline launch is enabled, so starting the local pack without verifying updates.");
                 Report(progress, UpdatePhase.Fallback, "Couldn’t check for updates — starting Minecraft.");
                 return 0;
             }
             catch (Exception exception) when (IsExpectedNetworkFailure(exception))
             {
-                // This explicit non-zero return must happen inside the release
-                // check. Letting it escape would reach the generic Prism
-                // fallback below and accidentally defeat AllowOfflineLaunch.
                 Log($"GitHub is unavailable ({exception.GetType().Name}) and offline launch is disabled.");
                 Report(progress, UpdatePhase.Blocked, "Couldn’t verify updates — launch is blocked by updater policy.");
                 return NetworkFailureExitCode(configuration, exception);
             }
 
-            var engine = new UpdateEngine(paths, configuration, Log, progress);
-            try
-            {
-                await engine.CheckAndUpdateAsync(releaseChain, options.CheckOnly, cancellation.Token);
-                return 0;
-            }
-            catch (TransactionRecoveryException)
-            {
-                throw;
-            }
-            catch (Exception exception) when (!configuration.AllowOfflineLaunch && IsExpectedNetworkFailure(exception))
-            {
-                Log($"Update download failed ({exception.GetType().Name}) and offline launch is disabled.");
-                Report(progress, UpdatePhase.Blocked, "Couldn’t verify the update — launch is blocked by updater policy.");
-                return NetworkFailureExitCode(configuration, exception);
-            }
-            catch (Exception exception) when (options.PrismPrelaunch)
-            {
-                // Bad or unreachable remote data must never partially modify a
-                // friend's instance or turn an otherwise playable local pack
-                // into a blocked Prism launch. The engine rolls back before
-                // this point whenever it has started a transaction.
-                Log($"Update was not applied: {exception.Message}");
-                Log("Launching the last known-good local pack.");
-                Report(progress, UpdatePhase.Fallback, "Update was not applied — starting Minecraft.");
-                return 0;
-            }
+            var engine = new UpdateEngine(paths, configuration, Log, progress, releaseClient.VerifiedReleases);
+            await engine.CheckAndUpdateAsync(releaseChain, options.CheckOnly, CancellationToken.None);
+            return 0;
         }
         catch (TransactionRecoveryException exception)
         {
@@ -134,12 +111,12 @@ internal static class Program
             Report(progress, UpdatePhase.Blocked, "Another update check is already running.");
             return 1;
         }
-        catch (Exception exception) when (options.PrismPrelaunch)
+        catch (Exception exception)
         {
-            Log($"Updater setup issue: {exception.Message}");
-            Log("Launching without changing the local pack.");
-            Report(progress, UpdatePhase.Fallback, "Updater setup needs attention — starting Minecraft.");
-            return 0;
+            Log($"Updater setup, update, or integrity check failed: {exception.Message}");
+            Log("Update did not complete; client parity has not been verified. Older launcher wrappers may ignore this failure exit code.");
+            Report(progress, UpdatePhase.Blocked, "Update failed — pack not updated. Check updater.log before playing.");
+            return 1;
         }
     }
 
@@ -290,7 +267,7 @@ internal static class Program
         }
         catch
         {
-            // A diagnostic sink must never block a safe launcher fallback.
+            // A diagnostic sink must not change the updater's launch decision.
         }
     }
 

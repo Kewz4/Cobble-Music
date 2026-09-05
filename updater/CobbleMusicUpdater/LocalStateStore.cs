@@ -161,10 +161,14 @@ internal static class LocalStateStore
         // every launch, so 1.2.8 upgrades that exact legacy policy in memory.
         // Deliberately narrowed custom policies remain narrowed.
         string[] legacyRoots = ["mods", "resourcepacks", "config", "defaultconfigs", "kubejs", "scripts"];
-        if (config.AllowedRoots.Count == legacyRoots.Length
+        if ((config.AllowedRoots.Count == legacyRoots.Length
+                || (config.AllowedRoots.Count == legacyRoots.Length + 1
+                    && config.AllowedRoots.Contains("shaderpacks", StringComparer.OrdinalIgnoreCase)))
             && legacyRoots.All(root => config.AllowedRoots.Contains(root, StringComparer.OrdinalIgnoreCase)))
         {
-            config.AllowedRoots.Add("shaderpacks");
+            if (!config.AllowedRoots.Contains("shaderpacks", StringComparer.OrdinalIgnoreCase))
+                config.AllowedRoots.Add("shaderpacks");
+            config.AllowedRoots.Add("datapacks");
         }
         return config;
     }

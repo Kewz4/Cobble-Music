@@ -15,7 +15,7 @@ param(
     [ValidatePattern('^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')]
     [string]$Repository = 'Kewz4/Cobble-Music',
     [string]$PrivateKeyPath = (Join-Path $env:USERPROFILE '.cobble-music\keys\cobble-music-release-private.key'),
-    [string[]]$IncludeRoots = @('mods', 'resourcepacks', 'shaderpacks', 'defaultconfigs', 'kubejs', 'scripts'),
+    [string[]]$IncludeRoots = @('mods', 'resourcepacks', 'datapacks', 'shaderpacks', 'defaultconfigs', 'kubejs', 'scripts'),
     [string[]]$IncludeFiles = @(
         'config/cobble-music-bridge.json',
         'config/cobble-music-pack-version.json',
@@ -72,8 +72,15 @@ $PinnedVerifierExe = Join-Path $Root 'updater\verifier\win-x64\CobbleMusicUpdate
 $UpdaterChannelPath = Join-Path $Root 'updater\channel\stable.json'
 $UpdaterChannelSignaturePath = Join-Path $Root 'updater\channel\stable.sig'
 $RequiredVerifierVersion = '1.2.7'
-$RequiredUpdaterVersion = '1.2.15'
-$AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
+$RequiredUpdaterVersion = '1.2.16'
+$AllowedRoots = @('mods', 'resourcepacks', 'datapacks', 'shaderpacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
+$OfficialPackProfilePaths = @(
+    'config/packed_packs/profiles/resourcepacks/Default.profile.json',
+    'config/packed_packs/profiles/resourcepacks/Realistic.profile.json'
+)
+# Only these two official profiles are managed. Custom profiles, selection,
+# Packed Packs preferences and Iris settings retain their create-only policy.
+$IncludeFiles = @(@($IncludeFiles) + $OfficialPackProfilePaths | Sort-Object -Unique)
 $MaximumManifestSnapshotBytes = 8MB
 $MaximumSignatureSnapshotBytes = 64KB
 
@@ -100,6 +107,30 @@ function Get-RelativeSlashPath([string]$FullPath, [string]$Base) {
 
 function Get-Sha256([string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-OfficialPackProfileSources([string]$MinecraftDirectory, [string]$TemplateDirectory) {
+    foreach ($relative in $OfficialPackProfilePaths) {
+        $full = Join-Path $MinecraftDirectory $relative
+        if (-not [string]::IsNullOrWhiteSpace($TemplateDirectory)) {
+            $template = Join-Path $TemplateDirectory $relative
+            Assert-Under $template $TemplateDirectory
+            if (Test-Path -LiteralPath $template -PathType Leaf) { $full = $template }
+        }
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+            throw "Required official pack profile is missing from template and canonical instance: $relative"
+        }
+        $item = Get-Item -LiteralPath $full
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Official pack profile may not be a reparse point: $full"
+        }
+        $profile = Read-JsonFile -Path $full -Description 'Official pack profile'
+        $expectedName = [IO.Path]::GetFileName($relative).Replace('.profile.json', '')
+        if ([string]$profile.name -cne $expectedName -or $profile.packIds -isnot [Collections.IList]) {
+            throw "Official pack profile has an invalid name or packIds array: $relative"
+        }
+        [pscustomobject]@{ full = $item.FullName; path = $relative }
+    }
 }
 
 function Invoke-NativeText {
@@ -1078,9 +1109,14 @@ try {
     }
 
     Write-Host "Building authoritative file manifest from $SourceMinecraftDir"
-    $allManagedSourceFiles = @(
+    $managedSourceCandidates = @(
         Get-CobbleManagedSourceFiles -SourceMinecraftDir $SourceMinecraftDir -IncludeRoots $IncludeRoots `
             -IncludeFiles $IncludeFiles -AllowedRoots $AllowedRoots |
+            Where-Object { $OfficialPackProfilePaths -inotcontains $_.path }
+        Get-OfficialPackProfileSources -MinecraftDirectory $SourceMinecraftDir -TemplateDirectory $SeedTemplateDir
+    )
+    $allManagedSourceFiles = @(
+        $managedSourceCandidates |
             ForEach-Object {
                 $item = Get-Item -LiteralPath $_.full
                 [pscustomobject]@{ full = $_.full; path = $_.path; size = $item.Length; sha256 = (Get-Sha256 $_.full) }
@@ -1104,7 +1140,7 @@ try {
             -not ($shaderOptionSeedSources | Where-Object { $_.path -ieq $candidate.path })
     })
 
-    $effectiveSeedPaths = @($SeedFiles) + @($optionalAxiomSources | ForEach-Object { $_.path }) +
+    $effectiveSeedPaths = @($SeedFiles | Where-Object { $OfficialPackProfilePaths -inotcontains $_.Replace('\', '/') }) + @($optionalAxiomSources | ForEach-Object { $_.path }) +
         @($shaderOptionSeedSources | ForEach-Object { $_.path })
     $seedSourceFiles = @(
         Get-CobbleSeedSourceFiles -SourceMinecraftDir $SourceMinecraftDir -SeedFiles $effectiveSeedPaths `

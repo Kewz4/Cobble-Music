@@ -1,9 +1,9 @@
 Set-StrictMode -Version Latest
 
-$script:AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
+$script:AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'datapacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $script:Sha256Pattern = '^[0-9a-f]{64}$'
 $script:VersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-$script:PinnedUpdaterVersion = '1.2.15'
+$script:PinnedUpdaterVersion = '1.2.16'
 $script:MaximumReleaseAssetCount = 999
 $script:ReservedReleaseMetadataAssetCount = 2
 $script:MaximumPublicReleaseCount = 499
@@ -274,7 +274,7 @@ function Get-CobbleManagedSourceFiles {
 
         # Both loaders consume top-level artifacts. Hidden `.index` folders and
         # other directories below these roots are generated runtime state.
-        $rootFiles = if ($rootName -in @('mods', 'resourcepacks')) {
+        $rootFiles = if ($rootName -in @('mods', 'resourcepacks', 'datapacks')) {
             $topLevelFiles = @(Get-ChildItem -LiteralPath $rootPath -File -Force)
             $approvedPattern = if ($rootName -ceq 'mods') {
                 '\.jar(?:\.disabled)?$'

@@ -134,13 +134,13 @@ $badMinimumBaseline = $baselineManifest.PSObject.Copy()
 $badMinimumBaseline.minimumUpdaterVersion = '1.02.0'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $badMinimumBaseline } 'Non-canonical v1 minimumUpdaterVersion was accepted for staged resume.'
 $futureMinimumBaseline = $baselineManifest.PSObject.Copy()
-$futureMinimumBaseline.minimumUpdaterVersion = '1.2.15'
+$futureMinimumBaseline.minimumUpdaterVersion = '999.0.0'
 Assert-Throws { Assert-CobbleV1Manifest -Manifest $futureMinimumBaseline } 'V1 requiring a newer-than-pinned updater was accepted for staged resume.'
 $nonCanonicalDeltaMinimum = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
 $nonCanonicalDeltaMinimum.minimumUpdaterVersion = '1.02.10'
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $nonCanonicalDeltaMinimum -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'Non-canonical v2 minimumUpdaterVersion was accepted for staged resume.'
 $futureDeltaMinimum = ($manifest | ConvertTo-Json -Depth 12) | ConvertFrom-Json
-$futureDeltaMinimum.minimumUpdaterVersion = '1.2.15'
+$futureDeltaMinimum.minimumUpdaterVersion = '999.0.0'
 Assert-Throws { Assert-CobbleDeltaManifest -Manifest $futureDeltaMinimum -BaseManifest $baseManifest -ExpectedBaseManifestSha256 $baseHash } 'V2 requiring a newer-than-pinned updater was accepted for staged resume.'
 
 $seed = New-Record 'config/ReactiveMusic.json5' 42 '9'
@@ -698,6 +698,70 @@ foreach ($snapshotLimitFragment in @(
     'Open-CobbleLockedFileSnapshot -Path $SignaturePath -MaximumBytes $MaximumSignatureSnapshotBytes'
 )) {
     Assert-True ($publisherText.Contains($snapshotLimitFragment, [StringComparison]::Ordinal)) "Publisher lost an updater-parity snapshot limit: $snapshotLimitFragment"
+}
+
+# Exercise the publisher's actual inventory statements, not a second copy of
+# its ownership rules. Reviewed official profiles must reach existing clients;
+# custom profiles, active selection and Iris remain create-only defaults.
+$profileFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) "cobble-official-profiles-$([Guid]::NewGuid().ToString('N'))"
+try {
+    $profileSourceRoot = Join-Path $profileFixtureRoot 'minecraft'
+    $profileTemplateRoot = Join-Path $profileFixtureRoot 'templates'
+    $officialPaths = @(
+        'config/packed_packs/profiles/resourcepacks/Default.profile.json',
+        'config/packed_packs/profiles/resourcepacks/Realistic.profile.json'
+    )
+    foreach ($profileName in @('Default', 'Realistic')) {
+        $relative = "config/packed_packs/profiles/resourcepacks/$profileName.profile.json"
+        foreach ($fixtureDirectory in @($profileSourceRoot, $profileTemplateRoot)) {
+            $profilePath = Join-Path $fixtureDirectory $relative
+            [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($profilePath)) | Out-Null
+            $packId = if ($fixtureDirectory -ceq $profileTemplateRoot) { 'file/reviewed.zip' } else { 'file/local.zip' }
+            [IO.File]::WriteAllText($profilePath, (ConvertTo-Json -InputObject @{ name = $profileName; packIds = @($packId) }))
+        }
+    }
+    $customProfile = 'config/packed_packs/profiles/resourcepacks/My Custom.profile.json'
+    [IO.File]::WriteAllText((Join-Path $profileSourceRoot $customProfile), '{"name":"My Custom","packIds":["file/personal.zip"]}')
+    [IO.File]::WriteAllText((Join-Path $profileSourceRoot 'config/iris.properties'), 'shaderPack=Personal.zip')
+    [IO.File]::WriteAllText((Join-Path $profileSourceRoot 'options.txt'), 'resourcePacks:["file/personal.zip"]')
+    [IO.File]::WriteAllText((Join-Path $profileSourceRoot 'config/managed.json'), '{}')
+
+    $profileHarnessParts = [Collections.Generic.List[string]]::new()
+    $profileHarnessParts.Add('param($SourceMinecraftDir, $SeedTemplateDir, $FixtureOfficialPaths)')
+    foreach ($functionName in @('Assert-Under', 'Read-JsonFile', 'Get-Sha256', 'Get-OfficialPackProfileSources')) {
+        $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName }, $true)
+        Assert-True ($null -ne $definition) "Official profile inventory helper is missing: $functionName"
+        $profileHarnessParts.Add($definition.Extent.Text)
+    }
+    $profileHarnessParts.Add('$IncludeRoots = @("mods"); $AllowedRoots = @("mods", "config"); $IncludeFiles = @("config/managed.json")')
+    $profileHarnessParts.Add('$SeedFiles = @("options.txt") + @($FixtureOfficialPaths); $SeedRoots = @("config"); $optionalAxiomSources = @(); $shaderOptionSeedSources = @()')
+    foreach ($assignmentName in @('OfficialPackProfilePaths', 'IncludeFiles', 'managedSourceCandidates', 'effectiveSeedPaths', 'seedSourceFiles')) {
+        $assignment = $ast.Find({ param($node)
+            $node -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $node.Left -is [Management.Automation.Language.VariableExpressionAst] -and
+                $node.Left.VariablePath.UserPath -eq $assignmentName
+        }, $true)
+        Assert-True ($null -ne $assignment) "Publisher ownership assignment is missing: $assignmentName"
+        $profileHarnessParts.Add($assignment.Extent.Text)
+    }
+    $profileHarnessParts.Add('[pscustomobject]@{ managed = @($managedSourceCandidates); seeds = @($seedSourceFiles) }')
+    $profileHarness = [scriptblock]::Create($profileHarnessParts -join [Environment]::NewLine)
+    $profileInventory = & $profileHarness $profileSourceRoot $profileTemplateRoot $officialPaths
+    Assert-True ($profileInventory.managed.Count -eq 3) 'Official profile inventory widened beyond the two official files and existing explicit config.'
+    foreach ($relative in $officialPaths) {
+        $managedProfile = @($profileInventory.managed | Where-Object path -ceq $relative)
+        Assert-True ($managedProfile.Count -eq 1 -and $managedProfile[0].full -ceq (Join-Path $profileTemplateRoot $relative)) "Official profile did not use its reviewed managed template: $relative"
+        Assert-True (@($profileInventory.seeds | Where-Object path -ceq $relative).Count -eq 0) "Official profile remained a seed when also explicitly requested as one: $relative"
+    }
+    foreach ($playerOwned in @($customProfile, 'options.txt', 'config/iris.properties')) {
+        Assert-True (@($profileInventory.managed | Where-Object path -ceq $playerOwned).Count -eq 0) "Player-owned profile/setting became managed: $playerOwned"
+        Assert-True (@($profileInventory.seeds | Where-Object path -ceq $playerOwned).Count -eq 1) "Player-owned profile/setting lost its create-only default: $playerOwned"
+    }
+}
+finally {
+    $profileTempPrefix = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if (-not [IO.Path]::GetFullPath($profileFixtureRoot).StartsWith($profileTempPrefix + 'cobble-official-profiles-', [StringComparison]::OrdinalIgnoreCase)) { throw 'Unexpected official profile fixture cleanup path.' }
+    if ([IO.Directory]::Exists($profileFixtureRoot)) { [IO.Directory]::Delete($profileFixtureRoot, $true) }
 }
 
 $newPayloadFunction = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'New-PayloadParts' }, $true)
