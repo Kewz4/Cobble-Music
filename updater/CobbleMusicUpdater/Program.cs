@@ -34,6 +34,12 @@ internal static class Program
             {
                 return VerifyUpdaterChannel(args);
             }
+            // [prestage] Swap helper started by a finished updater run (UpdaterPrestageSwap.cs).
+            if (args.Contains(UpdaterPrestageSwap.HelperSwitch, StringComparer.Ordinal))
+            {
+                return UpdaterPrestageSwap.RunHelper(args);
+            }
+            // [/prestage]
             if (args.Contains("--help", StringComparer.Ordinal) || args.Contains("-h", StringComparer.Ordinal))
             {
                 PrintUsage();
@@ -69,6 +75,9 @@ internal static class Program
             // Recover before opening mutable local configuration. A corrupt
             // configuration must not conceal an interrupted file transaction.
             await TransactionStore.RecoverIfNeededAsync(paths, BuildInfo.SupportedRoots, Log);
+            // [prestage] Background download of a signed newer updater (UpdaterPrestage.cs); never changes this launch's result.
+            using UpdaterPrestageSession? prestage = UpdaterPrestageSession.TryStart(options, paths, Log);
+            // [/prestage]
             UpdaterConfiguration configuration = LocalStateStore.LoadConfiguration(paths);
             InstalledState installedState = LocalStateStore.LoadState(paths);
             using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(configuration.NetworkTimeoutSeconds));
@@ -95,6 +104,12 @@ internal static class Program
 
             var engine = new UpdateEngine(paths, configuration, Log, progress, releaseClient.VerifiedReleases);
             await engine.CheckAndUpdateAsync(releaseChain, options.CheckOnly, CancellationToken.None);
+            // [prestage] Only after a successful run: bounded wait, then start the swap helper if a verified updater is staged.
+            if (prestage is not null)
+            {
+                await prestage.FinishAsync(progress);
+            }
+            // [/prestage]
             return 0;
         }
         catch (TransactionRecoveryException exception)

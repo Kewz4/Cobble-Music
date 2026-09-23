@@ -14,6 +14,9 @@ internal static class Program
 
     public static async Task<int> Main(string[] args)
     {
+        // [prestage] fixture/verifier-double entry for tests/Test-UpdaterPrestageBootstrap.ps1 (PrestageTests.cs)
+        if (PrestageFixtureCli.Handles(args)) { return await PrestageFixtureCli.RunAsync(args); }
+        // [/prestage]
         string tempRoot = Path.Combine(Path.GetTempPath(), "cobble-updater-delta-tests-" + Guid.NewGuid().ToString("N"));
         try
         {
@@ -60,6 +63,7 @@ internal static class Program
             await TestConditionalKeyCollisionMigrationAsync(Path.Combine(tempRoot, "key-collision-migration"));
             await TestJournalCommitBoundaryAsync(Path.Combine(tempRoot, "journal"));
             await TestCrossVolumeTransactionRecoveryAsync(Path.Combine(tempRoot, "cross-volume"));
+            await PrestageTests.RunAllAsync(Path.Combine(tempRoot, "prestage")); // [prestage]
             Console.WriteLine("Schema-v2 delta, release-chain, exact-baseline adoption, base-integrity, and journal commit-boundary checks passed.");
             return 0;
         }
