@@ -862,7 +862,7 @@ try {
         Where-Object { $_.FullName -cne $sourcePipelineTest -and $_.FullName -cne $sourceReproducibilityTest } |
         Sort-Object Name)
     foreach ($test in $ordinaryTests) {
-        Invoke-Checked "Running $($test.Name)..." { & pwsh -NoProfile -File $test.FullName }
+        Invoke-Checked "Running $($test.Name)..." { & pwsh -NoProfile -File $test.FullName 2>&1 }
     }
     $dotnetTestProjects = @(Get-ChildItem -LiteralPath (Join-Path $sourceRoot 'updater') -Filter '*.Tests.csproj' -File -Recurse | Sort-Object FullName)
     $consoleTestMarkers = @{
@@ -908,13 +908,13 @@ try {
             -UpdaterExePath $stagedExe `
             -BootstrapPath $stagedBootstrap `
             -ExpectedVersion $version `
-            -ExpectedRepository $Repository
+            -ExpectedRepository $Repository 2>&1
     }
     Invoke-Checked 'Proving the exact release artifact against cold, warm, and distinct-root commit builds...' {
         & pwsh -NoProfile -File $sourceReproducibilityTest `
             -SourceRepositoryRoot $Root `
             -SourceCommit $commit `
-            -ExpectedExePath $stagedExe
+            -ExpectedExePath $stagedExe 2>&1
     }
     Assert-SourceStillBound $commit
 
