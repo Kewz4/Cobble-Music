@@ -241,6 +241,7 @@ internal sealed partial class UpdateEngine
             string parts = Path.Combine(work, "parts");
             Directory.CreateDirectory(parts);
             using var client = new ReleaseClient(TimeSpan.FromSeconds(_configuration.NetworkTimeoutSeconds));
+            AttachDownloadDiagnostics(client);
             foreach (PayloadPart part in payload.Parts)
             {
                 _log($"Downloading repair source {origin.Manifest.Version}/{part.Name}...");

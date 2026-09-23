@@ -8,7 +8,7 @@ using System.Text.Json;
 using System.Windows.Forms;
 using CobbleMusicUpdater;
 
-internal static class Program
+internal static partial class Program
 {
     private static readonly CancellationToken NoCancellation = CancellationToken.None;
 
@@ -51,6 +51,7 @@ internal static class Program
             await TestReusableAssembledArchiveAsync(Path.Combine(tempRoot, "assembled-retry"));
             await TestAdversarialAssetDownloadsAsync(Path.Combine(tempRoot, "downloads"));
             await TestPaginatedReleaseAssetsAsync();
+            await TestNetworkResilienceAsync(Path.Combine(tempRoot, "network")); // 1.2.18 net track (NetworkTests.cs)
             await TestExactBaselineAdoptionAsync(Path.Combine(tempRoot, "adoption"));
             await TestExactDeltaBaseValidationAsync(Path.Combine(tempRoot, "delta"));
             await TestDeltaApplyTimeValidationAsync(Path.Combine(tempRoot, "delta-toctou"));

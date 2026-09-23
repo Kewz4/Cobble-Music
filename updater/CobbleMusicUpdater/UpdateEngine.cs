@@ -492,6 +492,7 @@ internal sealed partial class UpdateEngine
             else
             {
                 using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(_configuration.NetworkTimeoutSeconds));
+                AttachDownloadDiagnostics(releaseClient);
                 foreach (PayloadPart part in manifest.Payload.Parts)
                 {
                     string partPath = Path.Combine(partsDirectory, part.Name);

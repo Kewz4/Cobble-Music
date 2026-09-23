@@ -72,6 +72,8 @@ internal static class Program
             UpdaterConfiguration configuration = LocalStateStore.LoadConfiguration(paths);
             InstalledState installedState = LocalStateStore.LoadState(paths);
             using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(configuration.NetworkTimeoutSeconds));
+            // 1.2.18 net track: log + retry notice + verified metadata cache.
+            releaseClient.AttachReleaseCheck(paths, Log, message => Report(progress, UpdatePhase.Checking, message));
 
             IReadOnlyList<RemoteRelease> releaseChain;
             try
@@ -82,8 +84,9 @@ internal static class Program
             catch (Exception exception) when (configuration.AllowOfflineLaunch && IsExpectedNetworkFailure(exception))
             {
                 // Offline success is permitted only during the initial release check.
-                Log($"Initial release check is unavailable ({exception.GetType().Name}); offline launch is enabled, so starting the local pack without verifying updates.");
-                Report(progress, UpdatePhase.Fallback, "Couldn’t check for updates — starting Minecraft.");
+                // 1.2.18 net track: HTTP status/rate-limit detail in the log and on the card.
+                Log($"Initial release check is unavailable ({ReleaseCheckDiagnostics.Describe(exception)}); offline launch is enabled, so starting the local pack without verifying updates.");
+                Report(progress, UpdatePhase.Fallback, ReleaseCheckDiagnostics.FallbackCardMessage(exception));
                 return 0;
             }
             catch (Exception exception) when (IsExpectedNetworkFailure(exception))
