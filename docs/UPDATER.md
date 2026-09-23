@@ -101,8 +101,32 @@ also remains respected.
 
 Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
-An **unrecoverable local transaction** is the sole fail-closed case: Prism is
-blocked so it cannot start with a half-applied pack.
+A run that ends **Blocked** (local recovery needs attention, an integrity or
+apply failure, an unfinished install another process still holds, or
+`allowOfflineLaunch: false` without GitHub) fails the launch. The pinned
+friend bootstrap ignores the updater's exit code, so since 1.2.18 the updater
+itself ends its verified pre-launch `powershell.exe` (parent chain
+powershell -> prismlauncher, checked with creation-time guards) with exit code
+3; Prism then fails the pre-launch step and does not start Minecraft. Under the
+legacy direct command the updater's own exit code 1 does the same.
+
+### One updater per instance (lock v2, 1.2.18)
+
+`update.lock` keeps the 1.2.17 file and `FileShare.None`, so old and new
+builds still exclude each other. Only a sharing violation counts as busy
+(10 attempts, 250 ms apart); other I/O errors are real errors. The holder
+writes `update.lock.owner.json` (pid, start time, exe, Prism chain, phase,
+2 s heartbeat, progress) and listens on
+`Local\CobbleMusicUpdater.Stop.<identity hash>`. A later launch classifies the
+holder from OS facts only: an orphan (its Prism launch is gone) is taken over
+after a 3 s notice, or after up to 5 minutes when it is installing files; a
+live holder is waited for with a countdown and only a person can choose
+**Stop it and continue** (after 10 minutes, or when it stops responding); an
+unidentified holder is never touched and the launch continues after 30 s only
+when no install journal exists. A takeover signals the stop event, waits 15 s,
+re-validates pid, start time and image (this instance's
+`cobble-music-updater\CobbleMusicUpdater.exe` only), terminates, reacquires,
+and recovers any journal before doing anything else.
 
 ## What players see at launch
 
@@ -117,8 +141,14 @@ ETA estimate.
 
 On an ordinary no-update, offline-fallback, or successful-update launch, it
 briefly shows the result and closes automatically before Minecraft starts. A
-local recovery or concurrent-update error stays visible and blocks launch,
-because starting a partly updated pack would be unsafe.
+Blocked result stops the Prism launch (see above), stays visible with a
+**Close (20)** countdown, and closes itself after 20 seconds.
+
+The **X** is safe at any time: while checking or downloading it cancels the
+run and closes within 5 seconds (downloads resume by Range next time); while
+files are being installed or recovered it rolls the install back first
+("Finishing safely"), and a second X asks before a hard exit, which also stops
+the Prism launch.
 
 The GUI build also writes its own rotating diagnostic log at
 `minecraft/cobble-music-updater/updater.log`; it never writes to Minecraft's
@@ -144,6 +174,15 @@ signed `modpack-v<version>` release format.
   the card shows "Connection stalled — retrying…" (or similar).
 - **Check budget.** The release check (release list, asset lists, manifests)
   has 90 s in total. On expiry the updater takes the normal offline fallback.
+- **What counts as a network failure once retries are spent** (1.2.18
+  integration): `HttpRequestException` (including rate limits), timeouts
+  (idle, budget, header), `HttpIOException` (body ended before its
+  Content-Length), an `IOException` caused by a socket reset, and a body that
+  ended cleanly below its signed size. During the check that is the offline
+  fallback; after the check it launches the current pack only when offline
+  launch is allowed and no install journal exists. Any other I/O error (disk
+  full, a locked file) stays Blocked. The X and a later launch's stop event
+  always end as a cancellation, never as an offline fallback.
 - **Verified metadata cache.** Each release's signed manifest and signature
   are kept in `%LOCALAPPDATA%\CobbleMusicUpdater\<instance>\cache\releases\<release id>.json`,
   keyed by release id, tag and the manifest/signature asset id, name, size and

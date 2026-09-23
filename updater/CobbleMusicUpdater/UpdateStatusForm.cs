@@ -117,15 +117,16 @@ internal sealed class UpdateStatusForm : Form
         _minimizeButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(84, 72, 113);
         _minimizeButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(43, 38, 58);
         _minimizeButton.Click += (_, _) => WindowState = FormWindowState.Minimized;
-        // Kewz's request: an always-available X that fully terminates the updater
-        // like an End Task, even while an update is running. Downloads resume on
-        // the next launch; a mid-transaction kill is recovered from the journal.
+        // Kewz's request: an always-available X. [lock-v2] It now stops the run
+        // safely: outside a transaction it cancels and exits within 5 s (downloads
+        // resume by Range); during Applying/Recovering it rolls back first, and a
+        // second X asks before a hard exit (see OnForceCloseClicked).
         _forceCloseButton = new Button
         {
             Name = "forceCloseButton",
             Text = "×",
             AccessibleName = "Close updater",
-            AccessibleDescription = "Immediately closes the updater; a running update resumes on the next launch.",
+            AccessibleDescription = "Stops the update safely and closes the updater; a download resumes on the next launch.",
             FlatStyle = FlatStyle.Flat,
             BackColor = Color.FromArgb(57, 53, 73),
             ForeColor = Color.FromArgb(239, 230, 255),
@@ -135,7 +136,7 @@ internal sealed class UpdateStatusForm : Form
         _forceCloseButton.FlatAppearance.BorderSize = 0;
         _forceCloseButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(150, 68, 88);
         _forceCloseButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(110, 46, 62);
-        _forceCloseButton.Click += (_, _) => Environment.Exit(ExitCode);
+        _forceCloseButton.Click += (_, _) => OnForceCloseClicked(); // [lock-v2]
         _closeButton = new Button
         {
             Name = "closeButton",
@@ -152,6 +153,12 @@ internal sealed class UpdateStatusForm : Form
         _closeButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(77, 53, 120);
         _closeButton.Click += (_, _) =>
         {
+            // [lock-v2] While another updater holds the lock, this button is "Stop it and continue".
+            if (_offeringTakeover)
+            {
+                AcceptTakeoverOffer();
+                return;
+            }
             _canClose = true;
             Close();
         };
@@ -382,6 +389,16 @@ internal sealed class UpdateStatusForm : Form
             ExitCode = 1;
             DisplayProgress(new UpdateProgress(UpdatePhase.Blocked, $"Updater failed: {exception.Message}"));
         }
+        // [lock-v2] The X (or a later launch's stop event) asked to close: close as soon as the run has ended.
+        _runFinished = true;
+        _runCompletion.TrySetResult();
+        if (_closeRequested || RunControl.Current?.Reason == CancelReason.PeerStop)
+        {
+            _canClose = true;
+            Close();
+            return;
+        }
+        // [/lock-v2]
 
         if (ExitCode == 0)
         {
@@ -391,9 +408,11 @@ internal sealed class UpdateStatusForm : Form
         {
             _statusLabel.ForeColor = Color.FromArgb(255, 193, 204);
             _detailLabel.ForeColor = Color.FromArgb(223, 167, 178);
+            _offeringTakeover = false; // [lock-v2]
             _showCloseButton = true;
             _progressIndicator.Visible = false;
             _closeButton.Visible = true;
+            StartFailureAutoClose(); // [lock-v2]
             PerformLayout();
         }
     }
@@ -407,9 +426,10 @@ internal sealed class UpdateStatusForm : Form
 
         _statusLabel.Text = Describe(update);
         TransferMetrics transferMetrics = _transferMetrics.Observe(update, Stopwatch.GetTimestamp());
-        _detailLabel.Text = update.Phase == UpdatePhase.Downloading && update.TotalBytes > 0
+        _detailLabel.Text = update.Detail ?? (update.Phase == UpdatePhase.Downloading && update.TotalBytes > 0 // [lock-v2] Detail
             ? TransferMetricsFormatter.FormatDownloadDetail(update, transferMetrics)
-            : DetailFor(update);
+            : DetailFor(update));
+        ShowTakeoverOffer(update.Phase == UpdatePhase.WaitingCanStop); // [lock-v2]
         switch (update.Phase)
         {
             case UpdatePhase.Downloading when update.TotalBytes > 0:
@@ -455,7 +475,8 @@ internal sealed class UpdateStatusForm : Form
         UpdatePhase.Applying => "Applying a recoverable local update",
         UpdatePhase.Complete => "Launching Minecraft…",
         UpdatePhase.Fallback => "Your local pack was left unchanged",
-        UpdatePhase.Blocked => "Minecraft will wait until this is resolved",
+        UpdatePhase.Blocked => "Check updater.log before playing", // [lock-v2] the old text promised a wait the bootstrap never did
+        UpdatePhase.Waiting or UpdatePhase.WaitingCanStop => "Waiting for the other update to finish", // [lock-v2]
         _ => ""
     };
 
@@ -528,9 +549,147 @@ internal sealed class UpdateStatusForm : Form
         if (disposing)
         {
             _closeTimer.Dispose();
+            _failureCloseTimer?.Dispose(); // [lock-v2]
         }
         base.Dispose(disposing);
     }
+
+    // ---- [lock-v2] X button, takeover offer and failure auto-close ----------------------------------------------
+
+    /// <summary>Lock-lifecycle §7.5: the failure card closes itself after this long, with a countdown on its button.</summary>
+    internal const int FailureAutoCloseSeconds = 20;
+
+    private readonly TaskCompletionSource _runCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private System.Windows.Forms.Timer? _failureCloseTimer;
+    private int _failureCloseRemaining;
+    private bool _runFinished;
+    private bool _closeRequested;
+    private bool _cancelRequested;
+    private bool _offeringTakeover;
+
+    private async void OnForceCloseClicked()
+    {
+        RunControl? run = RunControl.Current;
+        ForceCloseAction action = ForceClosePolicy.Decide(
+            _runFinished,
+            run?.OwnTransactionMayBePending ?? false,
+            _cancelRequested);
+        switch (action)
+        {
+            case ForceCloseAction.ExitNow:
+                if (_runFinished)
+                {
+                    _canClose = true;
+                    Close();
+                }
+                else
+                {
+                    Environment.Exit(ExitCode);
+                }
+                return;
+            case ForceCloseAction.CancelThenExit:
+                _cancelRequested = true;
+                _closeRequested = true;
+                run?.RequestCancel(CancelReason.UserClose);
+                ShowStatus("Stopping the update…", "Closing in a moment — a download resumes on the next launch");
+                await Task.WhenAny(_runCompletion.Task, Task.Delay(ForceClosePolicy.CooperativeExitWait));
+                if (_runFinished)
+                {
+                    return; // StartUpdateAsync closes the card now that the run has ended.
+                }
+                if (run?.OwnTransactionMayBePending == true)
+                {
+                    // An install began just as the X was pressed: never walk away from a pending transaction.
+                    ShowFinishingSafely();
+                    return;
+                }
+                Environment.Exit(ExitCode);
+                return;
+            case ForceCloseAction.FinishSafely:
+                _cancelRequested = true;
+                _closeRequested = true;
+                run?.RequestCancel(CancelReason.UserClose);
+                ShowFinishingSafely();
+                return; // StartUpdateAsync closes the card once the rollback has finished.
+            case ForceCloseAction.ConfirmHardExit:
+                DialogResult answer = MessageBox.Show(
+                    this,
+                    "Your pack is being put back the way it was. Closing now can leave it half-installed: "
+                    + "this launch will not start Minecraft, and the next launch will repair the pack.\n\nClose anyway?",
+                    "Kewz's Cobblemon",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2);
+                if (answer != DialogResult.Yes || _runFinished)
+                {
+                    return;
+                }
+                run?.Log("The player force-closed the updater during an install; stopping this Prism launch.");
+                LaunchGate.FailPreLaunch(_options.PrismPrelaunch, run?.Log ?? (_ => { }));
+                Environment.Exit(1);
+                return;
+        }
+    }
+
+    private void ShowFinishingSafely() =>
+        ShowStatus("Finishing safely — undoing the unfinished install", "Closing as soon as your pack is back to how it was");
+
+    private void ShowStatus(string status, string detail)
+    {
+        if (IsDisposed)
+        {
+            return;
+        }
+        _statusLabel.Text = status;
+        _detailLabel.Text = detail;
+        _progressIndicator.IsIndeterminate = true;
+    }
+
+    /// <summary>Shows or withdraws "Stop it and continue" (the footer button) while another updater holds the lock.</summary>
+    private void ShowTakeoverOffer(bool offer)
+    {
+        if (offer == _offeringTakeover || _runFinished)
+        {
+            return;
+        }
+        _offeringTakeover = offer;
+        _closeButton.Text = offer ? "Stop it and continue" : "Close";
+        _closeButton.Visible = offer;
+        _showCloseButton = offer;
+        _progressIndicator.Visible = !offer;
+        PerformLayout();
+    }
+
+    private void AcceptTakeoverOffer()
+    {
+        RunControl.Current?.AcceptTakeover();
+        ShowTakeoverOffer(false);
+        ShowStatus("Stopping the other update…", "Your download continues where it stopped");
+    }
+
+    private void StartFailureAutoClose()
+    {
+        _failureCloseRemaining = FailureAutoCloseSeconds;
+        _closeButton.Text = FailureCloseText(_failureCloseRemaining);
+        _failureCloseTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+        _failureCloseTimer.Tick += (_, _) =>
+        {
+            _failureCloseRemaining--;
+            if (_failureCloseRemaining <= 0)
+            {
+                _failureCloseTimer.Stop();
+                _canClose = true;
+                Close();
+                return;
+            }
+            _closeButton.Text = FailureCloseText(_failureCloseRemaining);
+        };
+        _failureCloseTimer.Start();
+    }
+
+    internal static string FailureCloseText(int secondsRemaining) => $"Close ({secondsRemaining})";
+
+    // ---- [/lock-v2] --------------------------------------------------------------------------------------------
 
     private static GraphicsPath CreateRoundedPath(Rectangle bounds, int radius)
     {
