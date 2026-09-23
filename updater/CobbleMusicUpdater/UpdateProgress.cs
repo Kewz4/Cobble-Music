@@ -15,7 +15,11 @@ internal enum UpdatePhase
     // [lock-v2] Waiting for another updater that holds update.lock (countdown in Detail).
     Waiting,
     // [lock-v2] Waiting, and the card offers "Stop it and continue".
-    WaitingCanStop
+    WaitingCanStop,
+
+
+    // 1.2.18 jvm track: status texts of the memory-settings feature (JvmSettings/JvmSettingsText.cs).
+    MemorySettings
 }
 
 internal sealed record UpdateProgress(

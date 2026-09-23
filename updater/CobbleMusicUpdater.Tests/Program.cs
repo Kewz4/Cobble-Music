@@ -46,6 +46,7 @@ internal static partial class Program
             TestLegacyConfigurationRootMigration(Path.Combine(tempRoot, "configuration-migration"));
             TestOfflineLaunchPolicy();
             TestProcessTreeIdentityAndTermination();
+            JvmSettingsTests.Run(Path.Combine(tempRoot, "jvm-settings")); // 1.2.18 jvm track
             TestManagedFileIntegrity(Path.Combine(tempRoot, "managed-integrity"));
             await TestCatalogConvergenceAsync(Path.Combine(tempRoot, "catalog"));
             await TestUpdaterSetupFailureBlocksAsync(Path.Combine(tempRoot, "missing-instance"));

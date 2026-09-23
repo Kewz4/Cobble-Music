@@ -400,7 +400,8 @@ internal sealed class UpdateStatusForm : Form
         }
         // [/lock-v2]
 
-        if (ExitCode == 0)
+        // 1.2.18 jvm track: exit code 3 means the launch was stopped on purpose to restart Prism; close like a success.
+        if (ExitCode == 0 || ExitCode == JvmSettingsCoordinator.RestartExitCode)
         {
             _closeTimer.Start();
         }
@@ -475,8 +476,11 @@ internal sealed class UpdateStatusForm : Form
         UpdatePhase.Applying => "Applying a recoverable local update",
         UpdatePhase.Complete => "Launching Minecraft…",
         UpdatePhase.Fallback => "Your local pack was left unchanged",
-        UpdatePhase.Blocked => "Check updater.log before playing", // [lock-v2] the old text promised a wait the bootstrap never did
+        UpdatePhase.Blocked => "Minecraft will wait until this is resolved",
         UpdatePhase.Waiting or UpdatePhase.WaitingCanStop => "Waiting for the other update to finish", // [lock-v2]
+
+
+        UpdatePhase.MemorySettings => JvmSettingsText.DetailFor(update.Message), // 1.2.18 jvm track
         _ => ""
     };
 

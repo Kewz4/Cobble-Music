@@ -46,12 +46,21 @@ internal static class Program
                 return 0;
             }
 
+            // --- 1.2.18 jvm track (begin): helper mode, and the memory-settings step after the update ---
+            if (args.Length > 0 && args[0] == JvmSettingsHelper.CommandLineSwitch)
+            {
+                return JvmSettingsHelper.RunFromCommandLine(args);
+            }
+            Func<CommandLine, IProgress<UpdateProgress>?, Task<int>> runWithJvmSettings =
+                (runOptions, runProgress) => JvmSettingsCoordinator.RunAfterUpdaterAsync(runOptions, runProgress, RunUpdaterAsync, Log);
+            // --- 1.2.18 jvm track (end) ---
+
             CommandLine options = CommandLine.Parse(args);
             if (options.PrismPrelaunch && !options.NoUi)
             {
-                return UpdateStatusForm.Run(options, RunUpdaterAsync);
+                return UpdateStatusForm.Run(options, runWithJvmSettings);
             }
-            return RunUpdaterAsync(options, progress: null).GetAwaiter().GetResult();
+            return runWithJvmSettings(options, null).GetAwaiter().GetResult();
         }
         catch (Exception exception)
         {
@@ -350,6 +359,7 @@ internal static class Program
         Console.WriteLine("  CobbleMusicUpdater.exe --sign-manifest <manifest.json> --private-key-file <path> --signature-output <manifest.sig>");
         Console.WriteLine("  CobbleMusicUpdater.exe --verify-manifest <manifest.json> --signature-file <manifest.sig>");
         Console.WriteLine("  CobbleMusicUpdater.exe --verify-updater-channel <channel.json> --signature-file <channel.sig> --verified-output <validated.json>");
+        Console.WriteLine("  CobbleMusicUpdater.exe --apply-jvm-settings <plan.json>   (started by the updater itself; never by the bootstrap)"); // 1.2.18 jvm track
     }
 }
 

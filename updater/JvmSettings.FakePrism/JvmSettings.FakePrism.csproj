@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    1.2.18 jvm track: a Qt-free stand-in for prismlauncher.exe, used only by the integration script next to it
+    (Run-FakePrismJvmIntegration.ps1). It is never shipped and is not referenced by the updater or its tests.
+    FileVersion 10.0.5.0 because the updater only acts under Prism major versions 10 and 11.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>prismlauncher</AssemblyName>
+    <RootNamespace>CobbleMusicUpdater</RootNamespace>
+    <FileVersion>10.0.5.0</FileVersion>
+    <AssemblyVersion>10.0.5.0</AssemblyVersion>
+    <Version>10.0.5</Version>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The same readers the updater uses, so the fake exports INST_JAVA_ARGS exactly as the updater expects Prism to. -->
+    <Compile Include="..\CobbleMusicUpdater\JvmSettings\PrismArgs.cs" Link="Shared\PrismArgs.cs" />
+    <Compile Include="..\CobbleMusicUpdater\JvmSettings\PrismIni.cs" Link="Shared\PrismIni.cs" />
+    <Compile Include="..\CobbleMusicUpdater\JvmSettings\PrismEffectiveSettings.cs" Link="Shared\PrismEffectiveSettings.cs" />
+  </ItemGroup>
+</Project>
