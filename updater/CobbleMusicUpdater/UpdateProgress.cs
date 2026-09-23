@@ -11,7 +11,11 @@ internal enum UpdatePhase
     Applying,
     Complete,
     Fallback,
-    Blocked
+    Blocked,
+    // [lock-v2] Waiting for another updater that holds update.lock (countdown in Detail).
+    Waiting,
+    // [lock-v2] Waiting, and the card offers "Stop it and continue".
+    WaitingCanStop
 }
 
 internal sealed record UpdateProgress(
@@ -21,7 +25,11 @@ internal sealed record UpdateProgress(
     long TotalBytes = 0,
     int CurrentItem = 0,
     int TotalItems = 0,
-    long NetworkBytes = 0);
+    long NetworkBytes = 0)
+{
+    // [lock-v2] Optional second line for the card; null keeps the phase's standard detail text.
+    public string? Detail { get; init; }
+}
 
 internal readonly record struct PartDownloadProgress(
     long DownloadedBytes,

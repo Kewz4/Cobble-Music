@@ -57,19 +57,29 @@ internal static class Program
     internal static async Task<int> RunUpdaterAsync(CommandLine options, IProgress<UpdateProgress>? progress)
     {
         _diagnosticLogPath = null;
+        // [lock-v2] The ONE run-level cancellation source: the X button and the stop event cancel it.
+        using RunControl run = RunControl.Begin();
+        run.Log = Log;
+        run.InteractiveUi = options.PrismPrelaunch && !options.NoUi;
+        // [/lock-v2]
         try
         {
             Report(progress, UpdatePhase.Checking, "Checking for updates…");
             UpdaterPaths paths = LocalStateStore.ResolvePaths(options.InstanceDirectory, options.MinecraftDirectory);
             _diagnosticLogPath = Path.Combine(paths.InstallationDirectory, "updater.log");
+            run.Paths = paths; // [lock-v2]
             Log($"Updater executable version: {typeof(Program).Assembly.GetName().Version}");
             Log($"Resolved instance root: {paths.InstanceDirectory}");
             Log($"Resolved Minecraft directory: {paths.MinecraftDirectory}");
-            using FileStream updateLock = LocalStateStore.AcquireOperationLock(paths);
+            // [lock-v2] Waits for, takes over from, or gives up on another holder; writes the owner record.
+            using LockOwnership updateLock = await OperationLockV2.AcquireAsync(paths, options, run, progress, Log);
+            progress = updateLock.Track(progress);
+            // [/lock-v2]
             // Recover before opening mutable local configuration. A corrupt
             // configuration must not conceal an interrupted file transaction.
             await TransactionStore.RecoverIfNeededAsync(paths, BuildInfo.SupportedRoots, Log);
             UpdaterConfiguration configuration = LocalStateStore.LoadConfiguration(paths);
+            run.AllowOfflineLaunch = configuration.AllowOfflineLaunch; // [lock-v2]
             InstalledState installedState = LocalStateStore.LoadState(paths);
             using var releaseClient = new ReleaseClient(TimeSpan.FromSeconds(configuration.NetworkTimeoutSeconds));
 
@@ -77,46 +87,63 @@ internal static class Program
             try
             {
                 Log("Checking GitHub Releases...");
-                releaseChain = await releaseClient.GetUpdateChainAsync(configuration, installedState, CancellationToken.None);
+                releaseChain = await releaseClient.GetUpdateChainAsync(configuration, installedState, run.Token);
             }
-            catch (Exception exception) when (configuration.AllowOfflineLaunch && IsExpectedNetworkFailure(exception))
+            catch (Exception exception) when (!run.Token.IsCancellationRequested && configuration.AllowOfflineLaunch && IsExpectedNetworkFailure(exception))
             {
                 // Offline success is permitted only during the initial release check.
                 Log($"Initial release check is unavailable ({exception.GetType().Name}); offline launch is enabled, so starting the local pack without verifying updates.");
                 Report(progress, UpdatePhase.Fallback, "Couldn’t check for updates — starting Minecraft.");
                 return 0;
             }
-            catch (Exception exception) when (IsExpectedNetworkFailure(exception))
+            catch (Exception exception) when (!run.Token.IsCancellationRequested && IsExpectedNetworkFailure(exception))
             {
                 Log($"GitHub is unavailable ({exception.GetType().Name}) and offline launch is disabled.");
-                Report(progress, UpdatePhase.Blocked, "Couldn’t verify updates — launch is blocked by updater policy.");
-                return NetworkFailureExitCode(configuration, exception);
+                // [lock-v2] Make the policy's "blocked" true under the pinned bootstrap.
+                return RunOutcomes.Blocked(options, progress, Log, "Couldn’t verify updates — launch is blocked by updater policy.",
+                    NetworkFailureExitCode(configuration, exception));
             }
 
             var engine = new UpdateEngine(paths, configuration, Log, progress, releaseClient.VerifiedReleases);
-            await engine.CheckAndUpdateAsync(releaseChain, options.CheckOnly, CancellationToken.None);
+            await engine.CheckAndUpdateAsync(releaseChain, options.CheckOnly, run.Token);
             return 0;
+        }
+        // [lock-v2] X button or a peer's stop event. First, so no network filter mistakes the resulting
+        // TaskCanceledException for an outage and reports an offline fallback.
+        catch (OperationCanceledException) when (run.Token.IsCancellationRequested)
+        {
+            return RunOutcomes.Cancelled(options, run, progress, Log);
         }
         catch (TransactionRecoveryException exception)
         {
             Log($"Local update recovery needs attention: {exception.Message}");
-            Log("Prism launch is blocked so a partially updated modpack cannot run.");
-            Report(progress, UpdatePhase.Blocked, "Updater recovery needs attention. Check updater.log.");
-            return 1;
+            Log("Stopping this Prism launch so a partially updated modpack cannot run."); // [lock-v2]
+            return RunOutcomes.Blocked(options, progress, Log, "Updater recovery needs attention. Check updater.log.");
         }
         catch (UpdaterBusyException exception)
         {
             Log($"Update check is already in progress: {exception.Message}");
-            Log("Prism launch is blocked until that update check finishes.");
-            Report(progress, UpdatePhase.Blocked, "Another update check is already running.");
-            return 1;
+            return RunOutcomes.Busy(options, exception, progress, Log); // [lock-v2]
         }
         catch (Exception exception)
         {
             Log($"Updater setup, update, or integrity check failed: {exception.Message}");
-            Log("Update did not complete; client parity has not been verified. Older launcher wrappers may ignore this failure exit code.");
-            Report(progress, UpdatePhase.Blocked, "Update failed — pack not updated. Check updater.log before playing.");
-            return 1;
+            // [lock-v2] A cancelled run can surface as any exception once a callee wraps the cancellation; it is still
+            // a cancellation (a peer stop must still stop this launch).
+            if (run.Token.IsCancellationRequested)
+            {
+                return RunOutcomes.Cancelled(options, run, progress, Log);
+            }
+            // A network failure after the check is harmless when nothing is half-applied and offline launch is allowed.
+            if (run.AllowOfflineLaunch == true && IsExpectedNetworkFailure(exception) && !run.TransactionMayBePending)
+            {
+                Log("It was a network failure, offline launch is enabled and no install is pending; starting the current pack.");
+                Report(progress, UpdatePhase.Fallback, "Couldn’t finish the update — starting Minecraft.");
+                return 0;
+            }
+            Log("Update did not complete; client parity has not been verified. Stopping this Prism launch.");
+            return RunOutcomes.Blocked(options, progress, Log, "Update failed — pack not updated. Check updater.log before playing.");
+            // [/lock-v2]
         }
     }
 

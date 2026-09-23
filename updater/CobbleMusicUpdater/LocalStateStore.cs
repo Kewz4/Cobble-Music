@@ -323,4 +323,17 @@ internal static class LocalStateStore
 internal sealed class UpdaterBusyException : IOException
 {
     public UpdaterBusyException(string message, Exception innerException) : base(message, innerException) { }
+
+    // [lock-v2] A busy result now carries the launch decision: with a transaction journal present the pack may be
+    // half-applied, so the launch is blocked; without one it is safe to start the current pack.
+    public UpdaterBusyException(string message, bool journalPresent, HolderClass holderClass, Exception? innerException = null)
+        : base(message, innerException)
+    {
+        JournalPresent = journalPresent;
+        HolderClass = holderClass;
+    }
+
+    public bool JournalPresent { get; }
+
+    public HolderClass HolderClass { get; } = HolderClass.UnknownHolder;
 }
