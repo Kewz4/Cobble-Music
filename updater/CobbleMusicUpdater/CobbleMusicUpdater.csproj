@@ -8,7 +8,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>CobbleMusicUpdater</AssemblyName>
     <RootNamespace>CobbleMusicUpdater</RootNamespace>
-    <Version>1.2.18</Version>
+    <Version>1.2.19</Version>
     <PublishSingleFile>true</PublishSingleFile>
     <!-- 1.2.18: measured 121,450,566 -> 54,371,276 bytes (-55%); first window +~80 ms; the pinned bootstrap's
          per-launch SHA-256 passes over this exe take ~half as long; build stays byte-reproducible

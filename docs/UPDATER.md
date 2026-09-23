@@ -99,6 +99,18 @@ Sodium, and Voxy choices cannot trigger a repair or be undone. `options.txt`
 may not be re-offered in the same release, so an existing player-owned absence
 also remains respected.
 
+Updater 1.2.19 fixes fresh-install sourcing. Convergence builds two plans and
+downloads the cheaper: per-file cheapest payload, or newest schema-v1 baseline
+first. The baseline plan used to take a file the newest baseline lacks from the
+newest *older baseline* holding its exact bytes; when 1.0.57 rolled
+InventoryParticles back to 3.0.0 (bytes last in the 1.0.6 baseline), every
+fresh install downloaded 1.0.55 plus all 4.47 GiB of 1.0.6 (9.40 GiB) for one
+1.7 MiB jar. Such a file was re-shipped after the baseline, so it now comes
+from the newest release holding its bytes: a fresh 1.0.57 install is 1.0.55 +
+1.0.56 + 1.0.57 (4.93 GiB). The chosen plan is written to `updater.log`
+(`Sourcing plan: ...`). `CobbleMusicUpdater.Tests --sourcing-regression <dir>`
+replays a fresh install against every signed manifest in `<dir>`.
+
 Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
 A run that ends **Blocked** (local recovery needs attention, an integrity or

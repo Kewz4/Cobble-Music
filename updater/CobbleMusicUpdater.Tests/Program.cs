@@ -27,6 +27,11 @@ internal static partial class Program
                 Console.WriteLine("Catalog convergence regressions passed.");
                 return 0;
             }
+            if (args.Length == 2 && args[0] == "--sourcing-regression")
+            {
+                TestPublishedFreshInstallSourcing(args[1]);
+                return 0;
+            }
             if (args.Length == 2 && args[0] == "--log-regressions")
             {
                 TestPublishedHistoricalManifests(args[1]);
@@ -42,6 +47,7 @@ internal static partial class Program
             TestCreateOnlyDefaultManifestValidation();
             TestUpdaterChannelValidation();
             TestSequentialReleaseChain();
+            TestSourcingPlanUsesDeltasAfterNewestBaseline();
             TestInstanceIdentityNormalization(Path.Combine(tempRoot, "identity"));
             TestLegacyConfigurationRootMigration(Path.Combine(tempRoot, "configuration-migration"));
             TestOfflineLaunchPolicy();

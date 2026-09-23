@@ -104,29 +104,10 @@ internal sealed partial class UpdateEngine
         PathSafety.AssertNoReparsePointsOnTargetPath(_paths.LocalDataDirectory, work);
         string incoming = Path.Combine(work, "incoming");
         Directory.CreateDirectory(incoming);
-        // Two complete sourcing plans are built and the cheaper one wins:
-        //  * per-file cheapest payload (ideal for small repairs), and
-        //  * newest schema-1 baseline first (ideal when most of the inventory
-        //    is needed: one full payload instead of a patchwork of historical
-        //    releases that can cost several times the pack size).
-        var byCheapest = new Dictionary<RemoteRelease, List<ManifestFile>>();
-        var byNewestBaseline = new Dictionary<RemoteRelease, List<ManifestFile>>();
-        foreach (ManifestFile file in needed.Concat(seeds))
-        {
-            token.ThrowIfCancellationRequested();
-            List<RemoteRelease> sources = catalog.Where(r => r.Manifest.Payload is not null
-                && ManifestParser.PayloadContents(r.Manifest).Any(f => f.Path.Equals(file.Path, StringComparison.OrdinalIgnoreCase)
-                    && ManifestParser.SameFile(f, file))).ToList();
-            if (sources.Count == 0)
-                throw new InvalidDataException($"No signed downloadable source exists for {file.Path}; release is incomplete.");
-            RemoteRelease cheapest = sources.OrderBy(r => r.Manifest.Payload!.Size).First();
-            RemoteRelease? newestBaseline = sources.Where(r => r.Manifest.SchemaVersion == 1)
-                .OrderByDescending(r => Version.Parse(r.Manifest.Version)).FirstOrDefault();
-            AddToSourcingPlan(byCheapest, cheapest, file);
-            AddToSourcingPlan(byNewestBaseline, newestBaseline ?? cheapest, file);
-        }
-        Dictionary<RemoteRelease, List<ManifestFile>> groups =
-            SourcingPlanBytes(byNewestBaseline) < SourcingPlanBytes(byCheapest) ? byNewestBaseline : byCheapest;
+        Dictionary<RemoteRelease, List<ManifestFile>> groups = ChooseSourcingPlan(catalog, needed.Concat(seeds), token);
+        _log("Sourcing plan: " + string.Join(", ", groups.OrderBy(g => Version.Parse(g.Key.Manifest.Version))
+            .Select(g => $"{g.Key.Manifest.Version} ({g.Key.Manifest.Payload!.Size / (1024 * 1024)} MiB payload, {g.Value.Count} files)"))
+            + $"; {SourcingPlanBytes(groups) / (1024 * 1024)} MiB to download.");
         long requiredSpace = checked(needed.Concat(seeds).Sum(f => f.Size) * 2
             + groups.Keys.Sum(r => r.Manifest.Payload!.Size) + DiskReserveBytes);
         if (new DriveInfo(Path.GetPathRoot(work)!).AvailableFreeSpace < requiredSpace)
@@ -147,6 +128,41 @@ internal sealed partial class UpdateEngine
         TryDeleteDirectory(work);
         _log($"Release {target.Version} committed and verified: {needed.Count} repaired files. Prior files remain in recovery backups.");
         Report(UpdatePhase.Complete, $"Verified {target.Version} — starting Minecraft.");
+    }
+
+    // Two complete sourcing plans are built and the cheaper one wins:
+    //  * per-file cheapest payload (ideal for small repairs), and
+    //  * newest schema-1 baseline first (ideal when most of the inventory
+    //    is needed: one full payload instead of a patchwork of historical
+    //    releases that can cost several times the pack size).
+    // A file the newest baseline lacks, or holds in other bytes, was shipped
+    // again after it, so the baseline plan takes it from the NEWEST release
+    // with the exact bytes (a delta after the baseline), never from an older
+    // baseline: 1.0.57 rolled a jar back to bytes last seen in the 1.0.6
+    // baseline, and every fresh install then fetched all 4.47 GiB of 1.0.6
+    // for that one 1.7 MiB jar.
+    internal static Dictionary<RemoteRelease, List<ManifestFile>> ChooseSourcingPlan(
+        IReadOnlyList<RemoteRelease> catalog, IEnumerable<ManifestFile> files, CancellationToken token)
+    {
+        RemoteRelease? newestBaseline = catalog.Where(r => r.Manifest.Payload is not null && r.Manifest.SchemaVersion == 1)
+            .OrderByDescending(r => Version.Parse(r.Manifest.Version)).FirstOrDefault();
+        var byCheapest = new Dictionary<RemoteRelease, List<ManifestFile>>();
+        var byNewestBaseline = new Dictionary<RemoteRelease, List<ManifestFile>>();
+        foreach (ManifestFile file in files)
+        {
+            token.ThrowIfCancellationRequested();
+            List<RemoteRelease> sources = catalog.Where(r => r.Manifest.Payload is not null
+                && ManifestParser.PayloadContents(r.Manifest).Any(f => f.Path.Equals(file.Path, StringComparison.OrdinalIgnoreCase)
+                    && ManifestParser.SameFile(f, file))).ToList();
+            if (sources.Count == 0)
+                throw new InvalidDataException($"No signed downloadable source exists for {file.Path}; release is incomplete.");
+            RemoteRelease cheapest = sources.OrderBy(r => r.Manifest.Payload!.Size).First();
+            RemoteRelease newest = sources.OrderByDescending(r => Version.Parse(r.Manifest.Version)).First();
+            AddToSourcingPlan(byCheapest, cheapest, file);
+            AddToSourcingPlan(byNewestBaseline,
+                newestBaseline is not null && sources.Contains(newestBaseline) ? newestBaseline : newest, file);
+        }
+        return SourcingPlanBytes(byNewestBaseline) < SourcingPlanBytes(byCheapest) ? byNewestBaseline : byCheapest;
     }
 
     private static void AddToSourcingPlan(Dictionary<RemoteRelease, List<ManifestFile>> plan,
