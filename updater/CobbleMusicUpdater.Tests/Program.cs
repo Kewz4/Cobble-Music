@@ -42,6 +42,7 @@ internal static class Program
             TestInstanceIdentityNormalization(Path.Combine(tempRoot, "identity"));
             TestLegacyConfigurationRootMigration(Path.Combine(tempRoot, "configuration-migration"));
             TestOfflineLaunchPolicy();
+            TestProcessTreeIdentityAndTermination();
             TestManagedFileIntegrity(Path.Combine(tempRoot, "managed-integrity"));
             await TestCatalogConvergenceAsync(Path.Combine(tempRoot, "catalog"));
             await TestUpdaterSetupFailureBlocksAsync(Path.Combine(tempRoot, "missing-instance"));
@@ -902,6 +903,47 @@ internal static class Program
         });
         File.WriteAllText(paths.StatePath, nullMigrationLedgerState);
         Equal("", LocalStateStore.LoadState(paths).Version, "explicit-null player-setting migration ledger is rejected safely");
+    }
+
+    private static void TestProcessTreeIdentityAndTermination()
+    {
+        using var self = System.Diagnostics.Process.GetCurrentProcess();
+        Equal(true, ProcessTree.TryGetIdentity(Environment.ProcessId, out ProcessIdentity me), "own identity readable");
+        Equal(true, string.Equals(me.ImagePath, Environment.ProcessPath, StringComparison.OrdinalIgnoreCase), "own image path");
+        Equal(true, Math.Abs((me.StartUtc - self.StartTime.ToUniversalTime()).TotalSeconds) < 2, "own creation time");
+        Equal(true, ProcessTree.GetAncestors(Environment.ProcessId).Count >= 1, "test runner has a verified parent");
+        Equal(true, (ProcessTree.TryGetCommandLine(me) ?? string.Empty).Contains("CobbleMusicUpdater.Tests", StringComparison.OrdinalIgnoreCase), "own command line");
+        Equal<PrismLaunchChain?>(null, PrismLaunchChain.TryResolveCurrent(), "tests do not run under Prism");
+
+        var start = new System.Diagnostics.ProcessStartInfo("cmd.exe", "/c ping -n 30 127.0.0.1 > nul")
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        using System.Diagnostics.Process child = System.Diagnostics.Process.Start(start)
+            ?? throw new InvalidOperationException("Could not start the process-tree test child.");
+        try
+        {
+            Equal(true, ProcessTree.TryGetIdentity(child.Id, out ProcessIdentity childIdentity), "child identity readable");
+            Equal(true, ProcessTree.GetChildren(me).Any(c => c.Matches(childIdentity)), "child listed under its parent");
+            Equal(true, ProcessTree.GetAncestors(child.Id).FirstOrDefault()?.Matches(me) == true, "child's verified parent is this process");
+            var impostor = childIdentity with { StartUtc = childIdentity.StartUtc.AddSeconds(-5) };
+            Equal(false, ProcessTree.TryTerminate(impostor, 3), "termination refuses a mismatched creation time");
+            Equal(true, ProcessTree.IsAlive(childIdentity), "child survives the refused termination");
+            Equal(true, ProcessTree.TryTerminate(childIdentity, 3), "exact identity terminates");
+            Equal(true, ProcessTree.WaitForExit(childIdentity, TimeSpan.FromSeconds(10)), "terminated child exits");
+            child.WaitForExit();
+            Equal(3, child.ExitCode, "terminated child reports the requested exit code");
+            Equal(false, ProcessTree.IsAlive(childIdentity), "exited child is no longer alive");
+            Equal(false, ProcessTree.TryTerminate(childIdentity, 3), "exited child cannot be terminated again");
+        }
+        finally
+        {
+            if (!child.HasExited)
+            {
+                child.Kill(entireProcessTree: true);
+            }
+        }
     }
 
     private static void TestOfflineLaunchPolicy()
