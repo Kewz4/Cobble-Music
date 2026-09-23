@@ -389,6 +389,86 @@ GitHub authentication comes only from the GitHub CLI credential store; no
 access token is accepted or emitted. GitHub mutation modes validate the
 already committed public channel/signature and do not need the private seed.
 
+### Pre-staging a new updater (1.2.18 and later)
+
+Without pre-staging, every updater release makes each friend's pinned
+bootstrap download the new executable with Windows PowerShell 5.1 before any
+window appears (a hidden, unbounded download of tens of megabytes, which is
+also what floods Prism's log view). From 1.2.18 on, a running updater can
+fetch the next updater itself, so friends' bootstraps never have to:
+
+1. Stage and commit as usual, but push the release commit to a **branch**,
+   not `main` (`-UploadDraft` only needs the commit to exist on GitHub).
+   `main`'s `updater/channel/stable.json` must keep naming the current
+   updater for now.
+2. `-UploadDraft`, then `-Publish -ConfirmPublish` as above. Publishing the
+   GitHub release changes nothing for friends; `stable.json` on `main` does.
+3. On `main`, stage the next channel and commit only those two files:
+
+   ```powershell
+   .\tools\Publish-CobbleMusicUpdater.ps1 -StageNextChannel -NextVersion <version>
+   git add updater/channel/next.json updater/channel/next.sig
+   ```
+
+   This standalone, read-only mode needs no private key. It takes the exact
+   signed `stable.json`/`stable.sig` from the commit that the
+   `updater-v<version>` tag names, requires them to be byte-identical to what
+   this publisher writes for that version, verifies them with the bootstrap's
+   pinned 1.2.7 verifier, confirms the published release carries exactly the
+   signed `CobbleMusicUpdater.exe` (GitHub digest and an anonymous download),
+   and refuses a version that is not newer than `main`'s stable channel or
+   older than an already staged next channel.
+4. Push `main`. Over the next launches, running 1.2.18+ updaters download
+   the new updater in the background: HttpClient, 30-second inactivity
+   timeout per read, three retries with backoff, resume by `Range`, and at
+   most 15 seconds added after a successful update run, with the rest
+   resuming next launch. Each accepts the file only when it is exactly the
+   signed size and SHA-256 and starts with `MZ`, which is the bootstrap's
+   `Test-ExactExecutable`. The card's X (or a later launch's stop event)
+   ends that 15-second wait at once and starts no swap helper: a partial
+   download resumes and a finished one stays staged for the next launch.
+5. Later, advance stable by merging the release commit into `main`.
+   `stable.json` then carries the same bytes as `next.json`. A bootstrap that
+   already has the pre-staged updater sees an equal version with equal size and
+   hash, so it downloads nothing. Everyone else gets the normal bootstrap
+   download.
+
+Never let `stable.json` name a pre-staged version with different executable
+bytes. The pinned bootstrap refuses a reused version with different metadata
+and keeps running the pre-staged exe, so those friends would stay on it.
+
+How the swap is proven to satisfy the pinned bootstrap (`tests/Test-UpdaterPrestageBootstrap.ps1`):
+
+- **Why a helper process.** A running .NET single-file executable cannot be
+  renamed. After a rename, every later assembly load in that process fails
+  (measured for plain and compressed bundles). So the updater only downloads.
+  The swap is done by `prestage\swap-helper-*.exe`, a hard link to the
+  current updater that runs after the updater exits.
+- **Swap order.** The helper first keeps rollback copies. It then writes
+  `installed-updater-channel.json` and then `.sig` with the exact signed
+  `next` bytes, and finally renames the verified staged exe over
+  `CobbleMusicUpdater.exe`. Each of those three is one atomic rename, and the
+  helper re-verifies everything first.
+- **What the bootstrap does next.** Its `Get-CachedChannel` accepts the pair
+  (verified by the pinned verifier, exe matching size and SHA-256). A
+  `stable.json` still naming the older updater is then "Ignoring replayed
+  updater channel", and offline it keeps the cached pair. In none of these
+  cases does it download or fall back.
+- **Only when the bootstrap started it.** The updater pre-stages only in a
+  Prism pre-launch started by Prism's PowerShell, running from the
+  bootstrap's `<instance>\minecraft\cobble-music-updater\CobbleMusicUpdater.exe`,
+  with the pinned verifier beside it, and when the cached channel verifies
+  and names the running exe.
+- **Crash between writes, online.** If the helper dies between two renames
+  and the next launch is online, the bootstrap re-caches `stable.json` for the
+  old exe, runs it with no download, and the swap is retried.
+- **Crash between writes, offline.** If the helper dies after the cache
+  rename but before the exe rename, and the next launch is offline, that one
+  launch reaches the bootstrap's pinned-verifier fallback. That window can't be
+  closed because the bootstrap reads two files that can't be replaced together.
+  The next 1.2.18+ updater run repairs the pair from the signed descriptors
+  it kept, and removes leftover helper and rollback files.
+
 ## Install into one Prism instance
 
 ```powershell

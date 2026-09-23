@@ -34,6 +34,12 @@ internal static class Program
             {
                 return VerifyUpdaterChannel(args);
             }
+            // [prestage] Swap helper started by a finished updater run (UpdaterPrestageSwap.cs).
+            if (args.Contains(UpdaterPrestageSwap.HelperSwitch, StringComparer.Ordinal))
+            {
+                return UpdaterPrestageSwap.RunHelper(args);
+            }
+            // [/prestage]
             if (args.Contains("--help", StringComparer.Ordinal) || args.Contains("-h", StringComparer.Ordinal))
             {
                 PrintUsage();
@@ -78,6 +84,9 @@ internal static class Program
             // Recover before opening mutable local configuration. A corrupt
             // configuration must not conceal an interrupted file transaction.
             await TransactionStore.RecoverIfNeededAsync(paths, BuildInfo.SupportedRoots, Log);
+            // [prestage] Background download of a signed newer updater (UpdaterPrestage.cs); never changes this launch's result.
+            using UpdaterPrestageSession? prestage = UpdaterPrestageSession.TryStart(options, paths, Log);
+            // [/prestage]
             UpdaterConfiguration configuration = LocalStateStore.LoadConfiguration(paths);
             run.AllowOfflineLaunch = configuration.AllowOfflineLaunch; // [lock-v2]
             InstalledState installedState = LocalStateStore.LoadState(paths);
@@ -109,6 +118,16 @@ internal static class Program
 
             var engine = new UpdateEngine(paths, configuration, Log, progress, releaseClient.VerifiedReleases);
             await engine.CheckAndUpdateAsync(releaseChain, options.CheckOnly, run.Token);
+            // [prestage] Only after a successful run: bounded wait, then start the swap helper if a verified updater is staged.
+            if (prestage is not null)
+            {
+                // [integration 1.2.18] run.Token (X / peer stop) ends the grace wait at once and suppresses the helper.
+                await prestage.FinishAsync(progress, run.Token);
+            }
+            // [/prestage]
+            // [integration 1.2.18] FinishAsync swallows the cancellation, so a stop that arrived after the engine
+            // finished still ends this run as RunOutcomes.Cancelled (and so skips the post-update memory-settings step).
+            run.Token.ThrowIfCancellationRequested();
             return 0;
         }
         // [lock-v2] X button or a peer's stop event. First, so no network filter mistakes the resulting

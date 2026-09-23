@@ -509,6 +509,74 @@ foreach ($assetCase in @('default', 'mismatch', 'concurrent', 'repair')) {
     }
 }
 
+# -StageNextChannel (updater 1.2.18+ pre-staging): the staged next.json must be
+# the exact canonical stable descriptor, only ever move forward, and the mode
+# must never mutate GitHub or need the private key.
+$stageNextText = Get-PublisherFunctionText 'Invoke-StageNextChannel'
+foreach ($forbidden in @('--method', 'Assert-PrivateKeyIsolation', '--sign-manifest', 'Write-Utf8Atomically $BootstrapPath')) {
+    if ($stageNextText.Contains($forbidden, [StringComparison]::Ordinal)) {
+        throw "Invoke-StageNextChannel must stay read-only toward GitHub and keys; found: $forbidden"
+    }
+}
+foreach ($required in @(
+    'Get-ExactUpdaterTagRef $tag',
+    "Invoke-RootGit @('archive', '--format=zip', `"--output=`$archive`", `$commit, 'updater/channel/stable.json', 'updater/channel/stable.sig')",
+    '$channel = Assert-NextChannelDescriptor $candidateText $Version',
+    "'--verify-updater-channel', `$candidateJson",
+    'Assert-PublishedReleaseIdentity $release $releaseId $tag $commit',
+    'Test-RemoteAsset $exeAssets[0] $expectedExe',
+    'Assert-NextChannelAdvance $Version ([IO.File]::ReadAllText($ChannelPath)) $existingNextText $candidateText',
+    'Copy-Atomically $candidateJson $nextChannelPath',
+    'Copy-Atomically $candidateSignature $nextSignaturePath'
+)) {
+    if (-not $stageNextText.Contains($required, [StringComparison]::Ordinal)) {
+        throw "Invoke-StageNextChannel lost a required check: $required"
+    }
+}
+$stageDispatchIndex = $publisherText.IndexOf('    Invoke-StageNextChannel $NextVersion', [StringComparison]::Ordinal)
+$firstCleanInputsIndex = $publisherText.IndexOf('    $commit = Get-BoundSourceCommit', [StringComparison]::Ordinal)
+if ($stageDispatchIndex -lt 0 -or $firstCleanInputsIndex -lt 0 -or $stageDispatchIndex -gt $firstCleanInputsIndex) {
+    throw '-StageNextChannel must dispatch before the build/upload workflow.'
+}
+$nextChannelFunctions = @(
+    Get-PublisherFunctionText 'ConvertTo-CanonicalUpdaterVersion'
+    Get-PublisherFunctionText 'Get-UpdaterChannelText'
+    Get-PublisherFunctionText 'ConvertFrom-UpdaterChannelText'
+    Get-PublisherFunctionText 'Assert-NextChannelDescriptor'
+    Get-PublisherFunctionText 'Assert-NextChannelAdvance'
+) -join [Environment]::NewLine
+$committedStableText = [IO.File]::ReadAllText((Join-Path $Root 'updater\channel\stable.json'))
+$nextChannelHarness = [scriptblock]::Create('param([string]$CommittedStable)' + [Environment]::NewLine + $nextChannelFunctions + [Environment]::NewLine + @'
+$Repository = 'Kewz4/Cobble-Music'
+function Assert-Throws([scriptblock]$Action, [string]$ExpectedFragment) {
+    try { & $Action; throw 'Expected failure did not occur.' }
+    catch {
+        if (-not $_.Exception.Message.Contains($ExpectedFragment, [StringComparison]::Ordinal)) { throw }
+    }
+}
+$committedVersion = [string]($CommittedStable | ConvertFrom-Json).updaterVersion
+$null = Assert-NextChannelDescriptor $CommittedStable $committedVersion
+Assert-Throws { Assert-NextChannelDescriptor $CommittedStable '9.9.9' } 'not the canonical stable descriptor'
+Assert-Throws { Assert-NextChannelDescriptor $CommittedStable.Replace('"channel":"stable"', '"channel":"next"') $committedVersion } 'not the canonical stable descriptor'
+Assert-Throws { Assert-NextChannelDescriptor ($CommittedStable.TrimEnd("`n") + ' ') $committedVersion } 'not the canonical stable descriptor'
+function New-Channel([string]$Version, [string]$Sha) { Get-UpdaterChannelText $Version $Sha ([int64]2000000) }
+$stable = New-Channel '1.2.17' ('a' * 64)
+$candidate = New-Channel '1.2.18' ('b' * 64)
+Assert-NextChannelAdvance '1.2.18' $stable $null $candidate
+Assert-NextChannelAdvance '1.2.18' $stable $candidate $candidate
+Assert-NextChannelAdvance '1.2.18' $stable (New-Channel '1.2.16' ('c' * 64)) $candidate
+Assert-Throws { Assert-NextChannelAdvance '1.2.17' $stable $null (New-Channel '1.2.17' ('b' * 64)) } 'strictly newer'
+Assert-Throws { Assert-NextChannelAdvance '1.2.16' $stable $null (New-Channel '1.2.16' ('b' * 64)) } 'strictly newer'
+Assert-Throws { Assert-NextChannelAdvance '1.2.18' $stable (New-Channel '1.2.19' ('d' * 64)) $candidate } 'refusing to move it back'
+Assert-Throws { Assert-NextChannelAdvance '1.2.18' $stable (New-Channel '1.2.18' ('e' * 64)) $candidate } 'different bytes'
+Assert-Throws { Assert-NextChannelAdvance '1.02.18' $stable $null $candidate } 'canonical three-part'
+'next-channel-policy-ok'
+'@)
+$nextChannelResult = @(& $nextChannelHarness $committedStableText)
+if ($nextChannelResult.Count -ne 1 -or [string]$nextChannelResult[0] -cne 'next-channel-policy-ok') {
+    throw 'Next updater channel staging policy fixture did not complete exactly.'
+}
+
 # Invoke the real publisher by full path while the process CWD is an unrelated
 # Git repository. The diagnostic must report the publisher's repository and
 # commit, never the caller repository.
@@ -575,6 +643,26 @@ $cases = @(
         Name = 'stale repair requires draft resume mode'
         Arguments = @('-RepairStaleUploads')
         Expected = '-RepairStaleUploads is allowed only while resuming an existing draft with -UploadDraft or -Publish.'
+    },
+    [pscustomobject]@{
+        Name = 'next-channel staging is standalone'
+        Arguments = @('-StageNextChannel', '-NextVersion', '1.2.18', '-DryRun')
+        Expected = '-StageNextChannel is a standalone mode; run it on its own after -Publish.'
+    },
+    [pscustomobject]@{
+        Name = 'next-channel staging cannot ride along with source binding'
+        Arguments = @('-StageNextChannel', '-NextVersion', '1.2.18', '-VerifySourceBinding')
+        Expected = '-StageNextChannel is a standalone mode; run it on its own after -Publish.'
+    },
+    [pscustomobject]@{
+        Name = 'next-channel staging needs a version'
+        Arguments = @('-StageNextChannel')
+        Expected = '-StageNextChannel requires -NextVersion <major.minor.patch>.'
+    },
+    [pscustomobject]@{
+        Name = 'next version is only for next-channel staging'
+        Arguments = @('-NextVersion', '1.2.18')
+        Expected = '-NextVersion is valid only with -StageNextChannel.'
     }
 )
 
