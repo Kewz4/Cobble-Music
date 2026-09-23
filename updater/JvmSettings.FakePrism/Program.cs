@@ -50,6 +50,15 @@ internal static class FakePrismProgram
                     return 2;
             }
         }
+        // Harness note: a real Prism command line must stay reproducible, so the dummy game can also come from
+        // the environment (an extra argument made the updater's relaunch guard fire first).
+        string? dummyFromEnvironment = Environment.GetEnvironmentVariable("CM_FAKE_DUMMY_GAME_SECONDS");
+        if (dummyGameSeconds == 0
+            && !string.IsNullOrWhiteSpace(dummyFromEnvironment)
+            && int.TryParse(dummyFromEnvironment, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int environmentSeconds))
+        {
+            dummyGameSeconds = environmentSeconds;
+        }
         _logPath = Path.Combine(dataDirectory, "fake-prism.log");
         Log($"started: {Environment.CommandLine}");
 
@@ -150,6 +159,14 @@ internal static class FakePrismProgram
             foreach ((string key, string value) in variables)
             {
                 start.Environment[key] = value;
+            }
+            // Harness-only: a marker file in the fake Prism folder keeps every pre-launch child offline, even after
+            // the helper's Explorer relaunch (whose environment cannot inherit the harness's variables).
+            string fakeRoot = AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+            if (File.Exists(Path.Combine(fakeRoot, "cm-fake-dead-proxy.txt")))
+            {
+                start.Environment["HTTPS_PROXY"] = "http://127.0.0.1:9";
+                start.Environment["HTTP_PROXY"] = "http://127.0.0.1:9";
             }
             using Process process = Process.Start(start) ?? throw new InvalidOperationException("the pre-launch command did not start");
             process.OutputDataReceived += (_, line) => { if (line.Data is not null) { Log("pre-launch stdout: " + line.Data); } };

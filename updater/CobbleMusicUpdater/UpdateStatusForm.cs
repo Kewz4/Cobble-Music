@@ -2,6 +2,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace CobbleMusicUpdater;
@@ -96,6 +97,12 @@ internal sealed class UpdateStatusForm : Form
             ForeColor = Color.FromArgb(166, 160, 185),
             Text = "Securely checking the latest release"
         };
+        // Kewz's report: the borderless card could not be moved. Dragging any passive
+        // surface starts the native window drag; the buttons keep their own clicks.
+        foreach (Control dragSurface in new Control[] { this, _titleLabel, _subtitleLabel, _statusLabel, _detailLabel })
+        {
+            dragSurface.MouseDown += BeginWindowDrag;
+        }
         _progressIndicator = new SmoothProgressIndicator
         {
             Name = "progressIndicator",
@@ -694,6 +701,27 @@ internal sealed class UpdateStatusForm : Form
     internal static string FailureCloseText(int secondsRemaining) => $"Close ({secondsRemaining})";
 
     // ---- [/lock-v2] --------------------------------------------------------------------------------------------
+
+    private const int WindowMessageNonClientLeftButtonDown = 0x00A1;
+    private const int HitTestCaption = 2;
+
+    // Kewz's report: the borderless card could not be moved. Synthesizing the native
+    // non-client drag moves the whole window exactly like a title bar.
+    private void BeginWindowDrag(object? sender, MouseEventArgs eventArgs)
+    {
+        if (eventArgs.Button != MouseButtons.Left || !IsHandleCreated)
+        {
+            return;
+        }
+        ReleaseCapture();
+        _ = SendMessage(Handle, WindowMessageNonClientLeftButtonDown, new IntPtr(HitTestCaption), IntPtr.Zero);
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr windowHandle, int message, IntPtr wParam, IntPtr lParam);
 
     private static GraphicsPath CreateRoundedPath(Rectangle bounds, int radius)
     {

@@ -55,7 +55,7 @@ Write-Host "Building the updater and the fake Prism..."
 if ($LASTEXITCODE -ne 0) { throw 'Updater build failed.' }
 & dotnet build (Join-Path $PSScriptRoot 'JvmSettings.FakePrism.csproj') -c Release -v q -nologo
 if ($LASTEXITCODE -ne 0) { throw 'Fake Prism build failed.' }
-$updaterBin = Join-Path $repoUpdater 'CobbleMusicUpdater\bin\Release\net10.0-windows'
+$updaterBin = Join-Path $repoUpdater 'CobbleMusicUpdater\bin\Release\net10.0-windows\win-x64'
 $fakeBin = Join-Path $PSScriptRoot 'bin\Release\net10.0-windows\win-x64'
 
 $prismDir = Join-Path $WorkRoot 'Prism'
@@ -66,6 +66,9 @@ New-Item -ItemType Directory -Path $updaterDir -Force | Out-Null
 Copy-Item -Path (Join-Path $fakeBin '*') -Destination $prismDir -Recurse
 Copy-Item -Path (Join-Path $updaterBin '*') -Destination $updaterDir -Recurse
 Set-Content -LiteralPath (Join-Path $prismDir 'portable.txt') -Value '' -NoNewline
+# Harness-only marker: the fake Prism keeps every pre-launch child offline (dead proxy), including after the
+# helper's Explorer relaunch, so the updater deterministically takes the offline-fallback path.
+Set-Content -LiteralPath (Join-Path $prismDir 'cm-fake-dead-proxy.txt') -Value '' -NoNewline
 Copy-Item -LiteralPath (Join-Path $fixtures 'prismlauncher.cfg') -Destination (Join-Path $prismDir 'prismlauncher.cfg')
 @{
     schemaVersion = 1; modpackId = 'cobble-music'; repository = 'cm-jvm-integration-invalid-owner/does-not-exist'; channel = 'stable'
@@ -118,7 +121,10 @@ $fakeLog = Join-Path $prismDir 'fake-prism.log'
 $updaterLog = Join-Path $updaterDir 'updater.log'
 
 $fakeArguments = @('--launch', 'kewz')
-if ($DummyGame) { $fakeArguments += @('--spawn-dummy-game', '600') }
+if ($DummyGame) {
+    # via the environment: an extra command-line argument would trip the updater's relaunch guard first
+    $env:CM_FAKE_DUMMY_GAME_SECONDS = '600'
+}
 Write-Host "Starting the fake Prism ($Chain chain) in $WorkRoot ..."
 Start-Process -FilePath (Join-Path $prismDir 'prismlauncher.exe') -ArgumentList $fakeArguments | Out-Null
 
@@ -162,6 +168,7 @@ try {
     Write-Host 'Fake-Prism jvm-args integration passed.'
 }
 finally {
+    Remove-Item -Path 'Env:CM_FAKE_DUMMY_GAME_SECONDS' -ErrorAction SilentlyContinue
     foreach ($process in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($WorkRoot, [StringComparison]::OrdinalIgnoreCase) })) {
         Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
     }
