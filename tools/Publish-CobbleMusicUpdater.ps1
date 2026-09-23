@@ -34,7 +34,14 @@ param(
 
     # Read-only diagnostic used by the safety suite to prove that a publisher
     # invoked by full path never binds Git operations to the caller's CWD.
-    [switch]$VerifySourceBinding
+    [switch]$VerifySourceBinding,
+
+    # Opt-in, standalone (updater 1.2.18+ pre-staging): after -Publish made
+    # updater-v<NextVersion> public, copy that release commit's exact signed
+    # stable.json/.sig to updater/channel/next.json/.sig so running updaters
+    # download it before stable.json advances. Needs no private key.
+    [switch]$StageNextChannel,
+    [string]$NextVersion
 )
 
 $ErrorActionPreference = 'Stop'
@@ -714,6 +721,142 @@ function Sync-DraftAssets($Release, [hashtable]$ExpectedAssets, [string]$Tag, [s
     throw 'Draft validation did not complete.'
 }
 
+# ---------------------------------------------------------------------------
+# -StageNextChannel (updater 1.2.18+ pre-staging). Additive: no other mode
+# calls these functions. next.json must be byte-identical to the stable.json
+# that will later advance, because a running updater installs next.json's
+# bytes as the bootstrap's channel cache and the pinned bootstrap refuses a
+# stable channel that reuses that version with different executable metadata.
+# The bytes are therefore copied, never re-generated, from the commit the
+# release tag names (the commit -UploadDraft proved describes this build).
+
+function ConvertFrom-UpdaterChannelText([string]$Text, [string]$Context) {
+    try { $channel = $Text | ConvertFrom-Json }
+    catch { throw "$Context is not valid JSON: $($_.Exception.Message)" }
+    if ($null -eq $channel -or $null -eq $channel.PSObject.Properties['updater'] -or $null -eq $channel.updater) {
+        throw "$Context is not an updater channel descriptor."
+    }
+    return $channel
+}
+
+function Assert-NextChannelDescriptor([string]$DescriptorText, [string]$Version) {
+    $channel = ConvertFrom-UpdaterChannelText $DescriptorText 'Next updater channel'
+    $sha256 = [string]$channel.updater.sha256
+    if ($sha256 -cnotmatch '^[0-9a-f]{64}$') { throw 'Next updater channel SHA-256 is not canonical lowercase hex.' }
+    # Re-derive the canonical text with this publisher's own writer: every field
+    # (schema, product, repository, channel=stable, version, tag, asset name)
+    # must match byte for byte, not merely parse.
+    $expected = Get-UpdaterChannelText $Version $sha256 ([int64]$channel.updater.size)
+    if ($DescriptorText -cne $expected) {
+        throw "The release commit's stable.json is not the canonical stable descriptor for updater v$Version."
+    }
+    return $channel
+}
+
+function Assert-NextChannelAdvance([string]$Version, [string]$StableText, [string]$ExistingNextText, [string]$CandidateText) {
+    $candidate = ConvertTo-CanonicalUpdaterVersion $Version 'Next updater version'
+    $stable = ConvertFrom-UpdaterChannelText $StableText 'Committed stable updater channel'
+    $stableVersion = ConvertTo-CanonicalUpdaterVersion ([string]$stable.updaterVersion) 'Committed stable updater version'
+    if ($candidate -le $stableVersion) {
+        throw "Next updater $Version must be strictly newer than the committed stable channel $stableVersion; running updaters would ignore it."
+    }
+    if (-not [string]::IsNullOrEmpty($ExistingNextText)) {
+        $existing = ConvertFrom-UpdaterChannelText $ExistingNextText 'Existing next updater channel'
+        $existingVersion = ConvertTo-CanonicalUpdaterVersion ([string]$existing.updaterVersion) 'Existing next updater version'
+        if ($existingVersion -gt $candidate) {
+            throw "The committed next channel already names newer updater $existingVersion; refusing to move it back to $Version."
+        }
+        if ($existingVersion -eq $candidate -and $ExistingNextText -cne $CandidateText) {
+            throw "The committed next channel already names $Version with different bytes; a staged version is never re-signed with different executable metadata."
+        }
+    }
+}
+
+function Invoke-StageNextChannel([string]$Version) {
+    $null = ConvertTo-CanonicalUpdaterVersion $Version 'Next updater version'
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { throw 'GitHub CLI is required on PATH to confirm the published updater release.' }
+    $tag = "updater-v$Version"
+    $nextChannelPath = Join-Path $Root 'updater\channel\next.json'
+    $nextSignaturePath = Join-Path $Root 'updater\channel\next.sig'
+    $workRoot = Join-Path ([IO.Path]::GetTempPath()) ('cobble-music-next-channel-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        New-Item -ItemType Directory -Path $workRoot -Force | Out-Null
+
+        $tagRef = Get-ExactUpdaterTagRef $tag
+        if ($null -eq $tagRef -or [string]$tagRef.object.type -cne 'commit' -or [string]$tagRef.object.sha -cnotmatch '^[0-9a-f]{40,64}$') {
+            throw "Updater release tag $tag is missing on GitHub or is not a lightweight commit ref."
+        }
+        $commit = [string]$tagRef.object.sha
+        try { $null = Invoke-RootGit @('cat-file', '-e', "$commit^{commit}") }
+        catch { throw "Release commit $commit for $tag is not in the local repository; fetch it first. $($_.Exception.Message)" }
+
+        # git archive yields the exact committed bytes (text eol=lf), which are
+        # the bytes raw.githubusercontent.com serves for next.json/next.sig.
+        $archive = Join-Path $workRoot 'channel.zip'
+        $null = Invoke-RootGit @('archive', '--format=zip', "--output=$archive", $commit, 'updater/channel/stable.json', 'updater/channel/stable.sig')
+        Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $workRoot 'commit')
+        $candidateJson = Join-Path $workRoot 'commit\updater\channel\stable.json'
+        $candidateSignature = Join-Path $workRoot 'commit\updater\channel\stable.sig'
+        $candidateText = [IO.File]::ReadAllText($candidateJson)
+        $channel = Assert-NextChannelDescriptor $candidateText $Version
+
+        # Verify with the bootstrap's own pinned verifier, as every friend's bootstrap will.
+        $verifierHash = Get-SingleQuotedAssignment ([IO.File]::ReadAllText($BootstrapPath)) 'ExpectedVerifierSha256'
+        if (-not (Test-Path -LiteralPath $VerifierDistExe -PathType Leaf) `
+            -or -not (Get-Sha256 $VerifierDistExe).Equals($verifierHash, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "The pinned verifier $VerifierDistExe is missing or does not match the bootstrap pin."
+        }
+        $verifiedOutput = Join-Path $workRoot 'verified-next.json'
+        Invoke-UpdaterTool $VerifierDistExe @(
+            '--verify-updater-channel', $candidateJson,
+            '--signature-file', $candidateSignature,
+            '--verified-output', $verifiedOutput
+        ) 'Verifying the next updater channel with the pinned verifier'
+        if ([IO.File]::ReadAllText($verifiedOutput) -cne $candidateText.TrimEnd("`r", "`n")) {
+            throw 'The pinned verifier did not reproduce the exact next channel document.'
+        }
+
+        # The release must be public (draft assets are not anonymously downloadable)
+        # and carry exactly the signed executable.
+        $releaseSummary = Invoke-GhJson @('api', '-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2022-11-28', "/repos/$Repository/releases/tags/$tag")
+        $releaseId = [int64]$releaseSummary.id
+        $release = Get-Release $releaseId
+        Assert-PublishedReleaseIdentity $release $releaseId $tag $commit
+        $exeAssets = @($release.assets | Where-Object { [string]$_.name -ceq 'CobbleMusicUpdater.exe' })
+        $expectedExe = [pscustomobject]@{ Size = [int64]$channel.updater.size; Sha256 = [string]$channel.updater.sha256 }
+        if ($exeAssets.Count -ne 1 -or -not (Test-RemoteAsset $exeAssets[0] $expectedExe)) {
+            throw "Published release $tag does not carry exactly the signed CobbleMusicUpdater.exe."
+        }
+        $download = Join-Path $workRoot 'CobbleMusicUpdater.exe'
+        $previousProgress = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/$Repository/releases/download/$tag/CobbleMusicUpdater.exe" -OutFile $download -TimeoutSec 60
+        }
+        finally { $ProgressPreference = $previousProgress }
+        $downloadStream = [IO.File]::OpenRead($download)
+        try { $isPe = $downloadStream.Length -ge 2 -and $downloadStream.ReadByte() -eq 0x4d -and $downloadStream.ReadByte() -eq 0x5a }
+        finally { $downloadStream.Dispose() }
+        if (-not $isPe -or (Get-Item -LiteralPath $download).Length -ne $expectedExe.Size -or (Get-Sha256 $download) -cne $expectedExe.Sha256) {
+            throw "The anonymous public download of $tag does not match the signed next channel."
+        }
+
+        $existingNextText = if (Test-Path -LiteralPath $nextChannelPath -PathType Leaf) { [IO.File]::ReadAllText($nextChannelPath) } else { $null }
+        Assert-NextChannelAdvance $Version ([IO.File]::ReadAllText($ChannelPath)) $existingNextText $candidateText
+
+        Copy-Atomically $candidateJson $nextChannelPath
+        Copy-Atomically $candidateSignature $nextSignaturePath
+        foreach ($pair in @(@($candidateJson, $nextChannelPath), @($candidateSignature, $nextSignaturePath))) {
+            if ((Get-Sha256 $pair[0]) -cne (Get-Sha256 $pair[1])) { throw "Staged $($pair[1]) does not match the release commit's bytes." }
+        }
+        Write-Host "Staged updater/channel/next.json + next.sig = the exact signed stable channel of $tag (commit $commit)."
+        Write-Host 'Commit ONLY these two files to main and push. Running 1.2.18+ updaters then pre-stage this updater; advance stable later by merging the release commit so stable.json carries the same bytes.'
+    }
+    finally {
+        if (Test-Path -LiteralPath $workRoot) { Remove-Item -LiteralPath $workRoot -Recurse -Force }
+    }
+}
+
 if ($DryRun -and $GitHubMutation) { throw '-DryRun cannot be combined with -UploadDraft or -Publish.' }
 if ($ConfirmPublish -and -not $Publish) { throw '-ConfirmPublish is valid only with -Publish.' }
 if ($Publish -and -not $ConfirmPublish) { throw 'Final publication requires both -Publish and -ConfirmPublish.' }
@@ -721,8 +864,13 @@ if ($RepairStaleUploads -and -not $GitHubMutation) { throw '-RepairStaleUploads 
 if ($VerifySourceBinding -and ($DryRun -or $GitHubMutation -or $ConfirmPublish -or $RepairStaleUploads)) {
     throw '-VerifySourceBinding is a standalone read-only diagnostic.'
 }
+if ($StageNextChannel -and ($DryRun -or $GitHubMutation -or $ConfirmPublish -or $RepairStaleUploads -or $VerifySourceBinding)) {
+    throw '-StageNextChannel is a standalone mode; run it on its own after -Publish.'
+}
+if ($StageNextChannel -and [string]::IsNullOrWhiteSpace($NextVersion)) { throw '-StageNextChannel requires -NextVersion <major.minor.patch>.' }
+if (-not $StageNextChannel -and -not [string]::IsNullOrEmpty($NextVersion)) { throw '-NextVersion is valid only with -StageNextChannel.' }
 $resolvedPrivateKeyPath = $null
-if (-not $GitHubMutation -and -not $VerifySourceBinding) {
+if (-not $GitHubMutation -and -not $VerifySourceBinding -and -not $StageNextChannel) {
     $resolvedPrivateKeyPath = Assert-PrivateKeyIsolation $PrivateKeyPath
 }
 
@@ -731,6 +879,10 @@ if ($VerifySourceBinding) {
     $diagnosticCommit = Get-BoundSourceCommit
     Write-Output "SOURCE_ROOT=$Root"
     Write-Output "SOURCE_COMMIT=$diagnosticCommit"
+    exit 0
+}
+if ($StageNextChannel) {
+    Invoke-StageNextChannel $NextVersion
     exit 0
 }
 
