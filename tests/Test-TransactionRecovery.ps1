@@ -42,7 +42,7 @@ try {
     Write-Utf8 $journalPath ($journal | ConvertTo-Json -Depth 5)
 
     & dotnet $UpdaterDll --instance-dir $instance --minecraft-dir $minecraft --prism-prelaunch --no-ui | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "Valid rollback test exited with $LASTEXITCODE" }
+    if ($LASTEXITCODE -eq 0) { throw 'Recovery on an unconfigured instance reported a verified launch instead of the 1.2.16 failure report.' }
     if ((Get-Content -Raw -LiteralPath $target) -ne 'old-content') { throw 'Interrupted replacement was not restored from the rollback copy.' }
     if (Test-Path -LiteralPath $journalPath) { throw 'Recovered transaction journal was not removed.' }
 
