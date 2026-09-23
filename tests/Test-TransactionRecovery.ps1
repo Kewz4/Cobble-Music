@@ -50,7 +50,7 @@ try {
     $heldLock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     try {
         & dotnet $UpdaterDll --instance-dir $instance --minecraft-dir $minecraft --prism-prelaunch --no-ui 2>$null
-        if ($LASTEXITCODE -eq 0) { throw 'A concurrent updater lock unexpectedly allowed a Prism launch.' }
+        if ($LASTEXITCODE -ne 0) { throw "A held lock with no install journal must fall back to the current pack (lock v2), got exit $LASTEXITCODE." }
     }
     finally {
         $heldLock.Dispose()
