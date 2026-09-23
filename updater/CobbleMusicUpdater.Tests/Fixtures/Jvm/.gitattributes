@@ -1,0 +1,2 @@
+# Byte-exact copies of Prism instance.cfg files (CRLF): the round-trip tests compare bytes.
+*.cfg -text

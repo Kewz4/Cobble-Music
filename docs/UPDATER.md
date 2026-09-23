@@ -132,6 +132,42 @@ Normal source or updater-binary releases can live in this repository without
 interfering with clients. They are ignored unless they use the reserved,
 signed `modpack-v<version>` release format.
 
+## Recommended Java memory settings (1.2.18)
+
+After a successful (or offline-fallback) pre-launch run, the updater checks the
+instance's Java settings against policy version 1, which is compiled into the
+exe (`updater/CobbleMusicUpdater/JvmSettings/JvmPolicy.cs`): a heap floor by
+physical RAM (below 11 GiB nothing changes; 7168 / 8192 / 10000 / 12288 MB for
+the 16 / 24 / 32 / 48+ GB classes, Xms `min(4096, Xmx/2)`) and five JVM
+arguments (`-XX:+UseG1GC -XX:MaxGCPauseMillis=50 -XX:G1ReservePercent=15
+-XX:+UseStringDeduplication` and a rotated `logs/gc.log`). It acts only when
+something is missing; the player's own value always wins for every key, any
+player-chosen collector suppresses the whole GC group, and a higher player heap
+is never lowered.
+
+Prism rewrites `instance.cfg` from memory whenever a launch starts or a game
+starts or stops, so the file can only be edited while `prismlauncher.exe` is not
+running. When something is missing and every guard passes (verified
+`prismlauncher -> [powershell ->] updater` chain, Prism 10 or 11, nothing else
+running under Prism, the INST_JAVA_ARGS cross-check, at most 2 attempts per
+policy version and none in the last 10 minutes), the updater starts a helper
+copy of itself (`--apply-jvm-settings <plan.json>`), stops the current launch
+with exit code 3 ("Pre-Launch command failed with code 3." in Prism), and the
+helper closes Prism (WM_CLOSE first; TerminateProcess only with no children and
+no `.cfg.lock`), edits `instance.cfg` atomically in Prism's own INI format (only
+`OverrideMemory`, `MinMemAlloc`, `MaxMemAlloc`, `OverrideJavaArgs`, `JvmArgs`;
+backup `instance.cfg.cobble-music-jvm-<stamp>.bak`, last 3 kept) and reopens
+Prism with `--launch <instance id>` through Explorer. If a game from another
+instance is running, nothing is closed: the edit waits until Prism exits.
+State lives in `%LOCALAPPDATA%\CobbleMusicUpdater\<instance-hash>\jvm-settings.json`.
+A player opts out by creating
+`minecraft/cobble-music-updater/jvm-settings.optout`. The game folder's `logs/`
+directory is created on every pre-launch run because the gc log flag is fatal
+without it. Design and proofs: `workspace/shared/updater0923/jvm-args/FINDINGS.md`
+in the handoff hub. The fake-Prism integration harness is
+`updater/JvmSettings.FakePrism/Run-FakePrismJvmIntegration.ps1` (never point it
+at a real Prism folder).
+
 ## Why releases are chunked
 
 GitHub limits individual Release assets to under 2 GiB. The current Reactive
