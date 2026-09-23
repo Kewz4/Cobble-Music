@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.ExceptionServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 
@@ -16,7 +17,17 @@ internal sealed class ReleaseClient : IDisposable
     private const int MaxAssetPagesPerRelease = 10;
 
     private readonly HttpClient _http;
+    private readonly object _logGate = new();
+    // Stopwatch deadline of the running release check; 0 outside a check.
+    private long _checkDeadline;
     internal IReadOnlyList<RemoteRelease> VerifiedReleases { get; private set; } = [];
+    // Tags of releases that could not be reached and were provably not needed.
+    internal IReadOnlyList<string> SkippedReleaseTags { get; private set; } = [];
+    internal NetworkPolicy Policy { get; set; } = NetworkPolicy.Default;
+    internal Action<string>? DiagnosticLog { get; set; }
+    // Short player-facing text shown while a request is being retried.
+    internal Action<string>? RetryNotice { get; set; }
+    internal ReleaseMetadataCache? MetadataCache { get; set; }
     private readonly JsonSerializerOptions _jsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
@@ -48,36 +59,177 @@ internal sealed class ReleaseClient : IDisposable
         AllowAutoRedirect = true
     };
 
+    // Wires the release check to the updater log, the card and the verified
+    // metadata cache of this instance (1.2.18 network track).
+    internal void AttachReleaseCheck(UpdaterPaths paths, Action<string> log, Action<string> retryNotice)
+    {
+        DiagnosticLog = log;
+        RetryNotice = retryNotice;
+        MetadataCache = new ReleaseMetadataCache(paths.LocalDataDirectory);
+    }
+
     public async Task<IReadOnlyList<RemoteRelease>> GetUpdateChainAsync(
         UpdaterConfiguration configuration,
         InstalledState installedState,
         CancellationToken cancellationToken)
     {
-        List<GitHubRelease> releases = await GetPublishedModpackReleasesAsync(configuration, cancellationToken);
-        if (releases.Count == 0)
+        // One wall-clock budget covers the release index, asset lists and
+        // manifests. Its expiry surfaces as TimeoutException, which Program
+        // maps to the existing offline fallback; a cancellation requested by
+        // the caller still surfaces as OperationCanceledException.
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        budget.CancelAfter(Policy.ReleaseCheckBudget);
+        Volatile.Write(ref _checkDeadline, Deadline.After(Policy.ReleaseCheckBudget));
+        try
         {
-            return [];
-        }
-
-        // Manifests carry the delta base hash, so a chain cannot be selected
-        // safely from tags alone. Verify every candidate first, with bounded
-        // parallelism to avoid serial release latency or API bursts.
-        using var throttle = new SemaphoreSlim(4);
-        Task<RemoteRelease>[] tasks = releases.Select(async release =>
-        {
-            await throttle.WaitAsync(cancellationToken);
-            try
+            List<GitHubRelease> releases = await ListModpackReleasesAsync(configuration, budget.Token);
+            if (releases.Count == 0)
             {
-                return await DownloadAndVerifyReleaseAsync(release, configuration, cancellationToken);
+                return [];
             }
-            finally
+
+            // Manifests carry the delta base hash, so a chain cannot be selected
+            // safely from tags alone. Verify every candidate first, with bounded
+            // parallelism to avoid serial release latency or API bursts.
+            using var throttle = new SemaphoreSlim(4);
+            Task<ReleaseOutcome>[] tasks = releases
+                .Select(release => VerifyReleaseOutcomeAsync(release, configuration, throttle, budget.Token, cancellationToken))
+                .ToArray();
+            ReleaseOutcome[] outcomes = await Task.WhenAll(tasks);
+            List<RemoteRelease> verified = SelectReachableReleases(outcomes, installedState, budget.IsCancellationRequested);
+            VerifiedReleases = verified;
+            MetadataCache?.Prune(releases.Select(release => release.Id), Log);
+            return BuildSequentialChain(verified, installedState);
+        }
+        catch (OperationCanceledException exception) when (budget.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw BudgetExpired(exception);
+        }
+        finally
+        {
+            Volatile.Write(ref _checkDeadline, 0L);
+        }
+    }
+
+    private TimeoutException BudgetExpired(Exception inner) =>
+        new($"The update check did not finish within {Policy.ReleaseCheckBudget.TotalSeconds:0.###} seconds.", inner);
+
+    private TimeSpan? RemainingCheckBudget()
+    {
+        long deadline = Volatile.Read(ref _checkDeadline);
+        return deadline == 0 ? null : Deadline.Remaining(deadline);
+    }
+
+    internal sealed record ReleaseOutcome(GitHubRelease Release, RemoteRelease? Remote, Exception? Failure);
+
+    private async Task<ReleaseOutcome> VerifyReleaseOutcomeAsync(
+        GitHubRelease release,
+        UpdaterConfiguration configuration,
+        SemaphoreSlim throttle,
+        CancellationToken budgetToken,
+        CancellationToken callerToken)
+    {
+        bool entered = false;
+        try
+        {
+            await throttle.WaitAsync(budgetToken);
+            entered = true;
+            return new ReleaseOutcome(release, await VerifyReleaseAsync(release, configuration, budgetToken), null);
+        }
+        catch (Exception exception) when (!callerToken.IsCancellationRequested && IsUnreachable(exception))
+        {
+            // Decided after every release has finished: see SelectReachableReleases.
+            return new ReleaseOutcome(release, null, exception);
+        }
+        finally
+        {
+            if (entered)
             {
                 throttle.Release();
             }
-        }).ToArray();
-        RemoteRelease[] verified = await Task.WhenAll(tasks);
-        VerifiedReleases = verified;
-        return BuildSequentialChain(verified, installedState);
+        }
+    }
+
+    // Only transport-level failures make a release "unreachable". A bad
+    // signature, an invalid manifest or a protocol violation is never skipped
+    // (InvalidDataException is not an IOException).
+    private static bool IsUnreachable(Exception exception) =>
+        exception is HttpRequestException or TimeoutException or OperationCanceledException or IOException;
+
+    private List<RemoteRelease> SelectReachableReleases(
+        IReadOnlyList<ReleaseOutcome> outcomes,
+        InstalledState installedState,
+        bool budgetExpired)
+    {
+        Version newest = outcomes.Max(outcome => TagVersion(outcome.Release))!;
+        List<ReleaseOutcome> failures = outcomes
+            .Where(outcome => outcome.Failure is not null)
+            .OrderByDescending(outcome => TagVersion(outcome.Release))
+            .ToList();
+        List<ReleaseOutcome> needed = failures
+            .Where(outcome => IsOnUpdatePath(TagVersion(outcome.Release), newest, installedState))
+            .ToList();
+        if (needed.Count > 0)
+        {
+            foreach (ReleaseOutcome outcome in needed)
+            {
+                Log($"Release {outcome.Release.TagName} could not be reached and may be needed for this update: {ResilientIo.Describe(outcome.Failure!)}");
+            }
+            // A rate limit explains the failure best, so it decides the card text.
+            ReleaseOutcome decisive = needed.FirstOrDefault(outcome =>
+                ReleaseCheckDiagnostics.FindHttpFailure(outcome.Failure!) is { IsRateLimited: true }) ?? needed[0];
+            if (decisive.Failure is OperationCanceledException && budgetExpired)
+            {
+                throw BudgetExpired(decisive.Failure);
+            }
+            ExceptionDispatchInfo.Capture(decisive.Failure!).Throw();
+        }
+        foreach (ReleaseOutcome outcome in failures)
+        {
+            Log($"Skipped unreachable release {outcome.Release.TagName}: it is older than the installed {installedState.Version} and not needed to reach {newest} ({ResilientIo.Describe(outcome.Failure!)}).");
+        }
+        SkippedReleaseTags = failures.Select(outcome => outcome.Release.TagName).ToList();
+        return outcomes.Where(outcome => outcome.Remote is not null).Select(outcome => outcome.Remote!).ToList();
+    }
+
+    // Whether a release that could not be reached might matter to this
+    // update. Deliberately conservative: only a release older than a known
+    // installed version is skippable, because
+    // - the newest release is the convergence target,
+    // - the installed release anchors the delta chain, and every newer release
+    //   can be crossed by it or be the only signed source of a needed file,
+    // - with no installed version (fresh install) any release may be a source,
+    // - an installed state without an offered-seed ledger is back-filled by
+    //   UpdateEngine from every release up to the installed one.
+    internal static bool IsOnUpdatePath(Version releaseVersion, Version newestPublished, InstalledState installedState)
+    {
+        if (releaseVersion >= newestPublished)
+        {
+            return true;
+        }
+        if (!VersionPolicy.TryParseCanonical(installedState.Version, out Version? installed))
+        {
+            return true;
+        }
+        if (installedState.OfferedSeedPaths.Count == 0)
+        {
+            return true;
+        }
+        return releaseVersion >= installed;
+    }
+
+    private static Version TagVersion(GitHubRelease release) =>
+        VersionPolicy.TryParseCanonical(release.TagName["modpack-v".Length..], out Version? version)
+            ? version!
+            : throw new InvalidDataException($"GitHub release {release.TagName} has no canonical version.");
+
+    private void Log(string message)
+    {
+        // Releases are verified four at a time; the log sink appends to a file.
+        lock (_logGate)
+        {
+            DiagnosticLog?.Invoke(message);
+        }
     }
 
     internal static IReadOnlyList<RemoteRelease> BuildSequentialChain(
@@ -165,7 +317,31 @@ internal sealed class ReleaseClient : IDisposable
             .First();
     }
 
-    public async Task DownloadFileAsync(
+    // Payload parts: up to Policy.MaxAttempts attempts for transport errors,
+    // stalls (no byte for Policy.PayloadIdleTimeout), 5xx and 429. The partial
+    // file survives a transient failure, so each retry resumes with a Range
+    // request that ValidateDownloadResponse checks exactly as before. There
+    // is deliberately no total wall-clock cap on a download that is moving.
+    public Task DownloadFileAsync(
+        Uri source,
+        string destination,
+        long expectedSize,
+        Action<long>? reportDownloadedBytes,
+        CancellationToken cancellationToken) =>
+        ResilientIo.WithRetriesAsync(
+            Policy,
+            $"Download of {Path.GetFileName(destination)}",
+            async attemptToken =>
+            {
+                await DownloadFileOnceAsync(source, destination, expectedSize, reportDownloadedBytes, attemptToken);
+                return true;
+            },
+            Log,
+            RetryNotice,
+            remainingBudget: null,
+            cancellationToken);
+
+    private async Task DownloadFileOnceAsync(
         Uri source,
         string destination,
         long expectedSize,
@@ -193,7 +369,7 @@ internal sealed class ReleaseClient : IDisposable
                 request.Headers.Range = new RangeHeaderValue(existingSize, null);
             }
             using HttpResponseMessage response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-            response.EnsureSuccessStatusCode();
+            HttpResponses.EnsureSuccess(response, $"Download of {Path.GetFileName(destination)}");
 
             bool append = ValidateDownloadResponse(response, existingSize, expectedSize);
             if (!append)
@@ -211,12 +387,13 @@ internal sealed class ReleaseClient : IDisposable
                 1024 * 1024,
                 useAsync: true);
             byte[] buffer = ArrayPool<byte>.Shared.Rent(256 * 1024);
+            using var idle = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             try
             {
                 long downloaded = existingSize;
                 var reportTimer = Stopwatch.StartNew();
                 int read;
-                while ((read = await input.ReadAsync(buffer.AsMemory(), cancellationToken)) > 0)
+                while ((read = await ResilientIo.ReadAsync(input, buffer.AsMemory(), idle, Policy.PayloadIdleTimeout, cancellationToken)) > 0)
                 {
                     if (downloaded > expectedSize - read)
                     {
@@ -239,6 +416,12 @@ internal sealed class ReleaseClient : IDisposable
             await output.FlushAsync(cancellationToken);
 
             long finalSize = new FileInfo(destination).Length;
+            if (finalSize < expectedSize)
+            {
+                // The body ended early without a transport error. Keep the
+                // partial; the retry resumes it from this offset.
+                throw new TruncatedDownloadException($"Download of {Path.GetFileName(destination)} ended early at {finalSize:N0} of {expectedSize:N0} bytes.");
+            }
             if (finalSize != expectedSize)
             {
                 throw new InvalidDataException($"Downloaded size mismatch for {Path.GetFileName(destination)}. Expected {expectedSize:N0}, got {finalSize:N0} bytes.");
@@ -304,20 +487,44 @@ internal sealed class ReleaseClient : IDisposable
         UpdaterConfiguration configuration,
         CancellationToken cancellationToken)
     {
+        List<GitHubRelease> result = await ListModpackReleasesAsync(configuration, cancellationToken);
+        using var throttle = new SemaphoreSlim(4);
+        Task[] assetTasks = result.Select(async release =>
+        {
+            await throttle.WaitAsync(cancellationToken);
+            try
+            {
+                if (!NestedAssetsCarrySignedMetadata(release, configuration))
+                {
+                    await LoadCompleteAssetListAsync(configuration, release, cancellationToken);
+                }
+            }
+            finally
+            {
+                throttle.Release();
+            }
+        }).ToArray();
+        await Task.WhenAll(assetTasks);
+        return result.Where(release => CarriesSignedMetadata(release, configuration)).ToList();
+    }
+
+    // The release index pages only (normally one API call). Each release keeps
+    // the nested asset list GitHub embeds in this response.
+    private async Task<List<GitHubRelease>> ListModpackReleasesAsync(
+        UpdaterConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
         var result = new List<GitHubRelease>();
         for (int page = 1; page <= MaxReleasePages; page++)
         {
             string endpoint = $"https://api.github.com/repos/{configuration.Repository}/releases?per_page=100&page={page}";
-            using HttpResponseMessage response = await _http.GetAsync(endpoint, cancellationToken);
-            if (response.StatusCode == HttpStatusCode.NotFound)
+            byte[]? releaseIndex = await GetApiBytesAsync(endpoint, $"release list page {page}", notFoundMeansEmpty: true, cancellationToken);
+            if (releaseIndex is null)
             {
                 return [];
             }
-            response.EnsureSuccessStatusCode();
-
-            byte[] releaseIndex = await ReadBoundedBytesAsync(response.Content, MaxReleaseIndexBytes, cancellationToken);
             List<GitHubRelease>? pageReleases = JsonSerializer.Deserialize<List<GitHubRelease>>(releaseIndex, _jsonOptions);
-            if (pageReleases is null)
+            if (pageReleases is null || pageReleases.Any(candidate => candidate is null))
             {
                 throw new InvalidDataException("GitHub returned an invalid release index.");
             }
@@ -338,27 +545,39 @@ internal sealed class ReleaseClient : IDisposable
         {
             throw new InvalidDataException("GitHub returned a modpack release without a valid release ID.");
         }
-
-        // GitHub's nested `assets` field in list-releases responses may be
-        // truncated. Bind security-sensitive names and sizes only against the
-        // explicitly paginated release-assets endpoint.
-        using var throttle = new SemaphoreSlim(4);
-        Task[] assetTasks = result.Select(async release =>
+        foreach (GitHubRelease release in result)
         {
-            await throttle.WaitAsync(cancellationToken);
-            try
-            {
-                release.Assets = await GetAllReleaseAssetsAsync(configuration, release.Id, cancellationToken);
-            }
-            finally
-            {
-                throttle.Release();
-            }
-        }).ToArray();
-        await Task.WhenAll(assetTasks);
-        return result.Where(release =>
-            release.Assets.Any(asset => string.Equals(asset.Name, configuration.ManifestAsset, StringComparison.Ordinal))
-            && release.Assets.Any(asset => string.Equals(asset.Name, configuration.SignatureAsset, StringComparison.Ordinal))).ToList();
+            release.Assets ??= [];
+            release.AssetListIsComplete = false;
+        }
+        return result;
+    }
+
+    // The nested `assets` of a list-releases response come from the same
+    // API over the same TLS channel as /releases/{id}/assets, so they carry
+    // the same (unsigned) trust. What matters for security is unchanged:
+    // manifest and signature bytes are Ed25519-verified, and every signed
+    // payload part must bind to an asset of exactly its signed size before
+    // its bytes are SHA-256 checked. The only risk of the nested copy is that
+    // it could be incomplete; that shows up as a missing manifest, signature
+    // or part, and only then is the paginated endpoint called. This saves one
+    // API call per release per launch (bootstrap-path RC4).
+    private static bool NestedAssetsCarrySignedMetadata(GitHubRelease release, UpdaterConfiguration configuration) =>
+        release.Assets.All(asset => asset is not null)
+        && release.Assets.GroupBy(asset => asset.Name, StringComparer.OrdinalIgnoreCase).All(group => group.Count() == 1)
+        && CarriesSignedMetadata(release, configuration);
+
+    private static bool CarriesSignedMetadata(GitHubRelease release, UpdaterConfiguration configuration) =>
+        release.Assets.Any(asset => asset is not null && string.Equals(asset.Name, configuration.ManifestAsset, StringComparison.Ordinal))
+        && release.Assets.Any(asset => asset is not null && string.Equals(asset.Name, configuration.SignatureAsset, StringComparison.Ordinal));
+
+    private async Task LoadCompleteAssetListAsync(
+        UpdaterConfiguration configuration,
+        GitHubRelease release,
+        CancellationToken cancellationToken)
+    {
+        release.Assets = await GetAllReleaseAssetsAsync(configuration, release.Id, cancellationToken);
+        release.AssetListIsComplete = true;
     }
 
     internal async Task<List<GitHubAsset>> GetAllReleaseAssetsAsync(
@@ -374,9 +593,7 @@ internal sealed class ReleaseClient : IDisposable
         for (int page = 1; page <= MaxAssetPagesPerRelease; page++)
         {
             string endpoint = $"https://api.github.com/repos/{configuration.Repository}/releases/{releaseId}/assets?per_page=100&page={page}";
-            using HttpResponseMessage response = await _http.GetAsync(endpoint, cancellationToken);
-            response.EnsureSuccessStatusCode();
-            byte[] assetIndex = await ReadBoundedBytesAsync(response.Content, MaxReleaseIndexBytes, cancellationToken);
+            byte[] assetIndex = (await GetApiBytesAsync(endpoint, $"asset list of release {releaseId} page {page}", notFoundMeansEmpty: false, cancellationToken))!;
             List<GitHubAsset>? pageAssets = JsonSerializer.Deserialize<List<GitHubAsset>>(assetIndex, _jsonOptions);
             if (pageAssets is null || pageAssets.Count > 100 || pageAssets.Any(asset => asset is null))
             {
@@ -393,6 +610,51 @@ internal sealed class ReleaseClient : IDisposable
             }
         }
         throw new InvalidDataException($"GitHub release {releaseId} asset scan did not terminate safely.");
+    }
+
+    // One api.github.com GET with retries. Every response's status and rate
+    // limit headers are logged, so a 403 can be told apart from a network
+    // error in a friend's updater.log.
+    private Task<byte[]?> GetApiBytesAsync(
+        string endpoint,
+        string what,
+        bool notFoundMeansEmpty,
+        CancellationToken cancellationToken) =>
+        ResilientIo.WithRetriesAsync<byte[]?>(
+            Policy,
+            $"GitHub API {what}",
+            async attemptToken =>
+            {
+                using HttpResponseMessage response = await _http.GetAsync(endpoint, HttpCompletionOption.ResponseHeadersRead, attemptToken);
+                Log($"GitHub API {what}: {HttpResponses.DescribeStatus(response)}.");
+                if (notFoundMeansEmpty && response.StatusCode == HttpStatusCode.NotFound)
+                {
+                    return null;
+                }
+                HttpResponses.EnsureSuccess(response, $"GitHub API {what}");
+                return await ReadBoundedBytesAsync(response.Content, MaxReleaseIndexBytes, Policy.MetadataIdleTimeout, attemptToken);
+            },
+            Log,
+            RetryNotice,
+            RemainingCheckBudget,
+            cancellationToken);
+
+    // Returns null when the release carries no signed manifest/signature pair
+    // (not an updater release), exactly as the former list filter did.
+    private async Task<RemoteRelease?> VerifyReleaseAsync(
+        GitHubRelease release,
+        UpdaterConfiguration configuration,
+        CancellationToken cancellationToken)
+    {
+        if (!release.AssetListIsComplete && !NestedAssetsCarrySignedMetadata(release, configuration))
+        {
+            await LoadCompleteAssetListAsync(configuration, release, cancellationToken);
+        }
+        if (!CarriesSignedMetadata(release, configuration))
+        {
+            return null;
+        }
+        return await DownloadAndVerifyReleaseAsync(release, configuration, cancellationToken);
     }
 
     private async Task<RemoteRelease> DownloadAndVerifyReleaseAsync(
@@ -413,25 +675,152 @@ internal sealed class ReleaseClient : IDisposable
 
         ValidateBoundedAssetMetadata(manifestAsset, MaxManifestBytes, "manifest");
         ValidateBoundedAssetMetadata(signatureAsset, MaxSignatureBytes, "signature");
-        byte[] manifestBytes = await DownloadBytesAsync(
-            ValidatedAssetUri(manifestAsset),
-            MaxManifestBytes,
-            manifestAsset.Size,
-            cancellationToken);
-        byte[] signatureBytes = await DownloadBytesAsync(
-            ValidatedAssetUri(signatureAsset),
-            MaxSignatureBytes,
-            signatureAsset.Size,
-            cancellationToken);
-        UpdateManifest manifest = ManifestParser.VerifyAndParse(manifestBytes, signatureBytes);
-        IReadOnlyDictionary<string, Uri> urls = BindSignedPartAssets(manifest, assets);
+
+        byte[]? manifestBytes = null;
+        byte[]? signatureBytes = null;
+        UpdateManifest? manifest = null;
+        CachedReleaseMetadata? cached = MetadataCache?.TryLoad(release, manifestAsset, signatureAsset, Log);
+        if (cached is not null)
+        {
+            try
+            {
+                // Cached bytes get the full verification that downloaded
+                // bytes get; the cache is never trusted by itself.
+                manifest = VerifyReleaseMetadata(cached.ManifestBytes, cached.SignatureBytes, release);
+                manifestBytes = cached.ManifestBytes;
+                signatureBytes = cached.SignatureBytes;
+            }
+            catch (Exception exception) when (exception is InvalidDataException or JsonException)
+            {
+                Log($"Cached metadata for {release.TagName} failed verification ({exception.Message}); downloading it again.");
+                MetadataCache!.Evict(release.Id);
+                cached = null;
+            }
+        }
+        if (manifest is null)
+        {
+            manifestBytes = await DownloadBytesAsync(
+                ValidatedAssetUri(manifestAsset),
+                MaxManifestBytes,
+                manifestAsset.Size,
+                $"Download of {release.TagName} {manifestAsset.Name}",
+                cancellationToken);
+            signatureBytes = await DownloadBytesAsync(
+                ValidatedAssetUri(signatureAsset),
+                MaxSignatureBytes,
+                signatureAsset.Size,
+                $"Download of {release.TagName} {signatureAsset.Name}",
+                cancellationToken);
+            manifest = VerifyReleaseMetadata(manifestBytes, signatureBytes, release);
+        }
+
+        (IReadOnlyDictionary<string, Uri> urls, bool assetListChanged) = await BindPartsAsync(
+            release, configuration, manifest, manifestAsset, signatureAsset, cached, cancellationToken);
         ManifestParser.Validate(manifest, configuration, urls);
+        if (cached is null || assetListChanged)
+        {
+            MetadataCache?.Save(release, manifestAsset, signatureAsset, manifestBytes!, signatureBytes!, release.Assets, Log);
+        }
+        string manifestHash = Convert.ToHexString(SHA256.HashData(manifestBytes!)).ToLowerInvariant();
+        return new RemoteRelease(release, manifestBytes!, signatureBytes!, urls, manifest, manifestHash);
+    }
+
+    private static UpdateManifest VerifyReleaseMetadata(byte[] manifestBytes, byte[] signatureBytes, GitHubRelease release)
+    {
+        UpdateManifest manifest = ManifestParser.VerifyAndParse(manifestBytes, signatureBytes);
         if (!string.Equals(manifest.ReleaseTag, release.TagName, StringComparison.Ordinal))
         {
             throw new InvalidDataException("Signed manifest release tag does not match the GitHub release that carried it.");
         }
-        string manifestHash = Convert.ToHexString(SHA256.HashData(manifestBytes)).ToLowerInvariant();
-        return new RemoteRelease(release, manifestBytes, signatureBytes, urls, manifest, manifestHash);
+        return manifest;
+    }
+
+    // Binds signed payload parts to download URLs. Nested listing first; if it
+    // lacks a part, the asset list saved with a cache entry whose manifest and
+    // signature assets match the live listing; then the paginated endpoint.
+    // Every candidate goes through the same BindSignedPartAssets check.
+    private async Task<(IReadOnlyDictionary<string, Uri> Urls, bool AssetListChanged)> BindPartsAsync(
+        GitHubRelease release,
+        UpdaterConfiguration configuration,
+        UpdateManifest manifest,
+        GitHubAsset manifestAsset,
+        GitHubAsset signatureAsset,
+        CachedReleaseMetadata? cached,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            return (BindSignedPartAssets(manifest, AssetDictionary(release.Assets)), false);
+        }
+        catch (InvalidDataException) when (!release.AssetListIsComplete)
+        {
+        }
+
+        if (cached is not null && CachedAssetsAgree(cached.Assets, release.Assets, manifestAsset, signatureAsset))
+        {
+            try
+            {
+                return (BindSignedPartAssets(manifest, AssetDictionary(cached.Assets)), false);
+            }
+            catch (InvalidDataException)
+            {
+            }
+        }
+
+        await LoadCompleteAssetListAsync(configuration, release, cancellationToken);
+        if (release.Assets.GroupBy(asset => asset.Name, StringComparer.OrdinalIgnoreCase).Any(group => group.Count() != 1))
+        {
+            throw new InvalidDataException($"GitHub release {release.TagName} contains duplicate asset names.");
+        }
+        Dictionary<string, GitHubAsset> complete = AssetDictionary(release.Assets);
+        if (!complete.TryGetValue(configuration.ManifestAsset, out GitHubAsset? listedManifest)
+            || !complete.TryGetValue(configuration.SignatureAsset, out GitHubAsset? listedSignature)
+            || !ReleaseMetadataCache.SameAsset(listedManifest, manifestAsset)
+            || !ReleaseMetadataCache.SameAsset(listedSignature, signatureAsset))
+        {
+            throw new InvalidDataException($"GitHub release {release.TagName} changed its signed manifest assets during the update check.");
+        }
+        return (BindSignedPartAssets(manifest, complete), true);
+    }
+
+    private static Dictionary<string, GitHubAsset> AssetDictionary(IEnumerable<GitHubAsset> assets)
+    {
+        var result = new Dictionary<string, GitHubAsset>(StringComparer.OrdinalIgnoreCase);
+        foreach (GitHubAsset asset in assets)
+        {
+            if (asset is not null && !result.TryAdd(asset.Name, asset))
+            {
+                throw new InvalidDataException("GitHub release contains duplicate asset names.");
+            }
+        }
+        return result;
+    }
+
+    // A saved asset list is only a stand-in for the paginated endpoint while
+    // it still describes the live release: same manifest and signature asset,
+    // and identical entries for every asset the live listing shows.
+    private static bool CachedAssetsAgree(
+        IReadOnlyList<GitHubAsset> cachedAssets,
+        IReadOnlyList<GitHubAsset> liveAssets,
+        GitHubAsset manifestAsset,
+        GitHubAsset signatureAsset)
+    {
+        Dictionary<string, GitHubAsset> cachedByName;
+        try
+        {
+            cachedByName = AssetDictionary(cachedAssets);
+        }
+        catch (InvalidDataException)
+        {
+            return false;
+        }
+        return cachedByName.TryGetValue(manifestAsset.Name, out GitHubAsset? cachedManifest)
+            && ReleaseMetadataCache.SameAsset(cachedManifest, manifestAsset)
+            && cachedByName.TryGetValue(signatureAsset.Name, out GitHubAsset? cachedSignature)
+            && ReleaseMetadataCache.SameAsset(cachedSignature, signatureAsset)
+            && liveAssets.All(live => live is not null
+                && cachedByName.TryGetValue(live.Name, out GitHubAsset? saved)
+                && ReleaseMetadataCache.SameAsset(saved, live));
     }
 
     internal static IReadOnlyDictionary<string, Uri> BindSignedPartAssets(
@@ -474,23 +863,36 @@ internal sealed class ReleaseClient : IDisposable
         return uri;
     }
 
-    private async Task<byte[]> DownloadBytesAsync(
+    private Task<byte[]> DownloadBytesAsync(
         Uri source,
         int maximumBytes,
         long expectedBytes,
-        CancellationToken cancellationToken)
-    {
-        using HttpResponseMessage response = await _http.GetAsync(source, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
-        response.EnsureSuccessStatusCode();
-        byte[] bytes = await ReadBoundedBytesAsync(response.Content, maximumBytes, cancellationToken);
-        if (bytes.LongLength != expectedBytes)
-        {
-            throw new InvalidDataException($"GitHub asset size differs from its release metadata. Expected {expectedBytes:N0}, got {bytes.LongLength:N0} bytes.");
-        }
-        return bytes;
-    }
+        string what,
+        CancellationToken cancellationToken) =>
+        ResilientIo.WithRetriesAsync(
+            Policy,
+            what,
+            async attemptToken =>
+            {
+                using HttpResponseMessage response = await _http.GetAsync(source, HttpCompletionOption.ResponseHeadersRead, attemptToken);
+                HttpResponses.EnsureSuccess(response, what);
+                byte[] bytes = await ReadBoundedBytesAsync(response.Content, maximumBytes, Policy.MetadataIdleTimeout, attemptToken);
+                if (bytes.LongLength != expectedBytes)
+                {
+                    throw new InvalidDataException($"GitHub asset size differs from its release metadata. Expected {expectedBytes:N0}, got {bytes.LongLength:N0} bytes.");
+                }
+                return bytes;
+            },
+            Log,
+            RetryNotice,
+            RemainingCheckBudget,
+            cancellationToken);
 
-    private static async Task<byte[]> ReadBoundedBytesAsync(HttpContent content, int maximumBytes, CancellationToken cancellationToken)
+    private static async Task<byte[]> ReadBoundedBytesAsync(
+        HttpContent content,
+        int maximumBytes,
+        TimeSpan idleTimeout,
+        CancellationToken cancellationToken)
     {
         if (content.Headers.ContentLength is long contentLength && contentLength > maximumBytes)
         {
@@ -499,9 +901,10 @@ internal sealed class ReleaseClient : IDisposable
 
         await using Stream input = await content.ReadAsStreamAsync(cancellationToken);
         using var output = new MemoryStream();
+        using var idle = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         byte[] buffer = new byte[64 * 1024];
         int read;
-        while ((read = await input.ReadAsync(buffer, cancellationToken)) > 0)
+        while ((read = await ResilientIo.ReadAsync(input, buffer, idle, idleTimeout, cancellationToken)) > 0)
         {
             if (output.Length + read > maximumBytes)
             {

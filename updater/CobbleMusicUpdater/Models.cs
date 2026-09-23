@@ -64,10 +64,25 @@ internal sealed class GitHubRelease
 
     [JsonPropertyName("assets")]
     public List<GitHubAsset> Assets { get; set; } = [];
+
+    // True once Assets came from the paginated /releases/{id}/assets endpoint
+    // rather than the list-releases response's nested copy. Not serialized.
+    internal bool AssetListIsComplete { get; set; }
 }
 
 internal sealed class GitHubAsset
 {
+    // id, updated_at and digest key the verified release-metadata cache
+    // (ReleaseMetadataCache). They never replace signature verification.
+    [JsonPropertyName("id")]
+    public long Id { get; set; }
+
+    [JsonPropertyName("updated_at")]
+    public string? UpdatedAt { get; set; }
+
+    [JsonPropertyName("digest")]
+    public string? Digest { get; set; }
+
     [JsonPropertyName("name")]
     public string Name { get; set; } = "";
 

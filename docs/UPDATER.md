@@ -132,6 +132,42 @@ Normal source or updater-binary releases can live in this repository without
 interfering with clients. They are ignored unless they use the reserved,
 signed `modpack-v<version>` release format.
 
+### Network limits and the release-metadata cache (updater 1.2.18)
+
+- **Idle timeouts.** Every response body read is bounded by an inactivity
+  limit that resets after each successful read: 30 s for release metadata,
+  60 s for payload parts. A download that keeps moving is never cut off.
+- **Retries.** Transport errors, stalls, HTTP 5xx and 429 get three attempts
+  in total with jittered 2 s / 5 s backoff. `Retry-After` is honoured up to
+  60 s; a longer wait fails at once. Payload parts resume from the kept
+  partial file with a validated `Range` request. Each retry is logged and
+  the card shows "Connection stalled — retrying…" (or similar).
+- **Check budget.** The release check (release list, asset lists, manifests)
+  has 90 s in total. On expiry the updater takes the normal offline fallback.
+- **Verified metadata cache.** Each release's signed manifest and signature
+  are kept in `%LOCALAPPDATA%\CobbleMusicUpdater\<instance>\cache\releases\<release id>.json`,
+  keyed by release id, tag and the manifest/signature asset id, name, size and
+  `updated_at` (plus GitHub's sha256 `digest` when listed). Cached bytes are
+  re-verified with the compiled Ed25519 key, re-parsed and re-validated on
+  every launch exactly like downloaded bytes; an entry that fails is deleted
+  and downloaded again, and entries for releases GitHub no longer lists are
+  removed. The nested `assets` of the release list are used instead of one
+  `/releases/{id}/assets` call per release; the paginated endpoint is used
+  only when the nested list lacks the manifest, signature or a signed part.
+  Steady state: **one api.github.com call and no manifest downloads** per
+  launch.
+- **Skipping unreachable old releases.** A release that cannot be reached
+  (network only, never a verification failure) is skipped when it is older
+  than the installed version and the installed state has its offered-defaults
+  ledger. The newest release, the installed release, anything newer, every
+  release on a fresh install, and every release for a legacy state without
+  the ledger still fail the check.
+- **Diagnostics.** `updater.log` records each API response's HTTP status and
+  `X-RateLimit-Remaining`/`X-RateLimit-Reset`. On a GitHub rate limit (403
+  with no quota left, 403 with `Retry-After`, or 429) the card says "GitHub is
+  limiting update checks from this network until HH:MM — starting your
+  current pack."
+
 ## Why releases are chunked
 
 GitHub limits individual Release assets to under 2 GiB. The current Reactive
