@@ -10,6 +10,10 @@
     <RootNamespace>CobbleMusicUpdater</RootNamespace>
     <Version>1.2.17</Version>
     <PublishSingleFile>true</PublishSingleFile>
+    <!-- 1.2.18: measured 121,450,566 -> 54,371,276 bytes (-55%); first window +~80 ms; the pinned bootstrap's
+         per-launch SHA-256 passes over this exe take ~half as long; build stays byte-reproducible
+         (tests/Test-UpdaterBuildReproducibility.ps1). Trimming/AOT are unavailable for WinForms. -->
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <SelfContained>true</SelfContained>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <DebugType>embedded</DebugType>
