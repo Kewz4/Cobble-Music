@@ -15,6 +15,14 @@ internal sealed partial class UpdateEngine
         "packedpacks-" + (file.Path.EndsWith("/Default.profile.json", StringComparison.OrdinalIgnoreCase) ? "default-" : "realistic-")
         + file.Sha256.ToLowerInvariant();
 
+    // The game itself rewrites these signed files during normal play (Gravel's
+    // Extended Battles regenerates its TOML; Resourcify regenerates the .rpo
+    // pack overlays). Once the signed revision has been delivered, tolerate the
+    // runtime serialization instead of re-downloading historical payloads.
+    private static bool IsRuntimeMutableSignedConfig(string path) =>
+        path.Equals("config/gravels-extended-battles.toml", StringComparison.OrdinalIgnoreCase)
+        || path.EndsWith(".rpo", StringComparison.OrdinalIgnoreCase);
+
     // Reconcile only signed managed destinations. Player defaults stay create-only.
     // The transaction retains every displaced file in its recovery directory.
     internal async Task ConvergeToLatestAsync(IReadOnlyList<RemoteRelease> catalog,
@@ -39,6 +47,13 @@ internal sealed partial class UpdateEngine
             if (HistoricalManifestPolicy.IsPlayerOwned(target, file) || PathSafety.IsOptionalPlayerMod(file.Path)) continue;
             if (IsOfficialPackProfile(file.Path) && appliedRevisions.Contains(ProfileRevisionId(file))
                 && File.Exists(SafeLocal(file.Path))) continue;
+            if (IsRuntimeMutableSignedConfig(file.Path)
+                && File.Exists(SafeLocal(file.Path))
+                && state.ManagedFiles.Any(recorded => recorded.Path.Equals(file.Path, StringComparison.OrdinalIgnoreCase)
+                    && PathSafety.IsExpectedHash(recorded.Sha256, file.Sha256)))
+            {
+                continue;
+            }
             if (!await MatchesLocalAsync(file, token))
             {
                 needed.Add(file);
@@ -89,17 +104,29 @@ internal sealed partial class UpdateEngine
         PathSafety.AssertNoReparsePointsOnTargetPath(_paths.LocalDataDirectory, work);
         string incoming = Path.Combine(work, "incoming");
         Directory.CreateDirectory(incoming);
-        var groups = new Dictionary<RemoteRelease, List<ManifestFile>>();
+        // Two complete sourcing plans are built and the cheaper one wins:
+        //  * per-file cheapest payload (ideal for small repairs), and
+        //  * newest schema-1 baseline first (ideal when most of the inventory
+        //    is needed: one full payload instead of a patchwork of historical
+        //    releases that can cost several times the pack size).
+        var byCheapest = new Dictionary<RemoteRelease, List<ManifestFile>>();
+        var byNewestBaseline = new Dictionary<RemoteRelease, List<ManifestFile>>();
         foreach (ManifestFile file in needed.Concat(seeds))
         {
-            RemoteRelease origin = catalog.Where(r => r.Manifest.Payload is not null
+            token.ThrowIfCancellationRequested();
+            List<RemoteRelease> sources = catalog.Where(r => r.Manifest.Payload is not null
                 && ManifestParser.PayloadContents(r.Manifest).Any(f => f.Path.Equals(file.Path, StringComparison.OrdinalIgnoreCase)
-                    && ManifestParser.SameFile(f, file)))
-                .OrderBy(r => r.Manifest.Payload!.Size).FirstOrDefault()
-                ?? throw new InvalidDataException($"No signed downloadable source exists for {file.Path}; release is incomplete.");
-            if (!groups.TryGetValue(origin, out List<ManifestFile>? list)) groups[origin] = list = [];
-            list.Add(file);
+                    && ManifestParser.SameFile(f, file))).ToList();
+            if (sources.Count == 0)
+                throw new InvalidDataException($"No signed downloadable source exists for {file.Path}; release is incomplete.");
+            RemoteRelease cheapest = sources.OrderBy(r => r.Manifest.Payload!.Size).First();
+            RemoteRelease? newestBaseline = sources.Where(r => r.Manifest.SchemaVersion == 1)
+                .OrderByDescending(r => Version.Parse(r.Manifest.Version)).FirstOrDefault();
+            AddToSourcingPlan(byCheapest, cheapest, file);
+            AddToSourcingPlan(byNewestBaseline, newestBaseline ?? cheapest, file);
         }
+        Dictionary<RemoteRelease, List<ManifestFile>> groups =
+            SourcingPlanBytes(byNewestBaseline) < SourcingPlanBytes(byCheapest) ? byNewestBaseline : byCheapest;
         long requiredSpace = checked(needed.Concat(seeds).Sum(f => f.Size) * 2
             + groups.Keys.Sum(r => r.Manifest.Payload!.Size) + DiskReserveBytes);
         if (new DriveInfo(Path.GetPathRoot(work)!).AvailableFreeSpace < requiredSpace)
@@ -121,6 +148,16 @@ internal sealed partial class UpdateEngine
         _log($"Release {target.Version} committed and verified: {needed.Count} repaired files. Prior files remain in recovery backups.");
         Report(UpdatePhase.Complete, $"Verified {target.Version} — starting Minecraft.");
     }
+
+    private static void AddToSourcingPlan(Dictionary<RemoteRelease, List<ManifestFile>> plan,
+        RemoteRelease origin, ManifestFile file)
+    {
+        if (!plan.TryGetValue(origin, out List<ManifestFile>? list)) plan[origin] = list = [];
+        list.Add(file);
+    }
+
+    private static long SourcingPlanBytes(Dictionary<RemoteRelease, List<ManifestFile>> plan) =>
+        plan.Keys.Sum(r => r.Manifest.Payload!.Size);
 
     private string SafeLocal(string path)
     {

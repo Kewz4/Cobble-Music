@@ -215,8 +215,9 @@ internal static class Program
             showCloseButton: false);
 
         Equal(new Size(650, 218), layout.ClientSize, "120 DPI client size");
-        Equal(new Rectangle(31, 28, 533, 35), layout.TitleBounds, "120 DPI title bounds");
-        Equal(new Rectangle(574, 28, 45, 35), layout.MinimizeBounds, "120 DPI minimize bounds");
+        Equal(new Rectangle(31, 28, 488, 35), layout.TitleBounds, "120 DPI title bounds");
+        Equal(new Rectangle(529, 28, 45, 35), layout.MinimizeBounds, "120 DPI minimize bounds");
+        Equal(new Rectangle(574, 28, 45, 35), layout.ForceCloseBounds, "120 DPI force-close bounds");
         Equal(new Rectangle(32, 67, 587, 21), layout.SubtitleBounds, "120 DPI subtitle bounds");
         Equal(new Rectangle(31, 107, 588, 29), layout.StatusBounds, "120 DPI status bounds");
         Equal(new Rectangle(32, 137, 587, 22), layout.DetailBounds, "120 DPI detail bounds");
@@ -381,6 +382,7 @@ internal static class Program
 
         Control title = FindControl(form, "titleLabel");
         Control minimize = FindControl(form, "minimizeButton");
+        Control forceClose = FindControl(form, "forceCloseButton");
         Control subtitle = FindControl(form, "subtitleLabel");
         Control status = FindControl(form, "statusLabel");
         Control detail = FindControl(form, "detailLabel");
@@ -401,20 +403,24 @@ internal static class Program
         Equal(expected.MinimizeBounds, minimize.Bounds, $"{context}: exact minimize bounds");
         Equal("Minimize", minimize.AccessibleName!, $"{context}: accessible minimize label");
         Equal(true, minimize.TabStop, $"{context}: minimize is keyboard accessible");
+        Equal(expected.ForceCloseBounds, forceClose.Bounds, $"{context}: exact force-close bounds");
+        Equal("Close updater", forceClose.AccessibleName!, $"{context}: accessible force-close label");
+        Equal(true, forceClose.TabStop, $"{context}: force-close is keyboard accessible");
         Equal(expected.SubtitleBounds, subtitle.Bounds, $"{context}: exact subtitle bounds");
         Equal(expected.StatusBounds, status.Bounds, $"{context}: exact status bounds");
         Equal(expected.DetailBounds, detail.Bounds, $"{context}: exact detail bounds");
         Equal(expected.ProgressBounds, progress.Bounds, $"{context}: exact progress bounds");
         Equal(expected.CloseBounds, close.Bounds, $"{context}: exact close bounds");
 
-        foreach (Control control in new[] { title, minimize, subtitle, status, detail, progress, close })
+        foreach (Control control in new[] { title, minimize, forceClose, subtitle, status, detail, progress, close })
         {
             Equal(true, form.ClientRectangle.Contains(control.Bounds), $"{context}: {control.Name} inside client bounds");
         }
 
         Equal(true, title.Bottom <= subtitle.Top, $"{context}: title/subtitle separation");
         Equal(true, title.Right < minimize.Left, $"{context}: title/minimize separation");
-        Equal(true, minimize.Bottom <= subtitle.Top, $"{context}: minimize/subtitle separation");
+        Equal(true, minimize.Right <= forceClose.Left, $"{context}: minimize/force-close separation");
+        Equal(true, forceClose.Bottom <= subtitle.Top, $"{context}: force-close/subtitle separation");
         Equal(true, subtitle.Bottom <= status.Top, $"{context}: subtitle/status separation");
         Equal(true, status.Bottom <= detail.Top, $"{context}: status/detail separation");
         Equal(true, detail.Bottom <= progress.Top, $"{context}: detail/progress separation");

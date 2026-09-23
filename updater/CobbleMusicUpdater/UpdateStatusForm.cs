@@ -10,6 +10,7 @@ internal readonly record struct UpdateStatusLayout(
     Size ClientSize,
     Rectangle TitleBounds,
     Rectangle MinimizeBounds,
+    Rectangle ForceCloseBounds,
     Rectangle SubtitleBounds,
     Rectangle StatusBounds,
     Rectangle DetailBounds,
@@ -31,6 +32,7 @@ internal sealed class UpdateStatusForm : Form
     private readonly Label _detailLabel;
     private readonly SmoothProgressIndicator _progressIndicator;
     private readonly Button _minimizeButton;
+    private readonly Button _forceCloseButton;
     private readonly Button _closeButton;
     private readonly System.Windows.Forms.Timer _closeTimer;
     private readonly TransferMetricsTracker _transferMetrics = new(Stopwatch.Frequency);
@@ -115,6 +117,25 @@ internal sealed class UpdateStatusForm : Form
         _minimizeButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(84, 72, 113);
         _minimizeButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(43, 38, 58);
         _minimizeButton.Click += (_, _) => WindowState = FormWindowState.Minimized;
+        // Kewz's request: an always-available X that fully terminates the updater
+        // like an End Task, even while an update is running. Downloads resume on
+        // the next launch; a mid-transaction kill is recovered from the journal.
+        _forceCloseButton = new Button
+        {
+            Name = "forceCloseButton",
+            Text = "×",
+            AccessibleName = "Close updater",
+            AccessibleDescription = "Immediately closes the updater; a running update resumes on the next launch.",
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.FromArgb(57, 53, 73),
+            ForeColor = Color.FromArgb(239, 230, 255),
+            Font = new Font("Segoe UI", 9F, FontStyle.Bold, GraphicsUnit.Point),
+            TabIndex = 1
+        };
+        _forceCloseButton.FlatAppearance.BorderSize = 0;
+        _forceCloseButton.FlatAppearance.MouseOverBackColor = Color.FromArgb(150, 68, 88);
+        _forceCloseButton.FlatAppearance.MouseDownBackColor = Color.FromArgb(110, 46, 62);
+        _forceCloseButton.Click += (_, _) => Environment.Exit(ExitCode);
         _closeButton = new Button
         {
             Name = "closeButton",
@@ -150,6 +171,7 @@ internal sealed class UpdateStatusForm : Form
         Controls.Add(_detailLabel);
         Controls.Add(_progressIndicator);
         Controls.Add(_minimizeButton);
+        Controls.Add(_forceCloseButton);
         Controls.Add(_closeButton);
         AutoScaleDimensions = new SizeF(DesignDpi, DesignDpi);
         AutoScaleMode = AutoScaleMode.Dpi;
@@ -216,15 +238,22 @@ internal sealed class UpdateStatusForm : Form
         int top = Scale(22);
         int titleHeight = Math.Max(Scale(25), titlePreferredHeight);
         int minimizeWidth = Scale(36);
+        int forceCloseWidth = Scale(36);
+        int buttonHeight = Math.Max(Scale(28), titleHeight);
+        var forceCloseBounds = new Rectangle(
+            clientWidth - outerRight - forceCloseWidth,
+            top,
+            forceCloseWidth,
+            buttonHeight);
         var minimizeBounds = new Rectangle(
-            clientWidth - outerRight - minimizeWidth,
+            forceCloseBounds.Left - minimizeWidth,
             top,
             minimizeWidth,
-            Math.Max(Scale(28), titleHeight));
+            buttonHeight);
         var titleBounds = new Rectangle(
             outerLeft,
             top,
-            Math.Max(1, contentWidth - minimizeWidth - Scale(8)),
+            Math.Max(1, contentWidth - minimizeWidth - forceCloseWidth - Scale(8)),
             titleHeight);
 
         top = Math.Max(titleBounds.Bottom, minimizeBounds.Bottom) + Scale(3);
@@ -267,6 +296,7 @@ internal sealed class UpdateStatusForm : Form
             new Size(clientWidth, clientHeight),
             titleBounds,
             minimizeBounds,
+            forceCloseBounds,
             subtitleBounds,
             statusBounds,
             detailBounds,
@@ -472,6 +502,7 @@ internal sealed class UpdateStatusForm : Form
             }
             _titleLabel.Bounds = layout.TitleBounds;
             _minimizeButton.Bounds = layout.MinimizeBounds;
+            _forceCloseButton.Bounds = layout.ForceCloseBounds;
             _subtitleLabel.Bounds = layout.SubtitleBounds;
             _statusLabel.Bounds = layout.StatusBounds;
             _detailLabel.Bounds = layout.DetailBounds;
