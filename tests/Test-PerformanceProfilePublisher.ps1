@@ -51,7 +51,7 @@ Assert-True (Test-CobbleShaderSettingPath -Path 'shaderpacks/ComplementaryReimag
 Assert-True (Test-CobbleShaderSettingPath -Path 'config/kewz-shader-profiles.json') 'Shader profiles were not recognized.'
 
 $rejections = @(
-    @{ Why = 'Iris settings'; Edit = { param($p) $p.lite.settings = @([pscustomobject]@{ path = 'config/iris.properties'; format = 'properties'; key = 'enableShaders'; value = 'false' }) } },
+    @{ Why = 'Iris settings'; Edit = { param($p) $p.lite.settings = @([pscustomobject]@{ path = 'config/iris.properties'; format = 'properties'; key = 'maxShadowRenderDistance'; value = '16' }) } },
     @{ Why = 'shader profiles'; Edit = { param($p) $p.lite.settings = @([pscustomobject]@{ path = 'config/kewz-shader-profiles.json'; format = 'json'; key = 'grassierGrassMode'; value = '"OFF"' }) } },
     @{ Why = 'shaderpack options'; Edit = { param($p) $p.lite.settings = @([pscustomobject]@{ path = 'shaderpacks/x.zip.txt'; format = 'properties'; key = 'SHADOW_QUALITY'; value = '-1' }) } },
     @{ Why = 'the options pack list'; Edit = { param($p) $p.lite.settings = @([pscustomobject]@{ path = 'options.txt'; format = 'options'; key = 'resourcePacks'; value = '[]' }) } },
