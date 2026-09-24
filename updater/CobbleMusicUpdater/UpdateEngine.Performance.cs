@@ -209,7 +209,7 @@ internal sealed partial class UpdateEngine
         if (needProbe)
         {
             Report(UpdatePhase.Validating, "Checking this computer’s speed (only once)…");
-            (double? score, double? qps, string error) = await RunCpuProbeAsync(token);
+            (double? score, double? qps, double? interference, double? busyScore, string error) = await RunCpuProbeAsync(token);
             record = new MachinePerformanceRecord
             {
                 MeasuredAtUtc = DateTimeOffset.UtcNow,
@@ -217,6 +217,8 @@ internal sealed partial class UpdateEngine
                 CpuName = cpuName,
                 CpuScore = score,
                 CpuQuantaPerSecond = qps,
+                CpuInterference = interference,
+                CpuBusyScore = busyScore,
                 CpuError = error,
                 CpuAttempts = (sameProcessor ? record!.CpuAttempts : 0) + 1,
                 Gpus = gpus.ToList(),
@@ -272,7 +274,8 @@ internal sealed partial class UpdateEngine
         _ => "not on either list"
     };
 
-    private async Task<(double? Score, double? QuantaPerSecond, string Error)> RunCpuProbeAsync(CancellationToken token)
+    private async Task<(double? Score, double? QuantaPerSecond, double? Interference, double? BusyScore, string Error)> RunCpuProbeAsync(
+        CancellationToken token)
     {
         using var probeCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
         Task<CpuProbeResult> probe = Task.Factory.StartNew(
@@ -291,21 +294,31 @@ internal sealed partial class UpdateEngine
             probeCancellation.Cancel();
             string timeout = $"the processor check timed out after {_performanceEnvironment.ProbeTimeout.TotalSeconds:0.#} s";
             _log($"Performance check: {timeout}; it does not count toward lite.");
-            return (null, null, timeout);
+            return (null, null, null, null, timeout);
         }
         if (probe.IsFaulted || probe.IsCanceled)
         {
             string failure = probe.IsCanceled ? "the processor check was cancelled"
                 : $"the processor check failed ({probe.Exception!.InnerException?.GetType().Name}: {probe.Exception.InnerException?.Message})";
             _log($"Performance check: {failure}; it does not count toward lite.");
-            return (null, null, failure);
+            return (null, null, null, null, failure);
         }
         CpuProbeResult result = probe.Result;
-        if (!double.IsFinite(result.Score) || result.Score <= 0 || result.Score > 1_000_000)
+        if (!double.IsFinite(result.Score) || result.Score <= 0 || result.Score > 1_000_000 || !double.IsFinite(result.Interference))
         {
-            return (null, null, "the processor check returned an invalid score");
+            return (null, null, null, null, "the processor check returned an invalid score");
         }
-        return (Math.Round(result.Score, 1), Math.Round(result.QuantaPerSecond, 1), "");
+        double interference = Math.Round(result.Interference, 2);
+        if (interference > _performanceEnvironment.MaximumInterference)
+        {
+            // Other programs slowed the check down (a disturbed run can read a third of the real speed), so this
+            // score would wrongly call the PC slow. It does not vote; the next launch measures again.
+            string busy = $"the computer was busy during the processor check (score {result.Score.ToString("0", CultureInfo.InvariantCulture)}, "
+                + $"typical step {(interference * 100).ToString("0", CultureInfo.InvariantCulture)}% slower than the fastest)";
+            _log($"Performance check: {busy}; it does not count toward lite and is measured again next launch.");
+            return (null, null, interference, Math.Round(result.Score, 1), busy);
+        }
+        return (Math.Round(result.Score, 1), Math.Round(result.QuantaPerSecond, 1), interference, null, "");
     }
 
     // Never fails the update: an error rolls this one transaction back, is logged, and Minecraft starts with the

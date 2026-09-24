@@ -109,6 +109,9 @@ internal sealed class MachinePerformanceRecord
     public string CpuName { get; set; } = "";
     public double? CpuScore { get; set; }
     public double? CpuQuantaPerSecond { get; set; }
+    public double? CpuInterference { get; set; }
+    // The score of the last measurement that was too disturbed to count (for the log only; it never votes).
+    public double? CpuBusyScore { get; set; }
     public string CpuError { get; set; } = "";
     public int CpuAttempts { get; set; }
     public List<GpuAdapterInfo> Gpus { get; set; } = [];

@@ -14,12 +14,17 @@ internal sealed class PerformanceEnvironment
     public Func<IReadOnlyList<GpuAdapterInfo>> ReadGpus { get; init; } = GpuRegistry.Read;
     public Func<CancellationToken, CpuProbeResult> MeasureCpu { get; init; } = token => SingleCoreProbe.Run(token);
     public TimeSpan ProbeTimeout { get; init; } = TimeSpan.FromSeconds(5);
+    // A measurement disturbed more than this never votes lite (see CpuProbeResult.Interference).
+    public double MaximumInterference { get; init; } = 0.9;
     public int MaximumCpuAttempts { get; init; } = 3;
 
     public static PerformanceEnvironment Default { get; } = new();
 }
 
-internal sealed record CpuProbeResult(double Score, double QuantaPerSecond, long ElapsedMilliseconds);
+// Interference = how much slower the typical (median) work step was than the fast tail (p50/p05 - 1). A quiet PC
+// reads about 0.3-0.7; a PC busy with other programs reads more (measured on Kewz's i7-10750H with Minecraft
+// running: 1.06-1.71 while the score fell from ~1000 to 315-399).
+internal sealed record CpuProbeResult(double Score, double QuantaPerSecond, long ElapsedMilliseconds, double Interference = 0);
 
 internal static class CpuRegistry
 {
@@ -220,8 +225,10 @@ internal static class SingleCoreProbe
         if (times.Count < 20) throw new InvalidOperationException("The processor check could not complete enough work.");
         times.Sort();
         double fastTailSeconds = times[times.Count / 20] / (double)Stopwatch.Frequency;
+        double medianSeconds = times[times.Count / 2] / (double)Stopwatch.Frequency;
         double quantaPerSecond = 1.0 / fastTailSeconds;
-        return new CpuProbeResult(1000.0 * quantaPerSecond / ReferenceQuantaPerSecond, quantaPerSecond, total.ElapsedMilliseconds);
+        return new CpuProbeResult(1000.0 * quantaPerSecond / ReferenceQuantaPerSecond, quantaPerSecond, total.ElapsedMilliseconds,
+            medianSeconds / fastTailSeconds - 1.0);
     }
 
     private static int[] BuildCycle(int length, uint seed)

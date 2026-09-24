@@ -332,6 +332,32 @@ internal static partial class Program
             await new UpdateEngine(retry, Configuration(), _ => { }, performanceEnvironment: failing).PreparePerformancePlanAsync(lite, false, NoCancellation);
         Equal(3, failures, "a failing check is retried at most three times");
 
+        // A disturbed measurement (Minecraft or other programs busy during the check) never votes lite and is
+        // measured again next launch. Numbers from Kewz's i7-10750H with Minecraft running: score 315, interference 1.40.
+        UpdaterPaths busyPc = Paths(Path.Combine(root, "busy"));
+        Directory.CreateDirectory(busyPc.MinecraftDirectory);
+        int busyRuns = 0;
+        var busy = new PerformanceEnvironment
+        {
+            ReadCpuName = () => "Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz",
+            ReadGpus = () => [Gpu("Intel(R) UHD Graphics"), Gpu("NVIDIA GeForce RTX 2070 Super")],
+            MeasureCpu = _ => ++busyRuns < 3 ? new CpuProbeResult(315, 2046, 956, 1.40) : new CpuProbeResult(1001, 6506, 954, 0.32)
+        };
+        var busyLogs = new List<string>();
+        PerformancePlan busyPlan = await new UpdateEngine(busyPc, Configuration(), busyLogs.Add, performanceEnvironment: busy)
+            .PreparePerformancePlanAsync(lite, false, NoCancellation);
+        Equal(PerformanceMode.Full, busyPlan.Mode, "a disturbed low score does not make the PC lite");
+        Equal(true, busyLogs.Any(entry => entry.Contains("the computer was busy during the processor check (score 315, typical step 140% slower", StringComparison.Ordinal)),
+            "the disturbed run is logged with its numbers");
+        Equal(315.0, MachinePerformanceStore.Load(MachinePerformanceStore.PathFor(busyPc))!.CpuBusyScore, "the disturbed score is kept for reference");
+        await new UpdateEngine(busyPc, Configuration(), _ => { }, performanceEnvironment: busy).PreparePerformancePlanAsync(lite, false, NoCancellation);
+        PerformancePlan quietPlan = await new UpdateEngine(busyPc, Configuration(), _ => { }, performanceEnvironment: busy).PreparePerformancePlanAsync(lite, false, NoCancellation);
+        Equal(3, busyRuns, "measured again until a quiet run");
+        Equal(1001.0, MachinePerformanceStore.Load(MachinePerformanceStore.PathFor(busyPc))!.CpuScore, "the quiet score is recorded");
+        Equal(PerformanceMode.Lite, quietPlan.Mode, "the quiet score (1001 < 1050) decides");
+        await new UpdateEngine(busyPc, Configuration(), _ => { }, performanceEnvironment: busy).PreparePerformancePlanAsync(lite, false, NoCancellation);
+        Equal(3, busyRuns, "and never again after that");
+
         // No lite list in the release: no check at all.
         UpdaterPaths none = Paths(Path.Combine(root, "no-lite"));
         Directory.CreateDirectory(none.MinecraftDirectory);

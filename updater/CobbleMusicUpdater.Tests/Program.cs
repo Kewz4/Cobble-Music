@@ -27,6 +27,19 @@ internal static partial class Program
                 Console.WriteLine("Catalog convergence regressions passed.");
                 return 0;
             }
+            if (args.Length == 1 && args[0] == "--probe-hardware")
+            {
+                // 1.2.22 lite mode: the real registry reads and the real processor probe on this PC (read-only).
+                Console.WriteLine("processor: " + CpuRegistry.ReadName());
+                foreach (GpuAdapterInfo gpu in GpuRegistry.Read())
+                    Console.WriteLine($"graphics: {gpu.Name} | {gpu.DeviceId} | {gpu.MemoryBytes:N0} bytes");
+                for (int run = 0; run < 3; run++)
+                {
+                    CpuProbeResult result = SingleCoreProbe.Run(CancellationToken.None);
+                    Console.WriteLine($"probe run {run + 1}: score {result.Score:F0}, {result.QuantaPerSecond:F1} quanta/s, interference {result.Interference:P0}, {result.ElapsedMilliseconds} ms");
+                }
+                return 0;
+            }
             if (args.Length == 2 && args[0] == "--sourcing-regression")
             {
                 TestPublishedFreshInstallSourcing(args[1]);
