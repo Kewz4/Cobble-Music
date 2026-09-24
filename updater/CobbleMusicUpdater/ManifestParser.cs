@@ -71,6 +71,7 @@ internal static class ManifestParser
         {
             throw new InvalidDataException("Signed release manifest overlaps managed files and create-only defaults.");
         }
+        PerformanceProfilePolicy.Validate(manifest, files, seedFiles, requiredUpdater!);
 
         if (manifest.SchemaVersion == 1)
         {

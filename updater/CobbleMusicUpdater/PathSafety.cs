@@ -140,6 +140,78 @@ internal static class PathSafety
         return false;
     }
 
+    // ---- 1.2.22 lite mode: the only files a performance profile may ever edit --------------------------------
+    // Compiled in, so a signed manifest can choose keys and values but never widen the set of files. Every file
+    // here is a player-owned setting of a non-shader mod. Shaderpack options, Iris settings and the shader
+    // profiles are deliberately absent and are also rejected by IsShaderSettingPath (Kewz, 2026-09-23: "dont
+    // worry about complementary shaders, we already got the best settings").
+    private static readonly Dictionary<string, string> PerformanceSettingTargets = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["options.txt"] = "options",
+        ["config/sodium-options.json"] = "json",
+        ["config/sodium-extra-options.json"] = "json",
+        ["config/voxy-config.json"] = "json",
+        ["config/vss-client-config.json"] = "json",
+        ["config/astoutline.json"] = "json",
+        ["config/asyncparticles/asyncparticles.json"] = "json",
+        ["config/gnetum.json"] = "json",
+        ["config/xaero/world-map/profiles/cobbleverse.cfg"] = "properties",
+        ["config/xaero/minimap/profiles/cobbleverse.cfg"] = "properties"
+    };
+
+    public const string PerformanceLedgerPath = "cobble-music-updater/performance-state.json";
+
+    public static string? PerformanceSettingFormat(string normalizedRelativePath) =>
+        !IsShaderSettingPath(normalizedRelativePath)
+            && PerformanceSettingTargets.TryGetValue(normalizedRelativePath, out string? format) ? format : null;
+
+    public static bool IsShaderSettingPath(string normalizedRelativePath)
+    {
+        string path = normalizedRelativePath.Replace('\\', '/');
+        string name = path.Split('/')[^1];
+        return path.StartsWith("shaderpacks/", StringComparison.OrdinalIgnoreCase)
+            || path.Contains("shader", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("iris", StringComparison.OrdinalIgnoreCase)
+            || name.StartsWith("oculus", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // options.txt keys a performance profile may never edit: the pack list (Packed Packs owns it), keybinds,
+    // and anything shader-related.
+    public static bool IsPerformanceOptionsKeyAllowed(string key) =>
+        !string.IsNullOrEmpty(key)
+        && key.Length <= 128
+        && key.All(character => char.IsAsciiLetterOrDigit(character) || character is '_' or '.' or '-')
+        && !key.StartsWith("key_", StringComparison.Ordinal)
+        && !key.Equals("resourcePacks", StringComparison.Ordinal)
+        && !key.Equals("incompatibleResourcePacks", StringComparison.Ordinal)
+        && !key.Equals("version", StringComparison.Ordinal)
+        && !key.Contains("shader", StringComparison.OrdinalIgnoreCase);
+
+    public static bool IsLiteModPath(string normalizedRelativePath)
+    {
+        if (!normalizedRelativePath.StartsWith("mods/", StringComparison.OrdinalIgnoreCase)) return false;
+        string fileName = normalizedRelativePath["mods/".Length..];
+        return fileName.Length > ".jar".Length
+            && !fileName.Contains('/')
+            && fileName.EndsWith(".jar", StringComparison.OrdinalIgnoreCase)
+            && !IsOptionalPlayerMod(normalizedRelativePath);
+    }
+
+    public static bool IsOfficialPackProfilePath(string normalizedRelativePath) =>
+        normalizedRelativePath.Equals("config/packed_packs/profiles/resourcepacks/Default.profile.json", StringComparison.OrdinalIgnoreCase)
+        || normalizedRelativePath.Equals("config/packed_packs/profiles/resourcepacks/Realistic.profile.json", StringComparison.OrdinalIgnoreCase);
+
+    // Files a performance transaction may create, replace or delete (recovery validates journals against this).
+    public static bool IsPerformanceOutcomeAllowed(string normalizedRelativePath)
+    {
+        if (normalizedRelativePath.Equals(PerformanceLedgerPath, StringComparison.OrdinalIgnoreCase)) return true;
+        if (IsOfficialPackProfilePath(normalizedRelativePath)) return true;
+        if (PerformanceSettingFormat(normalizedRelativePath) is not null) return true;
+        if (normalizedRelativePath.EndsWith(".jar.disabled", StringComparison.OrdinalIgnoreCase))
+            return IsLiteModPath(normalizedRelativePath[..^".disabled".Length]);
+        return IsLiteModPath(normalizedRelativePath);
+    }
+
     public static string CombineUnder(string root, string normalizedRelativePath)
     {
         string rootFullPath = Path.GetFullPath(root);

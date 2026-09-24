@@ -134,6 +134,10 @@ internal sealed class UpdateManifest
     public List<ManifestFile> Files { get; set; } = [];
     public List<string> DeletePaths { get; set; } = [];
     public List<LegacyCleanupFile> LegacyCleanup { get; set; } = [];
+    // Updater 1.2.22: signed, data-driven performance profiles (only "lite" today). Absent or null means
+    // every PC runs the full pack. Updaters before 1.2.22 do not know this property and skip it, so the
+    // publisher and ManifestParser require minimumUpdaterVersion 1.2.22 whenever it is present.
+    public PerformanceProfiles? PerformanceProfiles { get; set; }
 }
 
 internal sealed class ManifestBase

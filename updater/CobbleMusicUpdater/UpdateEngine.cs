@@ -13,19 +13,22 @@ internal sealed partial class UpdateEngine
     private readonly Action<string> _log;
     private readonly IProgress<UpdateProgress>? _progress;
     private readonly IReadOnlyList<RemoteRelease>? _verifiedCatalog;
+    private readonly PerformanceEnvironment _performanceEnvironment;
 
     public UpdateEngine(
         UpdaterPaths paths,
         UpdaterConfiguration configuration,
         Action<string> log,
         IProgress<UpdateProgress>? progress = null,
-        IReadOnlyList<RemoteRelease>? verifiedCatalog = null)
+        IReadOnlyList<RemoteRelease>? verifiedCatalog = null,
+        PerformanceEnvironment? performanceEnvironment = null)
     {
         _paths = paths;
         _configuration = configuration;
         _log = log;
         _progress = progress;
         _verifiedCatalog = verifiedCatalog;
+        _performanceEnvironment = performanceEnvironment ?? PerformanceEnvironment.Default;
     }
 
     public async Task CheckAndUpdateAsync(
@@ -1133,6 +1136,8 @@ internal sealed partial class UpdateEngine
             // runtime copy once the signed revision was delivered, so the commit check must tolerate it too: 1.2.19
             // rolled back and blocked the launch of every player who had played since their last update.
             if (IsRuntimeMutableSignedConfig(file.Path) && File.Exists(target)) continue;
+            // 1.2.22: a mod lite keeps as <jar>.disabled with the exact signed bytes is installed, just switched off.
+            if (await IsSatisfiedByDisabledCopyAsync(file, cancellationToken)) continue;
             await ValidateExactTargetAsync(target, file, "Adopted managed file changed before commit", cancellationToken);
         }
         foreach (string path in manifest.DeletePaths.Concat(manifest.DeletedFiles.Select(file => file.Path)))

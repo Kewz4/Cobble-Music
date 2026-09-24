@@ -14,6 +14,10 @@ internal sealed class TransactionJournal
     public InstalledState? NextState { get; set; }
     public List<ManagedFileState> SeedFiles { get; set; } = [];
     public List<TransactionOperation> Operations { get; set; } = [];
+    // 1.2.22 lite/full switch: the committed outcome of every file a performance transaction creates or
+    // replaces (mods/*.jar[.disabled], the official Packed Packs profiles, allow-listed settings, the
+    // performance ledger). It overrides NextState/SeedFiles for those paths during recovery.
+    public List<ManagedFileState> PerformanceOutcomes { get; set; } = [];
 }
 
 internal sealed class TransactionOperation
@@ -84,7 +88,8 @@ internal static class TransactionStore
         if (journal is null
             || journal.SchemaVersion is not (1 or 2)
             || journal.Operations is null
-            || journal.SeedFiles is null)
+            || journal.SeedFiles is null
+            || journal.PerformanceOutcomes is null)
         {
             throw new TransactionRecoveryException("The updater transaction journal has an unsupported format. Prism will not launch until it is repaired.");
         }
@@ -188,6 +193,10 @@ internal static class TransactionStore
         var nextFiles = journal.NextState!.ManagedFiles.Concat(journal.SeedFiles).ToDictionary(
             file => file.Path,
             StringComparer.OrdinalIgnoreCase);
+        foreach (ManagedFileState outcome in journal.PerformanceOutcomes)
+        {
+            nextFiles[outcome.Path] = outcome;
+        }
         string rollbackRoot = Path.Combine(paths.LocalDataDirectory, "rollback");
         foreach (TransactionOperation operation in journal.Operations)
         {
@@ -278,6 +287,31 @@ internal static class TransactionStore
         {
             throw new TransactionRecoveryException("The updater transaction journal overlaps managed files and created defaults.");
         }
+        var performancePaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (ManagedFileState outcome in journal.PerformanceOutcomes)
+        {
+            if (outcome is null)
+            {
+                throw new TransactionRecoveryException("The updater transaction journal contains an empty performance outcome.");
+            }
+            string path = PathSafety.NormalizeRelativePath(outcome.Path);
+            if (!PathSafety.IsPerformanceOutcomeAllowed(path)
+                || seedPaths.Contains(path)
+                || outcome.Size < 0
+                || string.IsNullOrWhiteSpace(outcome.Sha256)
+                || outcome.Sha256.Length != 64
+                || outcome.Sha256.Any(character => !Uri.IsHexDigit(character))
+                || !performancePaths.Add(path))
+            {
+                throw new TransactionRecoveryException("The updater transaction journal contains an unsafe performance outcome.");
+            }
+            outcome.Path = path;
+        }
+        if (journal.SchemaVersion == 1 && performancePaths.Count != 0)
+        {
+            throw new TransactionRecoveryException("A legacy updater transaction journal cannot contain performance outcomes.");
+        }
+        var explicitTargets = seedPaths.Concat(performancePaths).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
         string rollbackRoot = Path.Combine(paths.LocalDataDirectory, "rollback");
         foreach (TransactionOperation operation in journal.Operations)
@@ -285,7 +319,7 @@ internal static class TransactionStore
             bool targetIsSeedOutcome = operation is not null
                 && !string.IsNullOrWhiteSpace(operation.TargetPath)
                 && PathSafety.TryGetRelativePathUnder(paths.MinecraftDirectory, operation.TargetPath, out string seedTargetRelative)
-                && seedPaths.Contains(seedTargetRelative);
+                && explicitTargets.Contains(seedTargetRelative);
             if (operation is null
                 || operation.Kind is not ("create" or "replace" or "delete")
                 || string.IsNullOrWhiteSpace(operation.TargetPath)
@@ -320,7 +354,7 @@ internal static class TransactionStore
                 operation.TargetPath,
                 paths.MinecraftDirectory,
                 allowedRoots,
-                seedPaths,
+                explicitTargets,
                 "target");
             if (needsBackup)
             {
@@ -586,8 +620,10 @@ internal static class TransactionStore
         {
             return false;
         }
-        expected = journal.NextState!.ManagedFiles.Concat(journal.SeedFiles).FirstOrDefault(
-            file => string.Equals(file.Path, relative, StringComparison.OrdinalIgnoreCase));
+        expected = journal.PerformanceOutcomes.FirstOrDefault(
+                file => string.Equals(file.Path, relative, StringComparison.OrdinalIgnoreCase))
+            ?? journal.NextState!.ManagedFiles.Concat(journal.SeedFiles).FirstOrDefault(
+                file => string.Equals(file.Path, relative, StringComparison.OrdinalIgnoreCase));
         return expected is not null;
     }
 

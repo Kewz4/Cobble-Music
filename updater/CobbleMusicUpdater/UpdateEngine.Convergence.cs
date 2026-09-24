@@ -36,6 +36,17 @@ internal sealed partial class UpdateEngine
         InstalledState state = LocalStateStore.LoadState(_paths);
         if (IsDowngradeOrMutation(state, target, latest.ManifestSha256))
             throw new InvalidDataException($"Published {target.Version} cannot validate local {state.Version}: downgrade or changed manifest identity.");
+        // 1.2.22: decide lite/full first (never throws except for cancellation), so a mod lite keeps switched off
+        // counts as installed and is not downloaded again; the switch itself runs after the pack is verified.
+        _performancePlan = await PreparePerformancePlanAsync(target, checkOnly, token);
+        string completion = await ConvergeFilesAsync(catalog, latest, target, state, checkOnly, token);
+        if (!checkOnly) await ApplyPerformancePlanAsync(_performancePlan, target, token);
+        Report(UpdatePhase.Complete, completion);
+    }
+
+    private async Task<string> ConvergeFilesAsync(IReadOnlyList<RemoteRelease> catalog, RemoteRelease latest,
+        UpdateManifest target, InstalledState state, bool checkOnly, CancellationToken token)
+    {
         var needed = new List<ManifestFile>();
         var appliedRevisions = state.AppliedPlayerSettingMigrationIds.ToHashSet(StringComparer.Ordinal);
         bool profileRevisionPending = target.Files.Where(f => IsOfficialPackProfile(f.Path))
@@ -54,7 +65,7 @@ internal sealed partial class UpdateEngine
             {
                 continue;
             }
-            if (!await MatchesLocalAsync(file, token))
+            if (!await MatchesLocalAsync(file, token) && !await IsSatisfiedByDisabledCopyAsync(file, token))
             {
                 needed.Add(file);
                 _log($"Repair needed: {file.Path}");
@@ -92,14 +103,12 @@ internal sealed partial class UpdateEngine
             && sameIdentity && !corrective && !profileRevisionPending)
         {
             _log($"Verified release {target.Version} inventory; applied Packed Packs revisions preserve their mutable runtime settings.");
-            Report(UpdatePhase.Complete, $"Verified {target.Version} — starting Minecraft.");
-            return;
+            return $"Verified {target.Version} — starting Minecraft.";
         }
         _log($"Converging directly to {target.Version}: {needed.Count} managed repairs and {seeds.Count} defaults.");
         if (checkOnly)
         {
-            Report(UpdatePhase.Complete, $"Release {target.Version}: {needed.Count} file repairs required.");
-            return;
+            return $"Release {target.Version}: {needed.Count} file repairs required.";
         }
         LocalStateStore.AssertWritable(_paths);
         string work = Path.Combine(_paths.LocalDataDirectory, "staging", "converge-" + latest.ManifestSha256);
@@ -130,7 +139,7 @@ internal sealed partial class UpdateEngine
             token, reconciledFiles: needed, reconciledCleanup: duplicates);
         TryDeleteDirectory(work);
         _log($"Release {target.Version} committed and verified: {needed.Count} repaired files. Prior files remain in recovery backups.");
-        Report(UpdatePhase.Complete, $"Verified {target.Version} — starting Minecraft.");
+        return $"Verified {target.Version} — starting Minecraft.";
     }
 
     // Two complete sourcing plans are built and the cheaper one wins:
@@ -241,7 +250,12 @@ internal sealed partial class UpdateEngine
             string local = SafeLocal(file.Path);
             string staged = incoming is null ? local : PathSafety.CombineUnder(incoming, file.Path);
             string selected = File.Exists(staged) ? staged : local;
-            if (!File.Exists(selected)) continue;
+            if (!File.Exists(selected))
+            {
+                // A lite-disabled copy still claims its mod id, so a stray enabled duplicate is still quarantined.
+                if (!await IsSatisfiedByDisabledCopyAsync(file, token)) continue;
+                selected = local + ".disabled";
+            }
             await VerifyFileAsync(selected, file.Size, file.Sha256, file.Path, token);
             string? id = ReadFabricModId(selected);
             if (id is null) continue;

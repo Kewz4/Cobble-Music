@@ -70,6 +70,7 @@ internal static partial class Program
             await TestCorrectiveSeedRefreshAndAdoptionAsync(Path.Combine(tempRoot, "corrective-seed-refresh"));
             await TestConditionalKeyCollisionMigrationAsync(Path.Combine(tempRoot, "key-collision-migration"));
             await TestFtbForceCompleteKeyMigrationAsync(Path.Combine(tempRoot, "ftb-key-migration"));
+            await TestPerformanceModeAsync(Path.Combine(tempRoot, "performance-mode")); // 1.2.22 lite mode (PerformanceModeTests.cs)
             await TestJournalCommitBoundaryAsync(Path.Combine(tempRoot, "journal"));
             await TestCrossVolumeTransactionRecoveryAsync(Path.Combine(tempRoot, "cross-volume"));
             await LockV2Tests.RunAsync(Path.Combine(tempRoot, "lock-v2")); // [lock-v2]
