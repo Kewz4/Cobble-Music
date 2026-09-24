@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 $script:AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'datapacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $script:Sha256Pattern = '^[0-9a-f]{64}$'
 $script:VersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-$script:PinnedUpdaterVersion = '1.2.16'
+$script:PinnedUpdaterVersion = '1.2.21'
 $script:MaximumReleaseAssetCount = 999
 $script:ReservedReleaseMetadataAssetCount = 2
 $script:MaximumPublicReleaseCount = 499
@@ -986,6 +986,7 @@ function Assert-CobbleDeltaManifest {
     $optionsReplacementCount = 0
     $hasIrisToggleReplacement = $false
     $hasFancyToastsReplacement = $false
+    $hasFtbKeyReplacement = $false
     foreach ($replacement in @($seedTextReplacementsState.Entries)) {
         $path = [string]$replacement.path
         Assert-CobbleSeedTextReplacementPathPolicy -Path $path -Context 'delta seed text replacement' | Out-Null
@@ -1017,11 +1018,16 @@ function Assert-CobbleDeltaManifest {
                 $newText -ceq 'key_iris.keybind.toggleShaders:key.keyboard.unknown') -or
              ($oldText -ceq 'key_key.fancytoasts.config_menu:key.keyboard.k' -and
                 $newText -ceq 'key_key.fancytoasts.config_menu:key.keyboard.unknown'))
+        # FTB Quests 2101.1.36 put "Force-complete Hovered" on C (Cobblemon Summary's key); exactly that default line, updater 1.2.21+.
+        $validFtbKey = $path -ieq 'options.txt' -and $requiredLines.Count -eq 0 -and
+            $migrationId -ceq 'options-ftb-force-complete-c-v1' -and
+            $oldText -ceq 'key_key.ftbquests.gui_editor.complete_object:key.keyboard.c' -and
+            $newText -ceq 'key_key.ftbquests.gui_editor.complete_object:key.keyboard.unknown'
         if (-not $seedTextReplacementKeys.Add($identity) -or
             -not $seedFiles.ByKey.ContainsKey($key) -or
             ($validIris -and -not $reofferSeedKeys.Contains($key)) -or
-            ($validOptions -and $reofferSeedKeys.Contains($key)) -or
-            -not $safeText -or -not ($validIris -or $validOptions)) {
+            (($validOptions -or $validFtbKey) -and $reofferSeedKeys.Contains($key)) -or
+            -not $safeText -or -not ($validIris -or $validOptions -or $validFtbKey)) {
             throw "Delta seedTextReplacements contains an unsafe, duplicate, or undeclared replacement: $path"
         }
         if ($validOptions) {
@@ -1030,6 +1036,7 @@ function Assert-CobbleDeltaManifest {
             if ($oldText -ceq 'key_iris.keybind.toggleShaders:key.keyboard.k') { $hasIrisToggleReplacement = $true }
             if ($oldText -ceq 'key_key.fancytoasts.config_menu:key.keyboard.k') { $hasFancyToastsReplacement = $true }
         }
+        if ($validFtbKey) { $hasFtbKeyReplacement = $true }
     }
     if ($optionsReplacementCount -ne 0 -and
         ($optionsReplacementCount -ne 2 -or -not $hasIrisToggleReplacement -or -not $hasFancyToastsReplacement)) {
@@ -1045,7 +1052,10 @@ function Assert-CobbleDeltaManifest {
         $key = Get-CobblePathKey $_.path
         $seedFiles.ByKey.ContainsKey($key) -and $reofferSeedKeys.Contains($key)
     }).Count -gt 0
-    $minimumFloor = if ($managedRepairPaths.Count -gt 0) {
+    $minimumFloor = if ($hasFtbKeyReplacement) {
+        [Version]'1.2.21'
+    }
+    elseif ($managedRepairPaths.Count -gt 0) {
         [Version]'1.2.13'
     }
     elseif ($hasOptionsTextReplacement) {
