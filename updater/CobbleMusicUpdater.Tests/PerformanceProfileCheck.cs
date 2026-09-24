@@ -63,6 +63,20 @@ internal static partial class Program
         {
             Console.WriteLine($"note: pack id not in either signed profile (nothing to remove): {id}");
         }
+        // How the graphics rules classify real adapter names (the three PCs Kewz named, then common cards).
+        foreach (string name in new[]
+        {
+            "NVIDIA GeForce RTX 3050", "NVIDIA GeForce RTX 3080", "Intel(R) UHD Graphics", "NVIDIA GeForce RTX 2070 Super",
+            "NVIDIA GeForce RTX 3050 Laptop GPU", "NVIDIA GeForce RTX 3060 Laptop GPU", "NVIDIA GeForce RTX 2060", "NVIDIA GeForce RTX 2060 SUPER",
+            "NVIDIA GeForce GTX 1650", "NVIDIA GeForce GTX 1660 SUPER", "NVIDIA GeForce GTX 1080 Ti", "NVIDIA GeForce MX450",
+            "NVIDIA GeForce RTX 4060", "NVIDIA GeForce RTX 5050", "AMD Radeon RX 580 2048SP", "AMD Radeon RX 6600", "AMD Radeon RX 6600 XT",
+            "AMD Radeon RX 7600", "AMD Radeon(TM) Graphics", "AMD Radeon 780M Graphics", "AMD Radeon(TM) Vega 8 Graphics",
+            "Intel(R) Iris(R) Xe Graphics", "Intel(R) Arc(TM) Graphics", "Intel(R) Arc(TM) A770 Graphics", "Intel(R) Arc(TM) A380 Graphics",
+            "Microsoft Basic Display Adapter"
+        })
+        {
+            Console.WriteLine($"graphics rule: {name} -> {(GpuRegistry.IsVirtualAdapter(name) ? "skipped (virtual)" : GpuTierList.Classify(name, lite.Detection).ToString())}");
+        }
         Console.WriteLine(problems == 0 ? "RESULT: OK" : $"RESULT: {problems} problem(s)");
         return problems == 0 ? 0 : 2;
     }
