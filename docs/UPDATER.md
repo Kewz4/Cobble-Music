@@ -132,25 +132,45 @@ the lists change per release without an updater release. Lite never changes shad
 shader profiles; the updater refuses such targets. The invariants:
 
 - **Decision.** `minecraft/cobble-music-updater/performance-mode.txt` holds `mode=auto|lite|full` and is honoured
-  every launch (the updater creates it with `mode=auto` and only ever refreshes its `# This computer:` status line).
-  With `auto`, the PC is lite when the processor score is below `detection.cpuScoreThreshold` **or** every real
-  display adapter matches `detection.liteGpuPatterns` (a card on `fullGpuPatterns`, or one on neither list, keeps
-  graphics neutral). Patterns are whole words, `#` = one digit. The processor score comes from a ~1 s single-thread
-  probe (score 1000 = Kewz's i7-10750H) run once per PC on its own thread with a 5 s timeout; the raw numbers are
-  kept machine-wide in `%LOCALAPPDATA%\CobbleMusicUpdater\performance-detection.json` and re-measured only for a new
-  processor. A failed, timed-out or disturbed run (typical work step more than 90% slower than the fastest, e.g.
-  Minecraft already running) never votes lite and is retried on the next launch, at most three times. Adapter names
-  come from the display-class registry key (no WMI). Nothing readable = full. One log line states processor, score,
-  adapters, verdict and reason.
+  every launch (the updater creates it with `mode=auto` and only ever refreshes its `# This computer:` status line,
+  which states the processor, the best graphics card, their scores and the lines in plain words). With `auto` nothing
+  is measured (round 2, Kewz 2026-09-24: "build an entire list of cpus/gpus with score"; the round-1 benchmark mostly
+  timed memory latency): the updater looks the hardware up in its embedded tables `HardwareDb/cpu_scores.json`
+  (PassMark single-thread rating, 4382 processors) and `HardwareDb/gpu_scores.json` (PassMark G3D Mark, 2769 cards,
+  plus 319 NVIDIA laptop device ids), built by `workspace/shared/lite0924/hwdb`. Names go through ONE normaliser,
+  `hwdb-norm-1` (`HardwareDb.cs`, a step-for-step port of `hwdb_norm.py`, pinned by the 246 hwdb test vectors), then
+  an exact lookup with no fuzzy fallback. The processor is `HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0`
+  `ProcessorNameString`; adapters come from the display-class key (`DriverDesc`, `MatchingDeviceId`,
+  `HardwareInformation.qwMemorySize`; no WMI, which caps memory at 4 GiB). Only REAL adapters count: present
+  (SetupAPI `DIGCF_PRESENT`, matched by driver key, so leftovers of removed cards drop out), a PCI hardware id of
+  vendor 10DE, 1002, 1022 or 8086 (`MatchingDeviceId`, or the present device's hardware id), and not a Basic Display,
+  remote, virtual, indirect or USB adapter. The PC is lite when the processor score is below
+  `detection.cpuSingleThreadBelow` **or** the best real adapter's score is below `detection.gpuScoreBelow`. Hardware
+  missing from the tables does not vote (a real adapter that is not in the table stops the graphics vote, because it
+  could be the best card); nothing known = full. The verdict and its inputs are kept per Windows user in
+  `%LOCALAPPDATA%\CobbleMusicUpdater\performance-detection.json` (schema 2) and re-decided only when the hardware
+  fingerprint (processor name + real adapters), the table version (`hwdb-norm-1/<fetched>/<sha>`) or the signed lines
+  change; a launch whose registry reads fail keeps the stored verdict and saves nothing. One log line states every
+  name, the table key it matched, the score and rule, the ignored adapters and why, the lines and the verdict.
+  `CobbleMusicUpdater.Tests --probe-hardware [<cpu line> <gpu line>]` prints exactly that for the PC it runs on.
 - **Mods** listed in `disabledMods` (exact managed top-level jars) are renamed to `<jar>.disabled`, the Prism
   convention Fabric Loader ignores. Convergence counts an exact `.disabled` copy as installed (lite-listed mod while
   lite, or one this instance's ledger says lite switched off), so it is never downloaded again, and full renames it
   back byte-exact. A player's own `.disabled` copies are never deleted; a mod the player turns back on by hand stays
   on. A release that updates a lite mod delivers the new jar and lite switches it off again; a release that retires
-  one also removes lite's disabled copy.
+  one also removes lite's disabled copy. Before switching anything off, the updater reads `fabric.mod.json` of every
+  enabled `mods/*.jar` and of the listed jars, nested jars included (`LiteModGuard`, once per release and list, the
+  result kept as `modCheck` in the lite record). The whole mod list is refused - no mod is switched off, packs and
+  settings still apply - when a listed jar is a critical mod (fabricloader, fabric-api, cobblemon, sodium, iris,
+  packed_packs, the Subtle Effects join fix `kewz_subtle_stub`, ...) or carries Mod Menu's `library` badge, or when an
+  enabled mod (top-level or nested) has a `depends` entry that only the listed jars provide (`recommends`/`suggests`
+  only warn in Fabric Loader and are not counted). The join fix `mods/kewz-subtle-effects-stub*.jar` can never be
+  listed at all: a signed profile naming it is rejected like any invalid manifest.
 - **Resource packs** in `removedPackIds` are taken out of the two official Packed Packs profiles once per signed
   profile revision (the profile's own formatting is kept). Full writes back the saved original bytes, or re-inserts
-  the ids at their old positions when Packed Packs re-serialized the file.
+  the ids at their old positions when Packed Packs re-serialized the file. When the file is back to the exact signed
+  bytes (the player deleted it and convergence restored it), lite filters it again; a profile Packed Packs rewrote with
+  other bytes is the player's choice and is left alone.
 - **Settings** in `settings` are edited once, one value each, only in a compiled allow-list of player-owned files
   (`options.txt` key:value; Sodium, Sodium Extra, Voxy, voxy-server-side, AS-Outline, AsyncParticles and Gnetum JSON
   by dotted key path to a scalar; Xaero world map / minimap `cobbleverse.cfg` key = value). The key must occur exactly
@@ -696,20 +716,27 @@ object:
 
 ```json
 { "lite": {
-    "revisionId": "lite-1.0.61-v1",
-    "detection": { "cpuScoreThreshold": 1050, "fullGpuPatterns": ["RTX 3060"], "liteGpuPatterns": ["RTX 3050"] },
+    "revisionId": "lite-1.0.61-v2",
+    "detection": { "cpuSingleThreadBelow": 2500, "gpuScoreBelow": 13000 },
     "disabledMods": ["mods/<exact managed jar>.jar"],
     "removedPackIds": ["file/<pack>.zip"],
     "settings": [ { "path": "config/sodium-options.json", "format": "json", "key": "quality.leaves_quality", "value": "\"FAST\"" } ] } }
 ```
 
-The Core module validates it (`ConvertTo-CobblePerformanceProfiles`, the same rules as the updater's
-`PerformanceProfilePolicy`), embeds it, and raises `minimumUpdaterVersion` to 1.2.22. The publisher refuses to stage
+The two lines are whole numbers (1-100000 and 1-1000000) against the updater's built-in tables; 2500 / 13000 is the
+hwdb track's recommendation (Jim's Ryzen 7 2700 + RTX 3050 lite on both, DONGLORD9000's 5800X + RTX 3080 full on
+both, Kewz's i7-10750H + laptop RTX 2070 Super full by 4% and 1.6%). The Core module validates the file
+(`ConvertTo-CobblePerformanceProfiles`, the same rules as the updater's `PerformanceProfilePolicy`), refuses the join
+fix in `disabledMods`, and - with `-ModsDirectory`, which the publisher always passes as the source tree's `mods` -
+runs `Get-CobbleLiteModListProblems`, the same critical/library/`depends` rule as the updater's `LiteModGuard`, over
+the tree's jars. It then embeds the file and raises `minimumUpdaterVersion` to 1.2.22. The publisher refuses to stage
 when the signed stable channel serves an older updater than the release requires, and refuses a source instance that
 is itself in lite mode (a `performance-state.json` with content or any `mods/*.jar.disabled`), so a lite PC's
 disabled jars can never become the pack. Before publishing, `CobbleMusicUpdater.Tests --check-performance-profile
-<signed manifest> <profile.json> <seed dir> <profile dir> <preview dir>` runs the file through the updater's own
-validation, prints every setting's current value, and writes the filtered Packed Packs profiles a lite PC will get.
+<signed manifest> <profile.json> <seed dir> <profile dir> <preview dir> [<extra jar>...]` runs the file through the
+updater's own validation, prints every setting's current value, writes the filtered Packed Packs profiles a lite PC
+will get, checks the tree's mod jars against the signed manifest, runs `LiteModGuard` over the tree plus the extra
+jars (for example the join fix before it is in the tree), and prints the verdict for Jim, DONGLORD9000 and Kewz's PC.
 
 ## Publish a pack update
 
