@@ -174,7 +174,18 @@ internal sealed partial class UpdateEngine
         }
         else
         {
-            (mode, status) = await DecideAutomaticallyAsync(lite.Detection, checkOnly, token);
+            try
+            {
+                (mode, status) = await DecideAutomaticallyAsync(lite.Detection, checkOnly, token);
+            }
+            catch (Exception exception) when (exception is not OperationCanceledException)
+            {
+                // Round-2 verifier FIX 2: an unexpected hardware name (for example ill-formed UTF-16) must never stop the
+                // launch. Nothing is saved, so it is decided again next launch.
+                mode = PerformanceMode.Full;
+                status = "the hardware check failed on this launch, so the full pack is used. Picked: full.";
+                _log($"Performance check: failed ({exception.GetType().Name}: {exception.Message}); result FULL for this launch, nothing saved.");
+            }
         }
         if (!checkOnly) PerformanceModeFile.EnsureStatus(modeFile, status, _log);
         return new PerformancePlan

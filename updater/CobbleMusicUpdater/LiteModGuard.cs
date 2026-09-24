@@ -21,6 +21,13 @@ internal static class LiteModGuard
         "packed_packs", "kewz_subtle_stub"
     };
 
+    // Mods the server cannot do without unless a stand-in is loaded instead: switching Subtle Effects off while the
+    // join fix (kewz_subtle_stub) is not enabled would lock the PC out of the server (round-2 verifiers, FIX 1).
+    public static readonly IReadOnlyDictionary<string, string> RequiredWhenOff = new Dictionary<string, string>(StringComparer.Ordinal)
+    {
+        ["subtle_effects"] = "kewz_subtle_stub"
+    };
+
     private const int MaximumNestingDepth = 4;
     private const long MaximumNestedJarBytes = 128L * 1024 * 1024;
     private const long MaximumModJsonBytes = 1024 * 1024;
@@ -173,6 +180,14 @@ internal static class LiteModGuard
         }
         var before = enabledMods.Concat(offMods).SelectMany(mod => mod.Ids).ToHashSet(StringComparer.Ordinal);
         var after = enabledMods.SelectMany(mod => mod.Ids).ToHashSet(StringComparer.Ordinal);
+        foreach (ModInfo mod in offMods.Where(item => item.Depth == 0))
+        {
+            foreach (string id in mod.Ids.Distinct(StringComparer.Ordinal))
+            {
+                if (RequiredWhenOff.TryGetValue(id, out string? standIn) && !after.Contains(standIn))
+                    problems.Add($"{mod.Jar} ({id}) may only be switched off while {standIn} is on; without it this PC could not join the server");
+            }
+        }
         foreach (ModInfo mod in enabledMods)
         {
             foreach (string dependency in mod.Depends.Distinct(StringComparer.Ordinal))

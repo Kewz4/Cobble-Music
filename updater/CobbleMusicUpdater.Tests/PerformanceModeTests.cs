@@ -433,6 +433,12 @@ internal static partial class Program
         Equal(true, kewz2700Logs.Any(entry => entry.Contains("decided now (the lines in this release changed)", StringComparison.Ordinal)), "re-decided on new lines");
         Equal(PerformanceMode.Lite, (await DecideAsync("kewz-gpu-line", KewzPc(), Lines(2500, 14000))).Plan.Mode, "graphics line 14000 from the manifest");
 
+        // Round-2 verifier FIX 2: an ill-formed hardware name (lone surrogate) must not stop the launch.
+        var brokenName = new PerformanceEnvironment { ReadCpuName = () => "AMD Ryzen 7 2700\uD800 Eight-Core Processor", ReadGpus = () => [JimGpu()] };
+        (PerformancePlan illFormed, List<string> illFormedLogs) = await DecideAsync("broken-name", brokenName);
+        Equal(PerformanceMode.Full, illFormed.Mode, "a failed hardware check gives the full pack for that launch");
+        Equal(true, illFormedLogs.Any(entry => entry.StartsWith("Performance check: failed (", StringComparison.Ordinal)), "the failure is logged: " + string.Join(" | ", illFormedLogs));
+
         // Stored pick: kept while nothing changed, re-decided when the hardware or the table changes.
         UpdaterPaths once = Paths(Path.Combine(root, "once"));
         Directory.CreateDirectory(once.MinecraftDirectory);
@@ -608,6 +614,11 @@ internal static partial class Program
         Equal(0, LiteModGuard.Check([J(libUser), J(otherLibHolder)], [J(effects)]).Count, "the same library nested in an enabled mod keeps it available");
         Equal(true, LiteModGuard.Check([J(user)], [J(stubRenamed)])[0].Contains("may never switch off (kewz_subtle_stub)", StringComparison.Ordinal),
             "the Subtle Effects join fix is refused by mod id, whatever the file is called");
+        string subtle = Write("SubtleEffects-fabric-1.21.1-1.14.3.jar", ModJar("{\"schemaVersion\":1,\"id\":\"subtle_effects\",\"version\":\"1.14.3\"}"));
+        List<string> noJoinFix = LiteModGuard.Check([J(user)], [J(subtle)]);
+        Equal(1, noJoinFix.Count, "Subtle Effects off without the join fix enabled is refused");
+        Equal(true, noJoinFix[0].Contains("(subtle_effects) may only be switched off while kewz_subtle_stub is on", StringComparison.Ordinal), noJoinFix[0]);
+        Equal(0, LiteModGuard.Check([J(user), J(stubRenamed)], [J(subtle)]).Count, "with the join fix enabled Subtle Effects may be switched off");
         Equal(1, LiteModGuard.Check([], [J(sodium)]).Count, "critical mods are refused");
         Equal(true, LiteModGuard.Check([], [J(library)])[0].Contains("is a library", StringComparison.Ordinal), "library badge refused");
         Equal(true, LiteModGuard.Check([], [J(notFabric)])[0].Contains("is not a Fabric mod", StringComparison.Ordinal), "non-Fabric jars refused");
@@ -857,7 +868,16 @@ internal static partial class Program
         await LaunchLiteAsync(fixture, jim);
         Equal(false, LocalExists(fixture, LiteModA), "lite applied at 1.0.61");
 
-        // 1.0.62 updates a lite mod, retires the other, and ships a new Default profile revision.
+        // 1.0.62 changes only other jars: the lite mods, already off and unchanged, stay off (round-2 verifier V4).
+        const string otherMod = "mods/other-mod-1.0.jar";
+        fixture.Managed[otherMod] = ConvergenceFabricJar("othermod", "1.0");
+        await PublishLiteAsync(fixture, "1.0.62", FixtureLite(), signer);
+        await LaunchLiteAsync(fixture, jim);
+        Equal(true, LocalExists(fixture, otherMod), "the new jar of 1.0.62 is installed");
+        Equal(false, LocalExists(fixture, LiteModA) || LocalExists(fixture, LiteModB), "lite mods already off stay off when only other jars change");
+        Equal(true, LocalExists(fixture, LiteModA + ".disabled") && LocalExists(fixture, LiteModB + ".disabled"), "their disabled copies are kept");
+
+        // 1.0.63 updates a lite mod, retires the other, and ships a new Default profile revision.
         byte[] oldA = fixture.Managed[LiteModA];
         fixture.Managed[LiteModA] = ConvergenceFabricJar("atmospherics", "2.6.7");
         fixture.Managed.Remove(LiteModB);
@@ -865,7 +885,7 @@ internal static partial class Program
             ["vinery:bushy_leaves", "file/Connected-Bricks 1.21-1.21.3 v3.1.zip", "file/New Official.zip", "fabric", "vanilla"]));
         LitePerformanceProfile next = FixtureLite();
         next.DisabledMods = [LiteModA];
-        await PublishLiteAsync(fixture, "1.0.62", next, signer);
+        await PublishLiteAsync(fixture, "1.0.63", next, signer);
         await LaunchLiteAsync(fixture, jim);
         Equal(false, LocalExists(fixture, LiteModA), "the updated lite mod stays off");
         Equal(HashBytes(fixture.Managed[LiteModA]), HashBytes(File.ReadAllBytes(PathSafety.CombineUnder(fixture.Paths.MinecraftDirectory, LiteModA + ".disabled"))),
@@ -892,7 +912,7 @@ internal static partial class Program
         await SetModeAsync(fixture, "lite");
         await LaunchLiteAsync(fixture, jim);
         Equal(false, File.Exists(a), "lite again");
-        await PublishLiteAsync(fixture, "1.0.63", null, signer);
+        await PublishLiteAsync(fixture, "1.0.64", null, signer);
         List<string> removedLogs = await LaunchLiteAsync(fixture, jim);
         Equal(true, File.Exists(a), "no lite list in the release = full pack");
         Equal(true, removedLogs.Any(line => line.Contains("this release has no lite list", StringComparison.Ordinal)), "logged");

@@ -25,6 +25,9 @@ $script:PerformanceProfilesMinimumUpdater = [Version]'1.2.22'
 # Subtle Effects join fix, which every PC needs once Subtle Effects is off on lite PCs.
 $script:LiteCriticalModIds = @('minecraft', 'java', 'fabricloader', 'fabric-loader', 'fabric-api', 'fabric', 'cobblemon', 'sodium', 'iris',
     'packed_packs', 'kewz_subtle_stub')
+# Mods the server cannot do without unless a stand-in ships in the SAME release tree (mirrors LiteModGuard.RequiredWhenOff).
+# Jars passed with -ExtraModJars never count as the stand-in, so a release whose tree lacks the join fix is refused.
+$script:LiteRequiredWhenOff = @{ 'subtle_effects' = 'kewz_subtle_stub' }
 $script:ReservedReleaseMetadataAssetCount = 2
 $script:MaximumPublicReleaseCount = 499
 $script:ExactRetiredV1013SeedIdentities = @{
@@ -1582,6 +1585,12 @@ function ConvertTo-CobblePerformanceProfiles {
         }
         $path
     })
+    # Second belt for callers without a tree (manifest assertions): a list that switches Subtle Effects off needs the join
+    # fix as a managed file of the same release.
+    if (@($mods | Where-Object { $_.StartsWith('mods/SubtleEffects-', [StringComparison]::OrdinalIgnoreCase) }).Count -gt 0 -and
+        @($FileSet.ByKey.Values | Where-Object { ([string]$_.path).StartsWith('mods/kewz-subtle-effects-stub', [StringComparison]::OrdinalIgnoreCase) }).Count -eq 0) {
+        throw "$Context.lite.disabledMods switches Subtle Effects off, but this release does not ship the Subtle Effects join fix (mods/kewz-subtle-effects-stub-*.jar); lite PCs could not join the server."
+    }
     if ($PSBoundParameters.ContainsKey('ModsDirectory')) {
         $modProblems = @(Get-CobbleLiteModListProblems -ModsDirectory $ModsDirectory -DisabledMods @($mods) -ExtraModJars @($ExtraModJars))
         if ($modProblems.Count -gt 0) {
@@ -1768,9 +1777,10 @@ function Get-CobbleLiteModListProblems {
     $enabledMods = [Collections.Generic.List[object]]::new()
     $offMods = [Collections.Generic.List[object]]::new()
     $jars = @(Get-ChildItem -LiteralPath $ModsDirectory -Filter '*.jar' -File | Sort-Object Name)
+    $treeIds = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($jar in $jars) {
         if ($offNames.Contains($jar.Name)) { continue }
-        try { foreach ($mod in @(Read-CobbleFabricModJar -Path $jar.FullName -Label $jar.Name)) { $enabledMods.Add($mod) } }
+        try { foreach ($mod in @(Read-CobbleFabricModJar -Path $jar.FullName -Label $jar.Name)) { $enabledMods.Add($mod); if ($mod.Depth -eq 0) { [void]$treeIds.Add($mod.Id) } } }
         catch { $problems.Add("$($jar.Name) could not be read ($($_.Exception.Message)), so its dependencies cannot be checked") }
     }
     foreach ($extra in $ExtraModJars) {
@@ -1793,6 +1803,14 @@ function Get-CobbleLiteModListProblems {
     }
     $after = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($mod in $enabledMods) { [void]$after.Add($mod.Id); foreach ($id in $mod.Provides) { [void]$after.Add($id) } }
+    foreach ($mod in @($offMods | Where-Object { $_.Depth -eq 0 })) {
+        foreach ($id in @(@($mod.Id) + @($mod.Provides) | Select-Object -Unique)) {
+            $standIn = $script:LiteRequiredWhenOff[$id]
+            if ($standIn -and -not $treeIds.Contains($standIn)) {
+                $problems.Add("$($mod.Jar) ($id) may only be switched off while $standIn is a managed, enabled jar in this release tree; without it lite PCs could not join the server")
+            }
+        }
+    }
     $before = [Collections.Generic.HashSet[string]]::new($after, [StringComparer]::Ordinal)
     foreach ($mod in $offMods) { [void]$before.Add($mod.Id); foreach ($id in $mod.Provides) { [void]$before.Add($id) } }
     foreach ($mod in $enabledMods) {
