@@ -40,6 +40,9 @@ param(
     [string[]]$SeedRoots = @('config'),
     [string[]]$ReofferSeedFiles = @(),
     [string]$SeedTextReplacementManifest,
+    # Updater 1.2.22 lite mode: JSON file holding the performanceProfiles object ({"lite": {...}}). Requires the signed
+    # stable updater channel to already serve 1.2.22 or newer; the release then requires updater 1.2.22.
+    [string]$PerformanceProfileManifest,
     [string]$SeedTemplateDir,
     [string]$LegacyCleanupManifest,
 
@@ -1173,6 +1176,23 @@ try {
             -not ($shaderOptionSeedSources | Where-Object { $_.path -ieq $candidate.path })
     })
 
+    # A source instance that the 1.2.22 updater switched to lite would publish its .jar.disabled copies and drop the
+    # real jars for everyone. Refuse any lite record with content, and any disabled jar outside the optional Axiom.
+    $sourceLiteLedger = Join-Path $SourceMinecraftDir 'cobble-music-updater\performance-state.json'
+    if (Test-Path -LiteralPath $sourceLiteLedger -PathType Leaf) {
+        $sourceLite = Read-JsonFile -Path $sourceLiteLedger -Description 'Source lite mode record'
+        foreach ($listName in @('mods', 'profiles', 'settings')) {
+            $listValue = Get-CobbleOptionalPropertyValue $sourceLite $listName
+            if ($null -ne $listValue -and @($listValue).Count -gt 0) {
+                throw "The source instance is in lite mode ($sourceLiteLedger lists $listName). Set mode=full in its cobble-music-updater\performance-mode.txt and launch it once, or use the release tree."
+            }
+        }
+    }
+    $disabledSourceJars = @($sourceFiles | Where-Object { ([string]$_.path) -imatch '^mods/[^/]+\.jar\.disabled$' })
+    if ($disabledSourceJars.Count -gt 0) {
+        throw "The source tree contains disabled mod jars, which would be published as the pack's mods: $(@($disabledSourceJars | ForEach-Object { $_.path }) -join ', ')"
+    }
+
     $effectiveSeedPaths = @($SeedFiles | Where-Object { $OfficialPackProfilePaths -inotcontains $_.Replace('\', '/') }) + @($optionalAxiomSources | ForEach-Object { $_.path }) +
         @($shaderOptionSeedSources | ForEach-Object { $_.path })
     $seedSourceFiles = @(
@@ -1224,6 +1244,22 @@ try {
     $releaseMinimumUpdaterVersion = if (@($seedTextReplacements | Where-Object { [string]$_.migrationId -ceq 'options-ftb-force-complete-c-v1' }).Count -ne 0) {
         '1.2.21'
     } else { $RequiredUpdaterVersion }
+    $performanceProfiles = $null
+    if (-not [string]::IsNullOrWhiteSpace($PerformanceProfileManifest)) {
+        $rawPerformanceProfiles = Read-JsonFile -Path $PerformanceProfileManifest -Description 'Performance profile manifest'
+        $performanceProfiles = ConvertTo-CobblePerformanceProfiles -Profiles $rawPerformanceProfiles -FileSet $currentSet -SeedFileSet $seedSet
+        if ([Version]$releaseMinimumUpdaterVersion -lt [Version]'1.2.22') { $releaseMinimumUpdaterVersion = '1.2.22' }
+        $performanceLite = $performanceProfiles['lite']
+        if ($null -ne $performanceLite) {
+            Write-Host "Lite profile $($performanceLite['revisionId']): $(@($performanceLite['disabledMods']).Count) mods, $(@($performanceLite['removedPackIds']).Count) pack ids, $(@($performanceLite['settings']).Count) settings; cpu threshold $($performanceLite['detection']['cpuScoreThreshold'])."
+        }
+    }
+    # Players run whatever the signed stable channel names. A release that needs a newer updater than the channel
+    # serves would stop every launch ("requires updater X"), so the channel commit must come first.
+    $channelUpdaterVersion = [string](Get-PinnedUpdaterPin).Version
+    if ([Version]$channelUpdaterVersion -lt [Version]$releaseMinimumUpdaterVersion) {
+        throw "This release requires updater $releaseMinimumUpdaterVersion but the signed stable channel serves $channelUpdaterVersion. Publish updater $releaseMinimumUpdaterVersion and commit its channel first."
+    }
 
     $managedRepairKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $baseFilesByKey = ConvertTo-CobbleFileRecordSet -Entries @($baseFiles) -Context 'signed base repair candidates' -AllowEmpty
@@ -1353,6 +1389,10 @@ try {
             deletedFiles = @($deletedFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
             legacyCleanup = @($legacyCleanup)
         }
+    }
+
+    if ($null -ne $performanceProfiles) {
+        $manifest['performanceProfiles'] = $performanceProfiles
     }
 
     if ($FullBaseline) {

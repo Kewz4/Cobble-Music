@@ -3,8 +3,24 @@ Set-StrictMode -Version Latest
 $script:AllowedRoots = @('mods', 'resourcepacks', 'shaderpacks', 'datapacks', 'config', 'defaultconfigs', 'kubejs', 'scripts')
 $script:Sha256Pattern = '^[0-9a-f]{64}$'
 $script:VersionPattern = '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
-$script:PinnedUpdaterVersion = '1.2.21'
+$script:PinnedUpdaterVersion = '1.2.22'
 $script:MaximumReleaseAssetCount = 999
+# Updater 1.2.22 lite mode: the only player-owned files a signed performance profile may edit (mirrors
+# PathSafety.PerformanceSettingTargets in the updater). Shaderpack options, Iris settings and the shader profiles are
+# deliberately absent: lite never changes shader settings.
+$script:PerformanceSettingTargets = @{
+    'options.txt' = 'options'
+    'config/sodium-options.json' = 'json'
+    'config/sodium-extra-options.json' = 'json'
+    'config/voxy-config.json' = 'json'
+    'config/vss-client-config.json' = 'json'
+    'config/astoutline.json' = 'json'
+    'config/asyncparticles/asyncparticles.json' = 'json'
+    'config/gnetum.json' = 'json'
+    'config/xaero/world-map/profiles/cobbleverse.cfg' = 'properties'
+    'config/xaero/minimap/profiles/cobbleverse.cfg' = 'properties'
+}
+$script:PerformanceProfilesMinimumUpdater = [Version]'1.2.22'
 $script:ReservedReleaseMetadataAssetCount = 2
 $script:MaximumPublicReleaseCount = 499
 $script:ExactRetiredV1013SeedIdentities = @{
@@ -839,6 +855,7 @@ function Assert-CobbleV1Manifest {
     if ($seedFiles.Entries.Count -gt 0 -and [Version]$Manifest.minimumUpdaterVersion -lt [Version]'1.2.6') {
         throw 'Baselines with create-only defaults must require updater 1.2.6 or newer.'
     }
+    Assert-CobblePerformanceProfilesManifest -Manifest $Manifest -FileSet $files -SeedFileSet $seedFiles | Out-Null
     $payload = Get-CobbleOptionalPropertyValue $Manifest 'payload'
     Assert-CobblePayloadMetadata $payload
 
@@ -1159,6 +1176,7 @@ function Assert-CobbleDeltaManifest {
     $allowedCleanupOverlaps = @($reofferSeedPathsState.Entries | ForEach-Object { [string]$_ }) + @($managedRepairPaths)
     Assert-CobbleLegacyCleanup -Entries @($legacyCleanup.Entries) -ForbiddenSets @($fullSet, $baseSet, $seedFiles) `
         -AllowedOverlapPaths $allowedCleanupOverlaps | Out-Null
+    Assert-CobblePerformanceProfilesManifest -Manifest $Manifest -FileSet $fullSet -SeedFileSet $seedFiles | Out-Null
 
     return $true
 }
@@ -1466,7 +1484,203 @@ function Assert-CobbleRemoteAssetInventory {
     return $missing
 }
 
+function Get-CobblePropertyNames {
+    param([Parameter(Mandatory)]$Object)
+    if ($Object -is [Collections.IDictionary]) { return @($Object.Keys | ForEach-Object { [string]$_ }) }
+    return @($Object.PSObject.Properties.Name)
+}
+
+function Test-CobbleShaderSettingPath {
+    param([Parameter(Mandatory)][string]$Path)
+    $normalized = $Path.Replace('\', '/')
+    $name = @($normalized.Split('/'))[-1]
+    return $normalized.StartsWith('shaderpacks/', [StringComparison]::OrdinalIgnoreCase) -or
+        $normalized.IndexOf('shader', [StringComparison]::OrdinalIgnoreCase) -ge 0 -or
+        $name.StartsWith('iris', [StringComparison]::OrdinalIgnoreCase) -or
+        $name.StartsWith('oculus', [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-CobbleGpuPatternKey {
+    param([AllowEmptyString()][string]$Pattern)
+    $cleaned = $Pattern -replace '\(R\)', ' ' -replace '\(TM\)', ' '
+    $tokens = @([regex]::Matches($cleaned, '[A-Za-z0-9#]+') | ForEach-Object { $_.Value.ToUpperInvariant() })
+    return ($tokens -join ' ')
+}
+
+function Test-CobbleJsonScalarLiteral {
+    param([AllowEmptyString()][string]$Value)
+    try {
+        $document = [Text.Json.JsonDocument]::Parse($Value)
+        try {
+            return $document.RootElement.ValueKind -in @(
+                [Text.Json.JsonValueKind]::String, [Text.Json.JsonValueKind]::Number,
+                [Text.Json.JsonValueKind]::True, [Text.Json.JsonValueKind]::False)
+        }
+        finally { $document.Dispose() }
+    }
+    catch { return $false }
+}
+
+# Validates and normalizes a signed performanceProfiles section (updater 1.2.22). Same rules as the updater's
+# PerformanceProfilePolicy: exact managed top-level jars, pack ids, allow-listed player-owned settings (never shader
+# or Iris files, never the options pack list or keybinds), and detection rules. Returns the canonical ordered object
+# that goes into the signed manifest.
+function ConvertTo-CobblePerformanceProfiles {
+    param(
+        [Parameter(Mandatory)]$Profiles,
+        [Parameter(Mandatory)]$FileSet,
+        [Parameter(Mandatory)]$SeedFileSet,
+        [string]$Context = 'performanceProfiles'
+    )
+
+    foreach ($name in @(Get-CobblePropertyNames $Profiles)) {
+        if ($name -cnotin @('lite')) { throw "$Context has an unknown profile: $name" }
+    }
+    $liteValue = Get-CobbleOptionalPropertyValue $Profiles 'lite'
+    if ($null -eq $liteValue) { return [ordered]@{} }
+    foreach ($name in @(Get-CobblePropertyNames $liteValue)) {
+        if ($name -cnotin @('revisionId', 'detection', 'disabledMods', 'removedPackIds', 'settings')) {
+            throw "$Context.lite has an unknown property: $name"
+        }
+    }
+    $revisionId = [string](Get-CobbleOptionalPropertyValue $liteValue 'revisionId')
+    if ($revisionId -cnotmatch '^[a-z0-9][a-z0-9._-]{0,127}$') { throw "$Context.lite.revisionId is missing or not a lowercase id: '$revisionId'" }
+
+    $detection = Get-CobbleOptionalPropertyValue $liteValue 'detection'
+    if ($null -eq $detection) { throw "$Context.lite.detection is missing." }
+    [int]$threshold = 0
+    $thresholdValue = Get-CobbleOptionalPropertyValue $detection 'cpuScoreThreshold'
+    if ($null -eq $thresholdValue -or -not [int]::TryParse([string]$thresholdValue, [ref]$threshold) -or $threshold -lt 1 -or $threshold -gt 100000) {
+        throw "$Context.lite.detection.cpuScoreThreshold must be a whole number from 1 to 100000."
+    }
+    $patternKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $patternLists = [ordered]@{}
+    foreach ($listName in @('fullGpuPatterns', 'liteGpuPatterns')) {
+        $listValue = Get-CobbleOptionalPropertyValue $detection $listName
+        if ($null -eq $listValue) { throw "$Context.lite.detection.$listName is missing." }
+        $patterns = @(foreach ($pattern in @($listValue)) {
+            $text = [string]$pattern
+            if ($text.Length -gt 64 -or $text -cnotmatch '^[A-Za-z0-9 #-]+$' -or (Get-CobbleGpuPatternKey $text).Length -eq 0) {
+                throw "$Context.lite.detection.$listName has an invalid graphics card pattern: '$text'"
+            }
+            if (-not $patternKeys.Add((Get-CobbleGpuPatternKey $text))) { throw "$Context.lite.detection lists a graphics card pattern twice: '$text'" }
+            $text
+        })
+        $patternLists[$listName] = $patterns
+    }
+    if ($patternKeys.Count -gt 400) { throw "$Context.lite.detection lists too many graphics card patterns." }
+
+    $modSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $mods = @(foreach ($modValue in @(Get-CobbleOptionalPropertyValue $liteValue 'disabledMods')) {
+        if ($null -eq $modValue) { throw "$Context.lite.disabledMods contains an empty entry." }
+        $path = [string]$modValue
+        $key = Get-CobblePathKey $path
+        $underMods = if ($path.StartsWith('mods/', [StringComparison]::Ordinal)) { $path.Substring(5) } else { '' }
+        if ($underMods.Length -le 4 -or $underMods.Contains('/') -or -not $underMods.EndsWith('.jar', [StringComparison]::OrdinalIgnoreCase) -or
+            $underMods.StartsWith('axiom', [StringComparison]::OrdinalIgnoreCase) -or
+            -not $FileSet.ByKey.ContainsKey($key) -or [string]$FileSet.ByKey[$key].path -cne $path) {
+            throw "$Context.lite.disabledMods names a mod that is not a managed top-level jar of this release: $path"
+        }
+        if (-not $modSet.Add($key)) { throw "$Context.lite.disabledMods lists a mod twice: $path" }
+        $path
+    })
+    if ($mods.Count -gt 200) { throw "$Context.lite.disabledMods lists too many mods." }
+
+    $packSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $packIds = @(foreach ($packValue in @(Get-CobbleOptionalPropertyValue $liteValue 'removedPackIds')) {
+        if ($null -eq $packValue) { throw "$Context.lite.removedPackIds contains an empty entry." }
+        $id = [string]$packValue
+        if ([string]::IsNullOrWhiteSpace($id) -or $id.Length -gt 256 -or $id -cne $id.Trim() -or
+            $id.ToCharArray().Where({ [char]::IsControl($_) }).Count -gt 0 -or $id -ceq 'vanilla' -or $id -ceq 'fabric') {
+            throw "$Context.lite.removedPackIds has an invalid pack id: '$id'"
+        }
+        if (-not $packSet.Add($id)) { throw "$Context.lite.removedPackIds lists a pack twice: $id" }
+        $id
+    })
+    if ($packIds.Count -gt 500) { throw "$Context.lite.removedPackIds lists too many packs." }
+
+    $settingKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $settings = @(foreach ($setting in @(Get-CobbleOptionalPropertyValue $liteValue 'settings')) {
+        if ($null -eq $setting) { throw "$Context.lite.settings contains an empty entry." }
+        $path = [string]$setting.path
+        $format = [string]$setting.format
+        $key = [string]$setting.key
+        $value = [string]$setting.value
+        if (Test-CobbleShaderSettingPath -Path $path) { throw "Lite never changes shader settings: $path" }
+        if (-not $script:PerformanceSettingTargets.ContainsKey($path) -or $script:PerformanceSettingTargets[$path] -cne $format) {
+            throw "$Context.lite.settings targets a file or format that is not allow-listed: $path ($format)"
+        }
+        $pathKey = Get-CobblePathKey $path
+        if ($FileSet.ByKey.ContainsKey($pathKey) -or -not $SeedFileSet.ByKey.ContainsKey($pathKey)) {
+            throw "$Context.lite.settings must target a player-owned default of this release: $path"
+        }
+        if ([string]::IsNullOrEmpty($value) -or $value.Length -gt 256 -or $value.ToCharArray().Where({ [char]::IsControl($_) }).Count -gt 0) {
+            throw "$Context.lite.settings has an unsafe value for $path $key"
+        }
+        $validKey = $false
+        if ($format -ceq 'json') {
+            $segments = @($key.Split('.'))
+            $validKey = (Test-CobbleJsonScalarLiteral $value) -and $key.Length -le 256 -and $segments.Count -le 8 -and
+                @($segments | Where-Object { $_ -cnotmatch '^[A-Za-z0-9_-]+$' }).Count -eq 0
+        }
+        elseif ($format -ceq 'options') {
+            $validKey = $key -cmatch '^[A-Za-z0-9_.-]{1,128}$' -and -not $key.StartsWith('key_', [StringComparison]::Ordinal) -and
+                $key -cne 'resourcePacks' -and $key -cne 'incompatibleResourcePacks' -and $key -cne 'version' -and
+                $key.IndexOf('shader', [StringComparison]::OrdinalIgnoreCase) -lt 0
+        }
+        elseif ($format -ceq 'properties') {
+            $validKey = $key -cmatch '^[A-Za-z0-9_.-]{1,128}$' -and $key.IndexOf('shader', [StringComparison]::OrdinalIgnoreCase) -lt 0 -and
+                -not $value.StartsWith(' ') -and -not $value.EndsWith(' ')
+        }
+        if (-not $validKey) { throw "$Context.lite.settings has an invalid key or value: $path $key" }
+        if (-not $settingKeys.Add($pathKey + [char]0 + $key)) { throw "$Context.lite.settings sets the same setting twice: $path $key" }
+        [ordered]@{ path = $path; format = $format; key = $key; value = $value }
+    })
+    if ($settings.Count -gt 200) { throw "$Context.lite.settings lists too many settings." }
+
+    return [ordered]@{
+        lite = [ordered]@{
+            revisionId = $revisionId
+            detection = [ordered]@{
+                cpuScoreThreshold = $threshold
+                fullGpuPatterns = @($patternLists['fullGpuPatterns'])
+                liteGpuPatterns = @($patternLists['liteGpuPatterns'])
+            }
+            disabledMods = @($mods)
+            removedPackIds = @($packIds)
+            settings = @($settings)
+        }
+    }
+}
+
+# Manifest-level check shared by the v1 and v2 assertions: a performanceProfiles section needs updater 1.2.22.
+function Assert-CobblePerformanceProfilesManifest {
+    param(
+        [Parameter(Mandatory)]$Manifest,
+        [Parameter(Mandatory)]$FileSet,
+        [Parameter(Mandatory)]$SeedFileSet
+    )
+    if ($Manifest -is [Collections.IDictionary]) {
+        if (-not $Manifest.Contains('performanceProfiles')) { return $false }
+        $profiles = $Manifest['performanceProfiles']
+    }
+    else {
+        $property = $Manifest.PSObject.Properties['performanceProfiles']
+        if ($null -eq $property) { return $false }
+        $profiles = $property.Value
+    }
+    if ($null -eq $profiles) { throw 'performanceProfiles must not be explicit JSON null.' }
+    if ([Version][string](Get-CobbleOptionalPropertyValue $Manifest 'minimumUpdaterVersion') -lt $script:PerformanceProfilesMinimumUpdater) {
+        throw "Signed performance profiles require minimumUpdaterVersion $($script:PerformanceProfilesMinimumUpdater) or newer."
+    }
+    ConvertTo-CobblePerformanceProfiles -Profiles $profiles -FileSet $FileSet -SeedFileSet $SeedFileSet | Out-Null
+    return $true
+}
+
 Export-ModuleMember -Function @(
+    'Test-CobbleShaderSettingPath',
+    'ConvertTo-CobblePerformanceProfiles',
+    'Assert-CobblePerformanceProfilesManifest',
     'Get-CobbleOptionalPropertyValue',
     'Get-CobblePathKey',
     'Assert-CobbleManagedPath',

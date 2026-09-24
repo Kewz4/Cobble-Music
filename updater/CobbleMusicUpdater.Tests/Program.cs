@@ -27,6 +27,10 @@ internal static partial class Program
                 Console.WriteLine("Catalog convergence regressions passed.");
                 return 0;
             }
+            if (args.Length == 6 && args[0] == "--check-performance-profile")
+            {
+                return CheckPerformanceProfile(args[1], args[2], args[3], args[4], args[5]);
+            }
             if (args.Length == 1 && args[0] == "--probe-hardware")
             {
                 // 1.2.22 lite mode: the real registry reads and the real processor probe on this PC (read-only).
