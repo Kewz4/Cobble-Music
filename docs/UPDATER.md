@@ -111,6 +111,12 @@ from the newest release holding its bytes: a fresh 1.0.57 install is 1.0.55 +
 (`Sourcing plan: ...`). `CobbleMusicUpdater.Tests --sourcing-regression <dir>`
 replays a fresh install against every signed manifest in `<dir>`.
 
+Updater 1.2.20 fixes a launch block introduced with the 1.2.17 runtime-config tolerance: convergence
+tolerated a game-rewritten `config/gravels-extended-battles.toml` / `.rpo`, but the pre-commit check still
+demanded their signed bytes, so every update after the game had rewritten them rolled back with "Adopted
+managed file changed before commit" and exited 3. The commit check now tolerates them exactly as it tolerates
+the official Packed Packs profiles.
+
 Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
 A run that ends **Blocked** (local recovery needs attention, an integrity or

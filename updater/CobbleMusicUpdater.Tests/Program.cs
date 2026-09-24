@@ -1018,6 +1018,7 @@ internal static partial class Program
         using var signer = new ConvergenceTestSigner();
         await TestCatalogRepairAndDuplicateQuarantineAsync(Path.Combine(root, "repair"), signer);
         await TestCatalogPreviousPayloadOriginAsync(Path.Combine(root, "previous-origin"), signer);
+        await TestCatalogRuntimeMutableConfigCommitAsync(Path.Combine(root, "runtime-mutable"), signer);
         await TestCatalogManagedAxiomPreservedAsync(Path.Combine(root, "custom-axiom"), signer, removed: false);
         await TestCatalogManagedAxiomPreservedAsync(Path.Combine(root, "removed-axiom"), signer, removed: true);
         await TestCatalogOfficialProfilesAsync(Path.Combine(root, "fresh-profiles"), signer, upgrade: false);

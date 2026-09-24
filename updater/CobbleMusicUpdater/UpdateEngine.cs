@@ -1129,6 +1129,10 @@ internal sealed partial class UpdateEngine
             string target = PathSafety.CombineUnder(_paths.MinecraftDirectory, file.Path);
             PathSafety.AssertNoReparsePointsOnTargetPath(_paths.MinecraftDirectory, target);
             if (IsOfficialPackProfile(file.Path) && File.Exists(target)) continue;
+            // The game rewrites these (Gravel's Extended Battles TOML, Resourcify .rpo). Convergence tolerates the
+            // runtime copy once the signed revision was delivered, so the commit check must tolerate it too: 1.2.19
+            // rolled back and blocked the launch of every player who had played since their last update.
+            if (IsRuntimeMutableSignedConfig(file.Path) && File.Exists(target)) continue;
             await ValidateExactTargetAsync(target, file, "Adopted managed file changed before commit", cancellationToken);
         }
         foreach (string path in manifest.DeletePaths.Concat(manifest.DeletedFiles.Select(file => file.Path)))
