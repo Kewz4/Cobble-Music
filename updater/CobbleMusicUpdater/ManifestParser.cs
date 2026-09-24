@@ -90,6 +90,13 @@ internal static class ManifestParser
             {
                 throw new InvalidDataException("Signed key-collision repairs require updater 1.2.11 or newer.");
             }
+            if (manifest.SeedTextReplacements.Any(replacement =>
+                    replacement is not null
+                    && string.Equals(replacement.MigrationId, FtbForceCompleteMigrationId, StringComparison.Ordinal))
+                && requiredUpdater < new Version(1, 2, 21))
+            {
+                throw new InvalidDataException("The FTB Quests key repair requires updater 1.2.21 or newer.");
+            }
             if (manifest.SeedTextReplacements.Count != 0 && requiredUpdater < new Version(1, 2, 10))
             {
                 throw new InvalidDataException("Signed seed text replacements require updater 1.2.10 or newer.");
@@ -222,6 +229,16 @@ internal static class ManifestParser
         return paths;
     }
 
+    // FTB Quests 2101.1.36 (modpack 1.0.59) added "Force-complete Hovered" on C, the key Cobblemon's Summary already uses.
+    // This one-time migration unbinds exactly that default line; a player who chose any other key keeps it.
+    internal const string FtbForceCompleteMigrationId = "options-ftb-force-complete-c-v1";
+    internal const string FtbForceCompleteC = "key_key.ftbquests.gui_editor.complete_object:key.keyboard.c";
+    internal const string FtbForceCompleteUnbound = "key_key.ftbquests.gui_editor.complete_object:key.keyboard.unknown";
+
+    internal static void ValidateSeedTextReplacementsForTest(IList<SeedTextReplacement> entries, IEnumerable<ManifestFile> seedFiles) =>
+        ValidateSeedTextReplacements(entries, seedFiles.ToDictionary(file => file.Path, StringComparer.OrdinalIgnoreCase),
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+
     private static void ValidateSeedTextReplacements(
         IList<SeedTextReplacement> entries,
         IReadOnlyDictionary<string, ManifestFile> seedFiles,
@@ -269,6 +286,11 @@ internal static class ManifestParser
                         && string.Equals(replacement.NewText, irisToggleUnbound, StringComparison.Ordinal))
                     || (string.Equals(replacement.OldText, fancyToastsK, StringComparison.Ordinal)
                         && string.Equals(replacement.NewText, fancyToastsUnbound, StringComparison.Ordinal)));
+            bool validFtbKeyReplacement = isOptions
+                && replacement.RequiredLines is { Count: 0 }
+                && string.Equals(replacement.MigrationId, FtbForceCompleteMigrationId, StringComparison.Ordinal)
+                && string.Equals(replacement.OldText, FtbForceCompleteC, StringComparison.Ordinal)
+                && string.Equals(replacement.NewText, FtbForceCompleteUnbound, StringComparison.Ordinal);
             string identity = replacement.Path.ToUpperInvariant() + "\0" + replacement.OldText;
             if (!PathSafety.IsSeedTextReplacementAllowed(replacement.Path)
                 || !seedFiles.ContainsKey(replacement.Path)
@@ -276,7 +298,7 @@ internal static class ManifestParser
                 || (isOptions && reofferSeedPaths.Contains(replacement.Path))
                 || !identities.Add(identity)
                 || !validText
-                || !(validIrisReplacement || validOptionsReplacement))
+                || !(validIrisReplacement || validOptionsReplacement || validFtbKeyReplacement))
             {
                 throw new InvalidDataException(
                     $"Release manifest contains an unsafe, duplicate, or undeclared seed text replacement: {replacement.Path}");

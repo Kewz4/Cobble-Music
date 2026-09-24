@@ -117,6 +117,15 @@ demanded their signed bytes, so every update after the game had rewritten them r
 managed file changed before commit" and exited 3. The commit check now tolerates them exactly as it tolerates
 the official Packed Packs profiles.
 
+Updater 1.2.21 closes a gap in convergence: it replayed only the target release's `deletedFiles`, so a player
+who skipped a release (for example because that update rolled back) kept whatever that release removed, even
+after their recorded version caught up (BetterF3 stayed installed after 1.0.58 removed it). Convergence now
+removes any file that some published release deleted or listed in `legacyCleanup` and that the target no
+longer ships, but only while it is still byte-identical to the official copy, and it does so even when the
+recorded version already matches. 1.2.21 also accepts one more reviewed one-time `options.txt` migration,
+`options-ftb-force-complete-c-v1`: FTB Quests 2101.1.36 put "Force-complete Hovered" on C, the key Cobblemon's
+Summary uses; exactly that default line becomes unbound, and a manifest carrying it requires updater 1.2.21.
+
 Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
 A run that ends **Blocked** (local recovery needs attention, an integrity or

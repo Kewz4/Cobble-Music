@@ -87,7 +87,9 @@ internal sealed partial class UpdateEngine
         bool corrective = await HasPendingCorrectiveWorkAsync(target, state, token);
         var duplicates = needed.Count == 0
             ? await FindConflictingModsAsync(target, null, token) : new List<LegacyCleanupFile>();
-        if (needed.Count == 0 && seeds.Count == 0 && duplicates.Count == 0 && sameIdentity && !corrective && !profileRevisionPending)
+        List<LegacyCleanupFile> retired = await FindRetiredOfficialFilesAsync(catalog, target, token);
+        if (needed.Count == 0 && seeds.Count == 0 && duplicates.Count == 0 && retired.Count == 0
+            && sameIdentity && !corrective && !profileRevisionPending)
         {
             _log($"Verified release {target.Version} inventory; applied Packed Packs revisions preserve their mutable runtime settings.");
             Report(UpdatePhase.Complete, $"Verified {target.Version} — starting Minecraft.");
@@ -121,6 +123,7 @@ internal sealed partial class UpdateEngine
         duplicates.AddRange(target.DeletedFiles
             .Where(f => !PathSafety.IsOptionalPlayerMod(f.Path))
             .Select(f => new LegacyCleanupFile { Path = f.Path, Size = f.Size, Sha256 = f.Sha256 }));
+        duplicates.AddRange(retired.Where(r => !duplicates.Any(d => d.Path.Equals(r.Path, StringComparison.OrdinalIgnoreCase))));
         // These are signed historical defaults, not permission to manage settings.
         state.OfferedSeedPaths = offered.Where(HistoricalManifestPolicy.IsLedgerPathAllowed).ToList();
         await ApplyTransactionAsync(target, latest.ManifestSha256, incoming, state, null,
@@ -192,6 +195,40 @@ internal sealed partial class UpdateEngine
     // Only a second copy of an explicitly managed Fabric mod qualifies. Extra
     // unrelated mods and every Axiom version remain player-owned. Exact bytes
     // are rechecked by the journal before moving to the retained backup.
+    // Official files that some published release removed (its deletedFiles or legacyCleanup) and the target no longer ships.
+    // Convergence used to replay only the target's own deletions, so a player who skipped a release - e.g. one whose 1.0.58
+    // update rolled back and who then converged 1.0.57 -> 1.0.59 - kept that release's removals forever (BetterF3). This runs
+    // even when the recorded version already matches. Only a file still byte-identical to the official copy qualifies, so a
+    // player's own file at the same path is never touched.
+    private async Task<List<LegacyCleanupFile>> FindRetiredOfficialFilesAsync(IReadOnlyList<RemoteRelease> catalog,
+        UpdateManifest target, CancellationToken token)
+    {
+        var shipped = target.Files.Select(f => f.Path).Concat(target.SeedFiles.Select(f => f.Path))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        Version targetVersion = Version.Parse(target.Version);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var result = new List<LegacyCleanupFile>();
+        foreach (RemoteRelease release in catalog.Where(r => Version.Parse(r.Manifest.Version) <= targetVersion)
+            .OrderBy(r => Version.Parse(r.Manifest.Version)))
+        {
+            IEnumerable<LegacyCleanupFile> removed = release.Manifest.DeletedFiles
+                .Select(f => new LegacyCleanupFile { Path = f.Path, Size = f.Size, Sha256 = f.Sha256 })
+                .Concat(release.Manifest.LegacyCleanup);
+            foreach (LegacyCleanupFile file in removed)
+            {
+                if (shipped.Contains(file.Path) || PathSafety.IsOptionalPlayerMod(file.Path)) continue;
+                if (!seen.Add(file.Path.ToUpperInvariant() + "\0" + file.Sha256.ToLowerInvariant())) continue;
+                string local = SafeLocal(file.Path);
+                if (!File.Exists(local) || new FileInfo(local).Length != file.Size) continue;
+                if (!PathSafety.IsExpectedHash(await PathSafety.Sha256Async(local, token), file.Sha256)) continue;
+                if (result.Any(r => r.Path.Equals(file.Path, StringComparison.OrdinalIgnoreCase))) continue;
+                _log($"Retired official file still present (removed by {release.Manifest.Version}): {file.Path}");
+                result.Add(new LegacyCleanupFile { Path = file.Path, Size = file.Size, Sha256 = file.Sha256 });
+            }
+        }
+        return result;
+    }
+
     private async Task<List<LegacyCleanupFile>> FindConflictingModsAsync(UpdateManifest target,
         string? incoming, CancellationToken token)
     {

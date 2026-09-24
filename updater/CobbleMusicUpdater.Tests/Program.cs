@@ -69,6 +69,7 @@ internal static partial class Program
             await TestCreateOnlyDefaultsAsync(Path.Combine(tempRoot, "create-only-defaults"));
             await TestCorrectiveSeedRefreshAndAdoptionAsync(Path.Combine(tempRoot, "corrective-seed-refresh"));
             await TestConditionalKeyCollisionMigrationAsync(Path.Combine(tempRoot, "key-collision-migration"));
+            await TestFtbForceCompleteKeyMigrationAsync(Path.Combine(tempRoot, "ftb-key-migration"));
             await TestJournalCommitBoundaryAsync(Path.Combine(tempRoot, "journal"));
             await TestCrossVolumeTransactionRecoveryAsync(Path.Combine(tempRoot, "cross-volume"));
             await LockV2Tests.RunAsync(Path.Combine(tempRoot, "lock-v2")); // [lock-v2]
@@ -1019,6 +1020,7 @@ internal static partial class Program
         await TestCatalogRepairAndDuplicateQuarantineAsync(Path.Combine(root, "repair"), signer);
         await TestCatalogPreviousPayloadOriginAsync(Path.Combine(root, "previous-origin"), signer);
         await TestCatalogRuntimeMutableConfigCommitAsync(Path.Combine(root, "runtime-mutable"), signer);
+        await TestCatalogRetiredOfficialFilesAsync(Path.Combine(root, "retired-official"), signer);
         await TestCatalogManagedAxiomPreservedAsync(Path.Combine(root, "custom-axiom"), signer, removed: false);
         await TestCatalogManagedAxiomPreservedAsync(Path.Combine(root, "removed-axiom"), signer, removed: true);
         await TestCatalogOfficialProfilesAsync(Path.Combine(root, "fresh-profiles"), signer, upgrade: false);

@@ -488,7 +488,12 @@ function Read-SeedTextReplacementManifest([string]$Path) {
                 $newText -ceq 'key_iris.keybind.toggleShaders:key.keyboard.unknown') -or
              ($oldText -ceq 'key_key.fancytoasts.config_menu:key.keyboard.k' -and
                 $newText -ceq 'key_key.fancytoasts.config_menu:key.keyboard.unknown'))
-        if (-not $seen.Add($identity) -or -not $safeText -or -not ($validIris -or $validOptions)) {
+        # FTB Quests 2101.1.36 (1.0.59) put "Force-complete Hovered" on C, Cobblemon Summary's key. Exactly that default line; needs updater 1.2.21.
+        $validFtbKey = $pathValue -ieq 'options.txt' -and $requiredLines.Count -eq 0 -and
+            $migrationId -ceq 'options-ftb-force-complete-c-v1' -and
+            $oldText -ceq 'key_key.ftbquests.gui_editor.complete_object:key.keyboard.c' -and
+            $newText -ceq 'key_key.ftbquests.gui_editor.complete_object:key.keyboard.unknown'
+        if (-not $seen.Add($identity) -or -not $safeText -or -not ($validIris -or $validOptions -or $validFtbKey)) {
             throw "Seed text replacement is unsafe or duplicated: $pathValue"
         }
         if ($validOptions) {
@@ -1216,6 +1221,9 @@ try {
     if ($FullBaseline -and $seedTextReplacements.Count -ne 0) {
         throw 'Full baselines cannot carry one-time seed text replacements.'
     }
+    $releaseMinimumUpdaterVersion = if (@($seedTextReplacements | Where-Object { [string]$_.migrationId -ceq 'options-ftb-force-complete-c-v1' }).Count -ne 0) {
+        '1.2.21'
+    } else { $RequiredUpdaterVersion }
 
     $managedRepairKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $baseFilesByKey = ConvertTo-CobbleFileRecordSet -Entries @($baseFiles) -Context 'signed base repair candidates' -AllowEmpty
@@ -1317,7 +1325,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = $RequiredUpdaterVersion
+            minimumUpdaterVersion = $releaseMinimumUpdaterVersion
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             payload = $payloadResult.Payload
             files = @($authoritativeFiles | ForEach-Object { [ordered]@{ path = $_.path; size = $_.size; sha256 = $_.sha256 } })
@@ -1333,7 +1341,7 @@ try {
             channel = 'stable'
             version = $Version
             releaseTag = "modpack-v$Version"
-            minimumUpdaterVersion = $RequiredUpdaterVersion
+            minimumUpdaterVersion = $releaseMinimumUpdaterVersion
             createdAtUtc = [DateTimeOffset]::UtcNow.ToString('O')
             base = [ordered]@{ version = $BaseVersion; manifestSha256 = $baseHash }
             payload = $payloadResult.Payload
