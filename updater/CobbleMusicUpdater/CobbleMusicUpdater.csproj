@@ -22,4 +22,10 @@
   <ItemGroup>
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.7.0" />
   </ItemGroup>
+
+  <!-- 1.2.22 lite mode, round 2: the processor and graphics card score tables (lite0924/hwdb, normaliser hwdb-norm-1). -->
+  <ItemGroup>
+    <EmbeddedResource Include="HardwareDb\cpu_scores.json" LogicalName="HardwareDb.cpu_scores.json" />
+    <EmbeddedResource Include="HardwareDb\gpu_scores.json" LogicalName="HardwareDb.gpu_scores.json" />
+  </ItemGroup>
 </Project>

@@ -1,82 +1,65 @@
-using System.Diagnostics;
-using System.Runtime.CompilerServices;
+using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Win32;
 
 namespace CobbleMusicUpdater;
 
-// Hardware sources for the one-time lite check. Every member can be replaced by tests; the real ones only read
-// the registry (no admin rights, no WMI) and run a ~1 s single-thread benchmark on its own thread.
+// Hardware sources for the lite decision. Every member can be replaced by tests; the real ones only READ the registry
+// (and ask Windows which display devices are present). Nothing is measured: round 1's processor benchmark was dropped
+// because it mostly timed memory latency and depended on what else was running (lite0924/build/VERIFY.md).
 internal sealed class PerformanceEnvironment
 {
     public Func<string> ReadCpuName { get; init; } = CpuRegistry.ReadName;
     public Func<IReadOnlyList<GpuAdapterInfo>> ReadGpus { get; init; } = GpuRegistry.Read;
-    public Func<CancellationToken, CpuProbeResult> MeasureCpu { get; init; } = token => SingleCoreProbe.Run(token);
-    public TimeSpan ProbeTimeout { get; init; } = TimeSpan.FromSeconds(5);
-    // A measurement disturbed more than this never votes lite (see CpuProbeResult.Interference).
-    public double MaximumInterference { get; init; } = 0.9;
-    public int MaximumCpuAttempts { get; init; } = 3;
+    public Func<HardwareDb> Database { get; init; } = () => HardwareDb.Embedded;
 
     public static PerformanceEnvironment Default { get; } = new();
 }
 
-// Interference = how much slower the typical (median) work step was than the fast tail (p50/p05 - 1). A quiet PC
-// reads about 0.3-0.7; a PC busy with other programs reads more (measured on Kewz's i7-10750H with Minecraft
-// running: 1.06-1.71 while the score fell from ~1000 to 315-399).
-internal sealed record CpuProbeResult(double Score, double QuantaPerSecond, long ElapsedMilliseconds, double Interference = 0);
-
 internal static class CpuRegistry
 {
+    // HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0 ProcessorNameString, exactly as Windows stores it apart from
+    // the outer spaces (Intel pads some names on the left). The normaliser collapses inner spaces itself.
     public static string ReadName()
     {
         using RegistryKey? key = Registry.LocalMachine.OpenSubKey(@"HARDWARE\DESCRIPTION\System\CentralProcessor\0");
-        string name = (key?.GetValue("ProcessorNameString") as string ?? "").Trim();
-        return name.Length == 0 ? "unknown processor" : CollapseSpaces(name);
+        return (key?.GetValue("ProcessorNameString") as string ?? "").Trim();
     }
-
-    internal static string CollapseSpaces(string value) =>
-        string.Join(' ', value.Split(' ', StringSplitOptions.RemoveEmptyEntries));
 }
 
-// Display adapters from the display-class registry key. WMI's AdapterRAM caps at 4 GiB (measured: an 8 GB
-// RTX 2070 Super reads 4,293,918,720 there) and needs a NuGet package; this key needs neither.
+// Display adapters from the display-class registry key (no admin rights, no WMI: WMI's AdapterRAM caps at 4 GiB).
+// The class key also keeps entries for cards that were removed, so each entry is matched to a PRESENT display device
+// through SetupAPI (its driver key "{4d36e968-...}\NNNN"); an entry with no present device is marked Present = false.
 internal static class GpuRegistry
 {
-    private const string DisplayClass = @"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}";
+    internal const string DisplayClassGuid = "{4d36e968-e325-11ce-bfc1-08002be10318}";
+    private const string DisplayClass = @"SYSTEM\CurrentControlSet\Control\Class\" + DisplayClassGuid;
 
     public static IReadOnlyList<GpuAdapterInfo> Read()
     {
+        Dictionary<string, string>? present = PresentDisplayDevices.TryRead();
         var adapters = new List<GpuAdapterInfo>();
         using RegistryKey? root = Registry.LocalMachine.OpenSubKey(DisplayClass);
         if (root is null) return adapters;
-        foreach (string subKeyName in root.GetSubKeyNames())
+        foreach (string subKeyName in root.GetSubKeyNames().Order(StringComparer.Ordinal))
         {
             if (subKeyName.Length != 4 || !subKeyName.All(char.IsAsciiDigit)) continue;
             try
             {
                 using RegistryKey? adapter = root.OpenSubKey(subKeyName);
                 if (adapter is null) continue;
-                string name = CpuRegistry.CollapseSpaces((adapter.GetValue("DriverDesc") as string ?? "").Trim());
-                if (name.Length == 0 || IsVirtualAdapter(name)) continue;
-                long memory = adapter.GetValue("HardwareInformation.qwMemorySize") switch
-                {
-                    long value => value,
-                    int value => (uint)value,
-                    byte[] bytes when bytes.Length >= 8 => BitConverter.ToInt64(bytes, 0),
-                    byte[] bytes when bytes.Length >= 4 => BitConverter.ToUInt32(bytes, 0),
-                    _ => adapter.GetValue("HardwareInformation.MemorySize") switch
-                    {
-                        int value => (uint)value,
-                        byte[] bytes when bytes.Length >= 4 => BitConverter.ToUInt32(bytes, 0),
-                        _ => 0L
-                    }
-                };
+                string name = (adapter.GetValue("DriverDesc") as string ?? "").Trim();
+                if (name.Length == 0) continue;
                 adapters.Add(new GpuAdapterInfo
                 {
                     Name = name,
                     DeviceId = (adapter.GetValue("MatchingDeviceId") as string ?? "").Trim(),
-                    MemoryBytes = memory
+                    HardwareId = present is not null && present.TryGetValue(subKeyName, out string? hardwareId) ? hardwareId : "",
+                    MemoryBytes = ReadMemory(adapter),
+                    RegistryKey = subKeyName,
+                    Present = present is null ? null : present.ContainsKey(subKeyName)
                 });
             }
             catch (Exception exception) when (exception is System.Security.SecurityException or UnauthorizedAccessException or IOException)
@@ -84,206 +67,217 @@ internal static class GpuRegistry
                 // The class key also holds a protected "Properties" subkey; unreadable adapters are skipped.
             }
         }
-        return adapters
-            .GroupBy(adapter => adapter.Name + "\0" + adapter.DeviceId, StringComparer.OrdinalIgnoreCase)
-            .Select(group => group.First())
-            .ToList();
+        return adapters;
     }
 
-    internal static bool IsVirtualAdapter(string name) =>
-        name.Contains("Microsoft Basic Display", StringComparison.OrdinalIgnoreCase)
-        || name.Contains("Microsoft Basic Render", StringComparison.OrdinalIgnoreCase)
-        || name.Contains("Microsoft Remote Display", StringComparison.OrdinalIgnoreCase)
-        || name.Contains("Remote Desktop", StringComparison.OrdinalIgnoreCase)
-        || name.Contains("Virtual Display", StringComparison.OrdinalIgnoreCase)
-        || name.Contains("Parsec Virtual", StringComparison.OrdinalIgnoreCase)
-        || name.Contains("Citrix", StringComparison.OrdinalIgnoreCase);
+    private static long ReadMemory(RegistryKey adapter) =>
+        adapter.GetValue("HardwareInformation.qwMemorySize") switch
+        {
+            long value => value,
+            int value => (uint)value,
+            byte[] bytes when bytes.Length >= 8 => BitConverter.ToInt64(bytes, 0),
+            byte[] bytes when bytes.Length >= 4 => BitConverter.ToUInt32(bytes, 0),
+            _ => adapter.GetValue("HardwareInformation.MemorySize") switch
+            {
+                int value => (uint)value,
+                long value => value,
+                byte[] bytes when bytes.Length >= 4 => BitConverter.ToUInt32(bytes, 0),
+                _ => 0L
+            }
+        };
 }
 
-internal enum GpuTier
+// SetupAPI: the display devices Windows reports as PRESENT, keyed by their class subkey ("0001"), with the first hardware
+// id ("PCI\VEN_10DE&DEV_1E91&..."). Returns null when the query itself fails (then presence is unknown, and every class
+// entry is used as before). Read-only.
+internal static class PresentDisplayDevices
 {
-    Unknown,
-    Lite,
-    Full
+    private const uint DigcfPresent = 0x2;
+    private const uint SpdrpHardwareId = 0x1;
+    private const uint SpdrpDriver = 0x9;
+    private static readonly IntPtr InvalidHandle = new(-1);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SpDevinfoData
+    {
+        public uint CbSize;
+        public Guid ClassGuid;
+        public uint DevInst;
+        public IntPtr Reserved;
+    }
+
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr SetupDiGetClassDevsW(ref Guid classGuid, IntPtr enumerator, IntPtr parent, uint flags);
+
+    [DllImport("setupapi.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetupDiEnumDeviceInfo(IntPtr set, uint index, ref SpDevinfoData data);
+
+    [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetupDiGetDeviceRegistryPropertyW(IntPtr set, ref SpDevinfoData data, uint property,
+        out uint registryType, byte[]? buffer, uint bufferSize, out uint requiredSize);
+
+    [DllImport("setupapi.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetupDiDestroyDeviceInfoList(IntPtr set);
+
+    public static Dictionary<string, string>? TryRead()
+    {
+        try
+        {
+            Guid display = new(GpuRegistry.DisplayClassGuid);
+            IntPtr set = SetupDiGetClassDevsW(ref display, IntPtr.Zero, IntPtr.Zero, DigcfPresent);
+            if (set == InvalidHandle || set == IntPtr.Zero) return null;
+            try
+            {
+                var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                for (uint index = 0; index < 64; index++)
+                {
+                    var data = new SpDevinfoData { CbSize = (uint)Marshal.SizeOf<SpDevinfoData>() };
+                    if (!SetupDiEnumDeviceInfo(set, index, ref data)) break;
+                    string driver = ReadString(set, ref data, SpdrpDriver);
+                    int slash = driver.LastIndexOf('\\');
+                    if (slash < 0 || !driver[..slash].Equals(GpuRegistry.DisplayClassGuid, StringComparison.OrdinalIgnoreCase)) continue;
+                    result[driver[(slash + 1)..]] = ReadString(set, ref data, SpdrpHardwareId);
+                }
+                return result;
+            }
+            finally
+            {
+                SetupDiDestroyDeviceInfoList(set);
+            }
+        }
+        catch (Exception exception) when (exception is DllNotFoundException or EntryPointNotFoundException or ExternalException)
+        {
+            return null;
+        }
+    }
+
+    // REG_SZ or the first string of a REG_MULTI_SZ.
+    private static string ReadString(IntPtr set, ref SpDevinfoData data, uint property)
+    {
+        SetupDiGetDeviceRegistryPropertyW(set, ref data, property, out _, null, 0, out uint required);
+        if (required == 0 || required > 64 * 1024) return "";
+        byte[] buffer = new byte[required];
+        if (!SetupDiGetDeviceRegistryPropertyW(set, ref data, property, out _, buffer, required, out _)) return "";
+        string text = Encoding.Unicode.GetString(buffer);
+        int end = text.IndexOf('\0');
+        return (end >= 0 ? text[..end] : text).Trim();
+    }
 }
 
-// Whole-word matching of graphics card names: "NVIDIA GeForce RTX 3050 Laptop GPU" matches "RTX 3050" but
-// "RX 6600 XT" does not match the pattern "RX 6600 XT" unless all three words appear in order. '#' in a
-// pattern word matches any one digit ("RADEON ###M" = Radeon 610M..890M integrated graphics).
-internal static class GpuTierList
+internal sealed record AdapterVerdict(GpuAdapterInfo Adapter, bool Real, string NotRealReason, string PciVendor, string PciDevice, HardwareMatch Match);
+
+internal sealed record HardwareDecision(
+    PerformanceMode Mode,
+    string CpuName,
+    HardwareMatch Cpu,
+    IReadOnlyList<AdapterVerdict> Adapters,
+    AdapterVerdict? BestGpu,
+    bool GpuVotes,
+    bool CpuLite,
+    bool GpuLite,
+    string Reason,
+    string Fingerprint,
+    PerformanceDetectionRules Rules,
+    string DatabaseVersion);
+
+// The whole lite decision as one pure function of (processor name, display adapters, table, lines):
+//   * processor: LITE vote when its table score is below cpuSingleThreadBelow; not in the table = no vote;
+//   * graphics: only REAL adapters count (present, a PCI hardware id from NVIDIA 10DE, AMD 1002/1022 or Intel 8086,
+//     not a Basic Display / remote / virtual / indirect / USB adapter). The BEST real adapter's score is compared with
+//     gpuScoreBelow. If any real adapter is not in the table, graphics do not vote (the unknown card could be the best);
+//   * LITE when either vote says lite; nothing known = FULL.
+internal static class HardwareVerdict
 {
-    public static IReadOnlyList<string> Tokenize(string value)
+    public static HardwareDecision Decide(string cpuName, IReadOnlyList<GpuAdapterInfo> adapters, HardwareDb db, PerformanceDetectionRules rules)
     {
-        string cleaned = value.Replace("(R)", " ", StringComparison.OrdinalIgnoreCase)
-            .Replace("(TM)", " ", StringComparison.OrdinalIgnoreCase)
-            .Replace("®", " ", StringComparison.Ordinal)
-            .Replace("™", " ", StringComparison.Ordinal);
-        var tokens = new List<string>();
-        var current = new StringBuilder();
-        foreach (char character in cleaned)
-        {
-            if (char.IsAsciiLetterOrDigit(character) || character == '#')
-            {
-                current.Append(char.ToUpperInvariant(character));
-            }
-            else if (current.Length != 0)
-            {
-                tokens.Add(current.ToString());
-                current.Clear();
-            }
-        }
-        if (current.Length != 0) tokens.Add(current.ToString());
-        return tokens;
+        HardwareMatch cpu = cpuName.Length == 0 ? HardwareMatch.Unknown(null, "not-read") : db.ResolveCpu(cpuName);
+        var verdicts = adapters.Select(adapter => Classify(adapter, db, cpuName)).ToList();
+        var real = verdicts.Where(item => item.Real).ToList();
+        AdapterVerdict? best = real.Where(item => item.Match.Status == HardwareMatchStatus.Known)
+            .OrderByDescending(item => item.Match.Score).ThenBy(item => item.Adapter.RegistryKey, StringComparer.Ordinal).FirstOrDefault();
+        bool gpuVotes = real.Count > 0 && real.All(item => item.Match.Status == HardwareMatchStatus.Known);
+        bool cpuLite = cpu.Status == HardwareMatchStatus.Known && cpu.Score < rules.CpuSingleThreadBelow;
+        bool gpuLite = gpuVotes && best is not null && best.Match.Score < rules.GpuScoreBelow;
+        PerformanceMode mode = cpuLite || gpuLite ? PerformanceMode.Lite : PerformanceMode.Full;
+        string reason = mode == PerformanceMode.Lite
+            ? cpuLite && gpuLite ? "processor and graphics card are below their lines" : cpuLite ? "processor is below its line" : "graphics card is below its line"
+            : cpu.Status != HardwareMatchStatus.Known && !gpuVotes ? "nothing could be looked up"
+            : "neither is below its line";
+        string fingerprint = "cpu=" + cpuName + "|gpu=" + string.Join(";", real
+            .Select(item => $"{item.Adapter.Name}@{item.PciVendor}:{item.PciDevice}@{RoundGib(item.Adapter.MemoryBytes)}g")
+            .Order(StringComparer.Ordinal));
+        return new HardwareDecision(mode, cpuName, cpu, verdicts, best, gpuVotes, cpuLite, gpuLite, reason, fingerprint, rules, db.Version);
     }
 
-    public static bool Matches(string adapterName, string pattern)
+    private static AdapterVerdict Classify(GpuAdapterInfo adapter, HardwareDb db, string cpuName)
     {
-        IReadOnlyList<string> name = Tokenize(adapterName);
-        IReadOnlyList<string> want = Tokenize(pattern);
-        if (want.Count == 0 || want.Count > name.Count) return false;
-        for (int start = 0; start + want.Count <= name.Count; start++)
-        {
-            bool all = true;
-            for (int offset = 0; offset < want.Count && all; offset++)
-                all = WordMatches(name[start + offset], want[offset]);
-            if (all) return true;
-        }
-        return false;
+        string pciId = IsPci(adapter.DeviceId) ? adapter.DeviceId : IsPci(adapter.HardwareId) ? adapter.HardwareId : "";
+        (string? vendor, string? device) = HardwareNames.ParsePciId(pciId);
+        AdapterVerdict NotReal(string why) =>
+            new(adapter, false, why, vendor ?? "", device ?? "", HardwareMatch.Ignore(why));
+        if (adapter.Present == false) return NotReal("not present (left over from removed hardware)");
+        if (HardwareNames.IsVirtualAdapter(adapter.Name)) return NotReal("virtual, remote or indirect display adapter");
+        if (vendor is null || device is null) return NotReal("no PCI hardware id");
+        if (!HardwareNames.GraphicsVendors.Contains(vendor)) return NotReal($"PCI vendor {vendor} is not NVIDIA, AMD or Intel");
+        HardwareMatch match = db.ResolveGpu(adapter.Name, pciId, adapter.MemoryBytes > 0 ? adapter.MemoryBytes : null, cpuName);
+        if (match.Status == HardwareMatchStatus.Ignore) return NotReal(match.Rule);
+        return new AdapterVerdict(adapter, true, "", vendor, device, match);
     }
 
-    private static bool WordMatches(string word, string pattern)
+    private static bool IsPci(string? id) => id is not null && id.StartsWith(@"pci\", StringComparison.OrdinalIgnoreCase);
+
+    internal static int RoundGib(long bytes) => bytes <= 0 ? 0 : (int)Math.Round(bytes / (double)(1L << 30));
+
+    // One plain log line: every name, the table key it matched, the score, the lines and the verdict.
+    public static string LogLine(HardwareDecision decision, string decided)
     {
-        if (word.Length != pattern.Length) return false;
-        for (int index = 0; index < word.Length; index++)
-        {
-            if (pattern[index] == '#' ? !char.IsAsciiDigit(word[index]) : pattern[index] != word[index]) return false;
-        }
-        return true;
+        var text = new StringBuilder("Performance check: processor \"").Append(decision.CpuName).Append("\" ");
+        text.Append(decision.Cpu.Status == HardwareMatchStatus.Known
+            ? $"= \"{decision.Cpu.Key}\" {decision.Cpu.Score}{(decision.Cpu.Ambiguous ? " (ambiguous key)" : "")}"
+            : $"not in the table (key \"{decision.Cpu.Key}\")");
+        text.Append($" (lite below {decision.Rules.CpuSingleThreadBelow}); graphics ");
+        var real = decision.Adapters.Where(item => item.Real).ToList();
+        text.Append(real.Count == 0 ? "none real" : string.Join(", ", real.Select(item =>
+            $"\"{item.Adapter.Name}\" [{item.PciVendor}:{item.PciDevice}, {RoundGib(item.Adapter.MemoryBytes)} GiB] "
+            + (item.Match.Status == HardwareMatchStatus.Known
+                ? $"= \"{item.Match.Key}\" {item.Match.Score} ({item.Match.Rule}{(item.Match.Ambiguous ? ", ambiguous" : "")})"
+                : $"not in the table (key \"{item.Match.Key}\")"))));
+        text.Append(decision.BestGpu is null ? "; no known graphics card" : $"; best {decision.BestGpu.Match.Score}");
+        text.Append($" (lite below {decision.Rules.GpuScoreBelow}){(decision.GpuVotes || real.Count == 0 ? "" : "; graphics do not vote: a real card is not in the table")}");
+        var ignored = decision.Adapters.Where(item => !item.Real).ToList();
+        if (ignored.Count > 0)
+            text.Append("; ignored ").Append(string.Join(", ", ignored.Select(item => $"\"{item.Adapter.Name}\" ({item.NotRealReason})")));
+        text.Append($"; table {decision.DatabaseVersion}; result {decision.Mode.ToString().ToUpperInvariant()} ({decision.Reason}); {decided}.");
+        text.Append(" Override: cobble-music-updater/").Append(PerformanceModeFile.FileName);
+        return text.ToString();
     }
 
-    public static GpuTier Classify(string adapterName, PerformanceDetectionRules rules)
+    // The same facts for performance-mode.txt, in plain words (one line, after "# This computer:").
+    public static string StatusText(HardwareDecision decision, PerformanceMode picked)
     {
-        if (rules.FullGpuPatterns.Any(pattern => Matches(adapterName, pattern))) return GpuTier.Full;
-        if (rules.LiteGpuPatterns.Any(pattern => Matches(adapterName, pattern))) return GpuTier.Lite;
-        return GpuTier.Unknown;
+        string processor = decision.Cpu.Status == HardwareMatchStatus.Known
+            ? $"processor {Plain(decision.CpuName)}, speed score {decision.Cpu.Score} (lite below {decision.Rules.CpuSingleThreadBelow})"
+            : decision.CpuName.Length == 0 ? "processor could not be read"
+            : $"processor {Plain(decision.CpuName)} is not in the updater's list, so it does not count";
+        var real = decision.Adapters.Where(item => item.Real).ToList();
+        string graphics;
+        if (real.Count == 0) graphics = "no graphics card could be read";
+        else if (!decision.GpuVotes)
+            graphics = "graphics card " + string.Join(" + ", real.Where(item => item.Match.Status != HardwareMatchStatus.Known).Select(item => Plain(item.Adapter.Name)))
+                + " is not in the updater's list, so graphics do not count";
+        else
+            graphics = $"best graphics card {Plain(decision.BestGpu!.Adapter.Name)}, speed score {decision.BestGpu.Match.Score}"
+                + (decision.BestGpu.Match.Rule == "nvidia-mobile-by-device-id" ? " as a laptop chip" : "")
+                + $" (lite below {decision.Rules.GpuScoreBelow})";
+        return $"{processor}; {graphics}. Picked: {picked.ToString().ToLowerInvariant()}.";
     }
 
-    // Any full card (or any card we do not know) keeps the PC out of lite on graphics; only when every real
-    // adapter is on the lite list does the graphics card vote lite. No adapters read = unknown.
-    public static GpuTier ClassifyMachine(IReadOnlyList<GpuAdapterInfo> adapters, PerformanceDetectionRules rules)
-    {
-        if (adapters.Count == 0) return GpuTier.Unknown;
-        List<GpuTier> tiers = adapters.Select(adapter => Classify(adapter.Name, rules)).ToList();
-        if (tiers.Contains(GpuTier.Full)) return GpuTier.Full;
-        if (tiers.Contains(GpuTier.Unknown)) return GpuTier.Unknown;
-        return GpuTier.Lite;
-    }
-}
-
-// Single-thread processor probe (ported unchanged in its kernels from lite0924/research/cpubench, where it was
-// calibrated). Fixed work per quantum, measured time; the score is the FAST TAIL (5th percentile quantum time)
-// because interference only ever slows a quantum down. Score 1000 = Kewz's i7-10750H (6500 quanta/s).
-internal static class SingleCoreProbe
-{
-    public const double ReferenceQuantaPerSecond = 6500.0;
-    private const int TableBits = 18;
-    private const int ChaseLength = 1 << 19;
-    private const int HashOpsPerQuantum = 5_000;
-    private const int ChaseStepsPerQuantum = 10_000;
-    private const int VectorsPerQuantum = 500;
-
-    public static CpuProbeResult Run(CancellationToken cancellationToken, double measureSeconds = 0.8)
-    {
-        var total = Stopwatch.StartNew();
-        int[] table = new int[1 << TableBits];
-        int[] chase = BuildCycle(ChaseLength, 0x9E3779B9u);
-        float[] vectors = new float[VectorsPerQuantum * 4];
-        for (int index = 0; index < vectors.Length; index++) vectors[index] = (index % 97) * 0.013f - 0.5f;
-        ulong checksum = 0;
-        uint seed = 0x2545F491u;
-        int cursor = 0;
-
-        var warmup = Stopwatch.StartNew();
-        while (warmup.ElapsedMilliseconds < 150)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            checksum += Quantum(table, chase, vectors, ref seed, ref cursor);
-        }
-
-        var times = new List<long>(8192);
-        long measureEnd = Stopwatch.GetTimestamp() + (long)(measureSeconds * Stopwatch.Frequency);
-        long start = Stopwatch.GetTimestamp();
-        while (start < measureEnd)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            checksum += Quantum(table, chase, vectors, ref seed, ref cursor);
-            long end = Stopwatch.GetTimestamp();
-            times.Add(end - start);
-            start = end;
-        }
-        GC.KeepAlive(checksum);
-        if (times.Count < 20) throw new InvalidOperationException("The processor check could not complete enough work.");
-        times.Sort();
-        double fastTailSeconds = times[times.Count / 20] / (double)Stopwatch.Frequency;
-        double medianSeconds = times[times.Count / 2] / (double)Stopwatch.Frequency;
-        double quantaPerSecond = 1.0 / fastTailSeconds;
-        return new CpuProbeResult(1000.0 * quantaPerSecond / ReferenceQuantaPerSecond, quantaPerSecond, total.ElapsedMilliseconds,
-            medianSeconds / fastTailSeconds - 1.0);
-    }
-
-    private static int[] BuildCycle(int length, uint seed)
-    {
-        int[] next = new int[length];
-        for (int index = 0; index < length; index++) next[index] = index;
-        for (int index = length - 1; index > 0; index--)
-        {
-            seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
-            int swap = (int)(seed % (uint)index);
-            (next[index], next[swap]) = (next[swap], next[index]);
-        }
-        return next;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveOptimization | MethodImplOptions.NoInlining)]
-    private static ulong Quantum(int[] table, int[] chase, float[] vectors, ref uint seed, ref int cursor)
-    {
-        ulong accumulator = 0;
-        int mask = table.Length - 1;
-        uint state = seed;
-        for (int index = 0; index < HashOpsPerQuantum; index++)
-        {
-            state ^= state << 13; state ^= state >> 17; state ^= state << 5;
-            int key = (int)(state & 0x7FFFF) | 1;
-            int slot = (int)((uint)(key * -1640531535) >> (32 - TableBits));
-            for (int probe = 0; probe < 8; probe++)
-            {
-                int value = table[slot];
-                if (value == 0) { table[slot] = key; break; }
-                if (value == key) { accumulator += (ulong)slot; break; }
-                slot = (slot + 1) & mask;
-            }
-            if ((state & 0xFFF) == 0) table[(int)(state >> 20) & mask] = 0;
-        }
-        seed = state;
-        int position = cursor;
-        for (int index = 0; index < ChaseStepsPerQuantum; index++) position = chase[position];
-        cursor = position;
-        accumulator += (ulong)position;
-        float m00 = 0.9f, m01 = 0.1f, m02 = -0.2f, m03 = 1f, m10 = -0.1f, m11 = 0.95f, m12 = 0.05f, m13 = 2f,
-              m20 = 0.2f, m21 = -0.05f, m22 = 0.97f, m23 = 3f;
-        float sum = 0;
-        for (int index = 0; index < vectors.Length; index += 4)
-        {
-            float x = vectors[index], y = vectors[index + 1], z = vectors[index + 2];
-            float tx = m00 * x + m01 * y + m02 * z + m03;
-            float ty = m10 * x + m11 * y + m12 * z + m13;
-            float tz = m20 * x + m21 * y + m22 * z + m23;
-            float inverse = 1f / (1f + tx * tx + ty * ty + tz * tz);
-            sum += (tx + ty + tz) * inverse;
-        }
-        accumulator += (ulong)BitConverter.SingleToInt32Bits(sum);
-        return accumulator;
-    }
+    private static string Plain(string name) =>
+        HardwareNames.Squash(name.Replace("(R)", "", StringComparison.OrdinalIgnoreCase).Replace("(TM)", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("®", "", StringComparison.Ordinal).Replace("™", "", StringComparison.Ordinal));
 }
 
 // The one plain file a player edits to force a mode: <minecraft>/cobble-music-updater/performance-mode.txt.
@@ -307,7 +301,7 @@ internal static class PerformanceModeFile
                 log("performance-mode.txt is unusually large; using mode=auto.");
                 return "auto";
             }
-            text = new UTF8Encoding(false, false).GetString(bytes).TrimStart('\uFEFF');
+            text = new UTF8Encoding(false, false).GetString(bytes).TrimStart('﻿');
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
@@ -331,7 +325,7 @@ internal static class PerformanceModeFile
     public static string Template(string status) =>
         "# Kewz's Cobblemon - performance mode\r\n"
         + "# Change the mode line and start the game again:\r\n"
-        + "#   mode=auto  the updater picks for this computer (it checks the processor and graphics card once)\r\n"
+        + "#   mode=auto  the updater picks for this computer from its built-in list of processor and graphics card speeds\r\n"
         + "#   mode=lite  lighter pack: fewer visual extras, runs better with shaders\r\n"
         + "#   mode=full  the whole pack\r\n"
         + "mode=auto\r\n"
@@ -391,9 +385,13 @@ internal static class PerformanceModeFile
     }
 }
 
-// The once-per-PC hardware record (%LOCALAPPDATA%\CobbleMusicUpdater\performance-detection.json).
+// The machine-wide (per Windows user) record of the last automatic decision
+// (%LOCALAPPDATA%\CobbleMusicUpdater\performance-detection.json). The verdict is re-decided only when the hardware
+// fingerprint, the built-in table's version or the signed lines change.
 internal static class MachinePerformanceStore
 {
+    public const int SchemaVersion = 2;
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -411,7 +409,8 @@ internal static class MachinePerformanceStore
         {
             if (!File.Exists(path) || new FileInfo(path).Length > 256 * 1024) return null;
             MachinePerformanceRecord? record = JsonSerializer.Deserialize<MachinePerformanceRecord>(File.ReadAllBytes(path), JsonOptions);
-            return record is { SchemaVersion: 1, Gpus: not null, CpuName: not null } ? record : null;
+            return record is { SchemaVersion: SchemaVersion, Fingerprint: not null, DatabaseVersion: not null, Verdict: "lite" or "full" }
+                ? record : null;
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
         {
@@ -430,7 +429,9 @@ internal static class MachinePerformanceStore
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
-            log($"The hardware check result could not be saved ({exception.GetType().Name}); it will run again next launch.");
+            log($"The hardware decision could not be saved ({exception.GetType().Name}); it is decided again next launch.");
         }
     }
+
+    public static string FormatDate(DateTimeOffset value) => value.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
 }

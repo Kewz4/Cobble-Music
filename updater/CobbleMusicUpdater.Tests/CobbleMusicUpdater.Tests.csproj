@@ -16,4 +16,8 @@
   <ItemGroup>
     <EmbeddedResource Include="Fixtures\Jvm\*.cfg" LogicalName="JvmFixtures.%(Filename)%(Extension)" />
   </ItemGroup>
+  <!-- 1.2.22 lite round 2: the hwdb test vectors (lite0924/hwdb/tests) and the Python reference's result for each. -->
+  <ItemGroup>
+    <EmbeddedResource Include="Fixtures\Hwdb\*.tsv" LogicalName="HwdbFixtures.%(Filename)%(Extension)" />
+  </ItemGroup>
 </Project>

@@ -1,0 +1,133 @@
+# DriverDesc <TAB> MatchingDeviceId (- none) <TAB> qwMemorySize in GiB (- none) <TAB> paired ProcessorNameString (- none)
+#   <TAB> expected PassMark videocard name | UNKNOWN | IGNORE <TAB> expected rule (- any) <TAB> provenance
+# provenance: this-pc = read from Kewz's registry 2026-09-24; task = given verbatim by Kewz/the task;
+# passmark = the PassMark name with the vendor prefix Windows adds (PassMark names come from the Windows adapter name);
+# pattern = written from the vendor's driver naming format, NOT observed on a machine in this session.
+NVIDIA GeForce RTX 2070 Super	pci\ven_10de&dev_1e91&subsys_12b41462	8	Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz	GeForce RTX 2070 Super with Max-Q Design	nvidia-mobile-by-device-id	this-pc
+Intel(R) UHD Graphics	PCI\VEN_8086&DEV_9BC4&SUBSYS_12B41462	-	Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz	Intel UHD Graphics	exact	this-pc
+NVIDIA GeForce RTX 3050	PCI\VEN_10DE&DEV_2507	8	AMD Ryzen 7 2700 Eight-Core Processor	GeForce RTX 3050 8GB	memory-variant	task
+NVIDIA GeForce RTX 3050	PCI\VEN_10DE&DEV_2584	6	-	GeForce RTX 3050 6GB	memory-variant	task
+NVIDIA GeForce RTX 3050	-	-	-	GeForce RTX 3050 6GB	memory-variant-lower	task
+NVIDIA GeForce RTX 3050 Laptop GPU	PCI\VEN_10DE&DEV_25A2	4	-	GeForce RTX 3050 Laptop GPU	exact	task
+NVIDIA GeForce RTX 2070 Super with Max-Q Design	-	8	-	GeForce RTX 2070 Super with Max-Q Design	exact	task
+AMD Radeon RX 6600	PCI\VEN_1002&DEV_73FF	8	-	Radeon RX 6600	exact	task
+AMD Radeon(TM) Graphics	PCI\VEN_1002&DEV_1638	-	AMD Ryzen 7 5800H with Radeon Graphics	Radeon Ryzen 7 5800H	amd-igpu-by-cpu	task
+Intel(R) UHD Graphics 630	PCI\VEN_8086&DEV_3E92	-	-	Intel UHD Graphics 630	exact	task
+Intel(R) Iris(R) Xe Graphics	PCI\VEN_8086&DEV_9A49	-	-	Intel Iris Xe	exact	task
+NVIDIA GeForce RTX 3080	PCI\VEN_10DE&DEV_2206	10	AMD Ryzen 7 5800X 8-Core Processor	GeForce RTX 3080	exact	task
+NVIDIA GeForce RTX 3080	PCI\VEN_10DE&DEV_220A	12	-	GeForce RTX 3080 12GB	memory-variant	passmark
+NVIDIA GeForce RTX 2070 SUPER	PCI\VEN_10DE&DEV_1E84	8	-	GeForce RTX 2070 SUPER	exact	passmark
+NVIDIA GeForce RTX 3050 6GB Laptop GPU	-	6	-	GeForce RTX 3050 6GB Laptop GPU	exact	passmark
+NVIDIA GeForce RTX 3050 Ti Laptop GPU	-	4	-	GeForce RTX 3050 Ti Laptop GPU	exact	passmark
+NVIDIA GeForce RTX 3050 OEM	-	8	-	GeForce RTX 3050 OEM	exact	passmark
+NVIDIA GeForce RTX 3050 A Laptop GPU	-	4	-	GeForce RTX 3050 A Laptop GPU	exact	passmark
+NVIDIA GeForce GTX 960	-	2	-	GeForce GTX 960	exact	passmark
+NVIDIA GeForce GTX 970	-	4	-	GeForce GTX 970	exact	passmark
+NVIDIA GeForce GTX 750 Ti	-	2	-	GeForce GTX 750 Ti	exact	passmark
+NVIDIA GeForce GTX 1050 Ti	-	4	-	GeForce GTX 1050 Ti	exact	passmark
+NVIDIA GeForce GTX 1060 6GB	PCI\VEN_10DE&DEV_1C03	6	-	GeForce GTX 1060	memory-token-dropped	pattern
+NVIDIA GeForce GTX 1060 3GB	PCI\VEN_10DE&DEV_1C02	3	-	GeForce GTX 1060 3GB	exact	passmark
+NVIDIA GeForce GTX 1060	PCI\VEN_10DE&DEV_1C20	6	-	GeForce GTX 1060 with Max-Q Design	nvidia-mobile-by-device-id	pattern
+NVIDIA GeForce GTX 1060 with Max-Q Design	-	6	-	GeForce GTX 1060 with Max-Q Design	exact	passmark
+NVIDIA GeForce GTX 1070	-	8	-	GeForce GTX 1070	exact	passmark
+NVIDIA GeForce GTX 1080 Ti	-	11	-	GeForce GTX 1080 Ti	exact	passmark
+NVIDIA GeForce GTX 1650	PCI\VEN_10DE&DEV_1F82	4	-	GeForce GTX 1650	exact	passmark
+NVIDIA GeForce GTX 1650	PCI\VEN_10DE&DEV_1F91	4	-	GeForce GTX 1650 with Max-Q Design	nvidia-mobile-by-device-id	pattern
+NVIDIA GeForce GTX 1650 SUPER	-	4	-	GeForce GTX 1650 SUPER	exact	passmark
+NVIDIA GeForce GTX 1660	-	6	-	GeForce GTX 1660	exact	passmark
+NVIDIA GeForce GTX 1660 SUPER	-	6	-	GeForce GTX 1660 SUPER	exact	passmark
+NVIDIA GeForce GTX 1660 Ti	-	6	-	GeForce GTX 1660 Ti	exact	passmark
+NVIDIA GeForce GTX 1660 Ti with Max-Q Design	-	6	-	GeForce GTX 1660 Ti with Max-Q Design	exact	passmark
+NVIDIA GeForce RTX 2060	PCI\VEN_10DE&DEV_1F08	6	-	GeForce RTX 2060	exact	passmark
+NVIDIA GeForce RTX 2060	PCI\VEN_10DE&DEV_1F03	12	-	GeForce RTX 2060 12GB	memory-variant	pattern
+NVIDIA GeForce RTX 2060	PCI\VEN_10DE&DEV_1F15	6	-	GeForce RTX 2060 with Max-Q Design	nvidia-mobile-by-device-id	pattern
+NVIDIA GeForce RTX 2060 SUPER	-	8	-	GeForce RTX 2060 SUPER	exact	passmark
+NVIDIA GeForce RTX 2060 with Max-Q Design	-	6	-	GeForce RTX 2060 with Max-Q Design	exact	passmark
+NVIDIA GeForce RTX 2070	PCI\VEN_10DE&DEV_1F10	8	-	GeForce RTX 2070 with Max-Q Design	nvidia-mobile-by-device-id	pattern
+NVIDIA GeForce RTX 2080 Ti	-	11	-	GeForce RTX 2080 Ti	exact	passmark
+NVIDIA GeForce RTX 2050	-	4	-	GeForce RTX 2050	exact	passmark
+NVIDIA GeForce RTX 3060	-	12	-	GeForce RTX 3060 12GB	memory-variant	passmark
+NVIDIA GeForce RTX 3060	-	8	-	GeForce RTX 3060 8GB	memory-variant	passmark
+NVIDIA GeForce RTX 3060	-	-	-	GeForce RTX 3060	exact	passmark
+NVIDIA GeForce RTX 3060 Laptop GPU	-	6	-	GeForce RTX 3060 Laptop GPU	exact	passmark
+NVIDIA GeForce RTX 3060 Ti	-	8	-	GeForce RTX 3060 Ti	exact	passmark
+NVIDIA GeForce RTX 3070	-	8	-	GeForce RTX 3070	exact	passmark
+NVIDIA GeForce RTX 3070 Laptop GPU	-	8	-	GeForce RTX 3070 Laptop GPU	exact	passmark
+NVIDIA GeForce RTX 3080 Laptop GPU	-	16	-	GeForce RTX 3080 Laptop GPU	exact	passmark
+NVIDIA GeForce RTX 4050 Laptop GPU	-	6	-	GeForce RTX 4050 Laptop GPU	exact	passmark
+NVIDIA GeForce RTX 4060	-	8	-	GeForce RTX 4060	exact	passmark
+NVIDIA GeForce RTX 4060 Laptop GPU	-	8	-	GeForce RTX 4060 Laptop GPU	exact	passmark
+NVIDIA GeForce RTX 4060 Ti	-	16	-	GeForce RTX 4060 Ti 16GB	memory-variant	passmark
+NVIDIA GeForce RTX 4060 Ti	-	8	-	GeForce RTX 4060 Ti	exact	passmark
+NVIDIA GeForce RTX 4070 SUPER	-	12	-	GeForce RTX 4070 SUPER	exact	passmark
+NVIDIA GeForce RTX 4090	-	24	-	GeForce RTX 4090	exact	passmark
+NVIDIA GeForce RTX 5060	-	8	-	GeForce RTX 5060	exact	passmark
+NVIDIA GeForce RTX 5060 Ti	-	16	-	GeForce RTX 5060 Ti 16GB	memory-variant	pattern
+NVIDIA GeForce GT 1030	-	2	-	GeForce GT 1030	exact	passmark
+NVIDIA GeForce MX450	-	2	-	GeForce MX450	exact	passmark
+NVIDIA GeForce MX150	-	2	-	GeForce MX150	exact	passmark
+NVIDIA Quadro RTX 4000	-	8	-	Quadro RTX 4000	exact	passmark
+NVIDIA RTX A2000	-	6	-	RTX A2000	exact	passmark
+NVIDIA RTX A2000 Laptop GPU	-	4	-	RTX A2000 Laptop GPU	exact	passmark
+NVIDIA T600	-	4	-	NVIDIA T600	exact	passmark
+Radeon RX 580 Series	PCI\VEN_1002&DEV_67DF	8	-	Radeon RX 580	exact	pattern
+AMD Radeon RX 580 2048SP	-	8	-	Radeon RX 580 2048SP	exact	passmark
+Radeon RX 570 Series	-	4	-	Radeon RX 470/570	exact	pattern
+Radeon (TM) RX 480 Graphics	-	8	-	Radeon RX 480	exact	pattern
+AMD Radeon R9 390 Series	-	8	-	Radeon R9 390	exact	pattern
+AMD Radeon RX 5500 XT	-	8	-	Radeon RX 5500 XT	exact	passmark
+AMD Radeon RX 5600 XT	-	6	-	Radeon RX 5600 XT	exact	passmark
+AMD Radeon RX 5700 XT	-	8	-	Radeon RX 5700 XT	exact	passmark
+AMD Radeon RX 6500 XT	-	4	-	Radeon RX 6500 XT	exact	passmark
+AMD Radeon RX 6600 XT	-	8	-	Radeon RX 6600 XT	exact	passmark
+AMD Radeon RX 6650 XT	-	8	-	Radeon RX 6650 XT	exact	passmark
+AMD Radeon RX 6700 XT	-	12	-	Radeon RX 6700 XT	exact	passmark
+AMD Radeon RX 6800 XT	-	16	-	Radeon RX 6800 XT	exact	passmark
+AMD Radeon RX 6600M	-	8	-	Radeon RX 6600M	exact	passmark
+AMD Radeon RX 7600	-	8	-	Radeon RX 7600	exact	passmark
+AMD Radeon RX 7800 XT	-	16	-	Radeon RX 7800 XT	exact	passmark
+AMD Radeon RX 9070 XT	-	16	-	Radeon RX 9070 XT	exact	passmark
+AMD Radeon(TM) Graphics	PCI\VEN_1002&DEV_1638	-	AMD Ryzen 5 5600G with Radeon Graphics	Ryzen 5 5600G with Radeon Graphics	amd-igpu-by-cpu	pattern
+AMD Radeon(TM) Graphics	PCI\VEN_1002&DEV_164C	-	AMD Ryzen 5 5500U with Radeon Graphics	Ryzen 5 5500U with Radeon Graphics	amd-igpu-by-cpu	pattern
+AMD Radeon(TM) Graphics	PCI\VEN_1002&DEV_164E	-	AMD Ryzen 7 7800X3D 8-Core Processor	Radeon Ryzen 7 7800X3D 8-Core	amd-igpu-by-cpu	pattern
+AMD Radeon(TM) Graphics	PCI\VEN_1002&DEV_164E	-	AMD Ryzen 5 7600 6-Core Processor	Radeon Ryzen 5 7600 6-Core	amd-igpu-by-cpu	pattern
+AMD Radeon(TM) Graphics	-	-	-	-	amd-igpu-generic-max	pattern
+AMD Radeon(TM) Vega 8 Graphics	-	-	AMD Ryzen 5 3500U with Radeon Vega Mobile Gfx	Radeon Vega 8 Ryzen 5 3500U	amd-igpu-by-cpu	pattern
+AMD Radeon(TM) Vega 8 Graphics	-	-	AMD Ryzen 3 3200G with Radeon Vega Graphics	Radeon Vega 8 Ryzen 3 3200G	amd-igpu-by-cpu	pattern
+AMD Radeon(TM) Vega 8 Graphics	-	-	-	Radeon Vega 8	exact	pattern
+AMD Radeon(TM) RX Vega 11 Graphics	-	-	AMD Ryzen 5 3400G with Radeon Vega Graphics	Radeon RX Vega 11 Ryzen 5 3400G	amd-igpu-by-cpu	pattern
+AMD Radeon(TM) RX Vega 11 Graphics	-	-	AMD Ryzen 5 2400G with Radeon Vega Graphics	RadeonT RX Vega 11	exact	pattern
+AMD Radeon 780M Graphics	PCI\VEN_1002&DEV_15BF	-	AMD Ryzen 7 7840HS w/ Radeon 780M Graphics	Radeon 780M	exact	pattern
+AMD Radeon(TM) 680M	PCI\VEN_1002&DEV_1681	-	AMD Ryzen 7 6800H with Radeon Graphics	RadeonT 680M Ryzen 7 6800H	amd-igpu-by-cpu	pattern
+AMD Radeon 890M Graphics	-	-	AMD Ryzen AI 9 HX 370 w/ Radeon 890M	Radeon 890M	exact	pattern
+AMD Radeon 760M Graphics	-	-	-	Radeon 760M	exact	pattern
+AMD Custom GPU 0405	-	-	-	Custom GPU 0405	exact	pattern
+Intel(R) UHD Graphics 620	-	-	-	Intel UHD Graphics 620	exact	passmark
+Intel(R) UHD Graphics 730	-	-	-	Intel UHD Graphics 730	exact	passmark
+Intel(R) UHD Graphics 770	-	-	-	Intel UHD Graphics 770	exact	passmark
+Intel(R) HD Graphics 620	-	-	-	Intel HD Graphics 620	exact	pattern
+Intel(R) HD Graphics 530	-	-	-	Intel HD 530	exact	pattern
+Intel(R) HD Graphics 4600	-	-	-	Intel HD 4600	exact	pattern
+Intel(R) HD Graphics 4000	-	-	-	Intel HD 4000	exact	pattern
+Intel(R) HD Graphics	-	-	-	Intel HD Family	exact	pattern
+Intel(R) Iris(R) Plus Graphics	-	-	-	Intel Iris Plus	exact	pattern
+Intel(R) Iris(R) Plus Graphics 655	-	-	-	Intel Iris Plus 655	exact	pattern
+Intel(R) Arc(TM) Graphics	-	-	-	Intel Arc	exact	pattern
+Intel(R) Arc(TM) 140V GPU (16GB)	-	-	-	Intel Arc 140V GPU	memory-token-dropped	pattern
+Intel(R) Arc(TM) A770 Graphics	-	16	-	Intel Arc A770	exact	pattern
+Intel(R) Arc(TM) A750 Graphics	-	8	-	Intel Arc A750	exact	pattern
+Intel(R) Arc(TM) A380 Graphics	-	6	-	Intel Arc A380	exact	pattern
+Intel(R) Arc(TM) B580 Graphics	-	12	-	Intel Arc B580	exact	pattern
+Intel(R) Graphics	-	-	-	Intel Graphics	exact	pattern
+Microsoft Basic Display Adapter	-	-	-	IGNORE	-	pattern
+Microsoft Basic Render Driver	-	-	-	IGNORE	-	pattern
+Microsoft Remote Display Adapter	SWD\RemoteDisplayEnum	-	-	IGNORE	-	pattern
+spacedesk Graphics Adapter	ROOT\spacedesk	-	-	IGNORE	-	pattern
+Virtual Desktop Monitor	ROOT\VirtualDesktopMonitor	-	-	IGNORE	-	pattern
+Parsec Virtual Display Adapter	ROOT\Parsec\VDA	-	-	IGNORE	-	pattern
+DisplayLink USB Device	USB\VID_17E9&PID_4301	-	-	IGNORE	-	pattern
+Citrix Indirect Display Adapter	-	-	-	IGNORE	-	pattern
+Meta Virtual Monitor	-	-	-	IGNORE	-	pattern
+Matrox G200eW3 (Nuvoton) WDDM 2.0	PCI\VEN_102B&DEV_0536	-	-	IGNORE	-	pattern
+ASPEED Graphics Family(WDDM)	PCI\VEN_1A03&DEV_2000	-	-	IGNORE	-	pattern
+NVIDIA GeForce RTX 9999	PCI\VEN_10DE&DEV_FFFF	8	-	UNKNOWN	no-entry	pattern

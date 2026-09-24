@@ -27,21 +27,27 @@ internal static partial class Program
                 Console.WriteLine("Catalog convergence regressions passed.");
                 return 0;
             }
-            if (args.Length == 6 && args[0] == "--check-performance-profile")
+            if (args.Length >= 6 && args[0] == "--check-performance-profile")
             {
-                return CheckPerformanceProfile(args[1], args[2], args[3], args[4], args[5]);
+                return CheckPerformanceProfile(args[1], args[2], args[3], args[4], args[5], args[6..]);
             }
-            if (args.Length == 1 && args[0] == "--probe-hardware")
+            if (args.Length is 1 or 3 && args[0] == "--probe-hardware")
             {
-                // 1.2.22 lite mode: the real registry reads and the real processor probe on this PC (read-only).
-                Console.WriteLine("processor: " + CpuRegistry.ReadName());
-                foreach (GpuAdapterInfo gpu in GpuRegistry.Read())
-                    Console.WriteLine($"graphics: {gpu.Name} | {gpu.DeviceId} | {gpu.MemoryBytes:N0} bytes");
-                for (int run = 0; run < 3; run++)
+                // 1.2.22 lite mode: the real registry reads on this PC and the built-in table lookup (read-only, nothing
+                // measured). Optional lines: --probe-hardware <cpuSingleThreadBelow> <gpuScoreBelow> (default 2500 13000).
+                var rules = new PerformanceDetectionRules
                 {
-                    CpuProbeResult result = SingleCoreProbe.Run(CancellationToken.None);
-                    Console.WriteLine($"probe run {run + 1}: score {result.Score:F0}, {result.QuantaPerSecond:F1} quanta/s, interference {result.Interference:P0}, {result.ElapsedMilliseconds} ms");
-                }
+                    CpuSingleThreadBelow = args.Length == 3 ? int.Parse(args[1], System.Globalization.CultureInfo.InvariantCulture) : 2500,
+                    GpuScoreBelow = args.Length == 3 ? int.Parse(args[2], System.Globalization.CultureInfo.InvariantCulture) : 13000
+                };
+                string cpu = CpuRegistry.ReadName();
+                IReadOnlyList<GpuAdapterInfo> gpus = GpuRegistry.Read();
+                Console.WriteLine($"processor: [{cpu}]");
+                foreach (GpuAdapterInfo gpu in gpus)
+                    Console.WriteLine($"graphics {gpu.RegistryKey}: [{gpu.Name}] | MatchingDeviceId [{gpu.DeviceId}] | present {gpu.Present?.ToString() ?? "unknown"} | hardware id [{gpu.HardwareId}] | {gpu.MemoryBytes:N0} bytes");
+                HardwareDecision decision = HardwareVerdict.Decide(cpu, gpus, HardwareDb.Embedded, rules);
+                Console.WriteLine(HardwareVerdict.LogLine(decision, "diagnostic run"));
+                Console.WriteLine("# This computer: " + HardwareVerdict.StatusText(decision, decision.Mode));
                 return 0;
             }
             if (args.Length == 2 && args[0] == "--sourcing-regression")

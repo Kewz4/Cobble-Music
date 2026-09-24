@@ -11,7 +11,6 @@ internal static class PerformanceProfilePolicy
     private const int MaximumModEntries = 200;
     private const int MaximumPackEntries = 500;
     private const int MaximumSettingEntries = 200;
-    private const int MaximumGpuPatterns = 400;
 
     public static void Validate(
         UpdateManifest manifest,
@@ -51,6 +50,10 @@ internal static class PerformanceProfilePolicy
         {
             string normalized = PathSafety.NormalizeRelativePath(lite.DisabledMods[index] ?? "");
             lite.DisabledMods[index] = normalized;
+            if (PathSafety.IsNeverDisabledModPath(normalized))
+            {
+                throw new InvalidDataException($"Signed lite profile names a mod lite may never switch off: {normalized}");
+            }
             if (!PathSafety.IsLiteModPath(normalized)
                 || !files.TryGetValue(normalized, out ManifestFile? managed)
                 || !string.Equals(managed.Path, normalized, StringComparison.Ordinal)
@@ -136,28 +139,14 @@ internal static class PerformanceProfilePolicy
         }
     }
 
+    internal const int MaximumCpuLine = 100_000;
+    internal const int MaximumGpuLine = 1_000_000;
+
     private static void ValidateDetection(PerformanceDetectionRules detection)
     {
-        if (detection.CpuScoreThreshold is < 1 or > 100_000
-            || detection.FullGpuPatterns is null
-            || detection.LiteGpuPatterns is null
-            || detection.FullGpuPatterns.Count + detection.LiteGpuPatterns.Count > MaximumGpuPatterns)
+        if (detection.CpuSingleThreadBelow is < 1 or > MaximumCpuLine || detection.GpuScoreBelow is < 1 or > MaximumGpuLine)
         {
-            throw new InvalidDataException("Signed lite profile has invalid detection rules.");
-        }
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (string pattern in detection.FullGpuPatterns.Concat(detection.LiteGpuPatterns))
-        {
-            if (GpuTierList.Tokenize(pattern ?? "").Count == 0
-                || pattern!.Length > 64
-                || pattern.Any(character => !(char.IsAsciiLetterOrDigit(character) || character is ' ' or '#' or '-')))
-            {
-                throw new InvalidDataException($"Signed lite profile has an invalid graphics card pattern: {pattern}");
-            }
-            if (!seen.Add(string.Join(' ', GpuTierList.Tokenize(pattern))))
-            {
-                throw new InvalidDataException($"Signed lite profile lists a graphics card pattern twice: {pattern}");
-            }
+            throw new InvalidDataException("Signed lite profile has invalid detection lines (cpuSingleThreadBelow 1-100000, gpuScoreBelow 1-1000000).");
         }
     }
 

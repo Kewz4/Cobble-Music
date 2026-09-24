@@ -194,8 +194,14 @@ internal static class PathSafety
         return fileName.Length > ".jar".Length
             && !fileName.Contains('/')
             && fileName.EndsWith(".jar", StringComparison.OrdinalIgnoreCase)
-            && !IsOptionalPlayerMod(normalizedRelativePath);
+            && !IsOptionalPlayerMod(normalizedRelativePath)
+            && !IsNeverDisabledModPath(normalizedRelativePath);
     }
+
+    // Managed mods lite may never switch off, by file name (the mod id is checked too, by LiteModGuard and the
+    // publisher). The Subtle Effects join fix must be on every PC: without it a lite PC cannot join the server.
+    public static bool IsNeverDisabledModPath(string normalizedRelativePath) =>
+        normalizedRelativePath.StartsWith("mods/kewz-subtle-effects-stub", StringComparison.OrdinalIgnoreCase);
 
     public static bool IsOfficialPackProfilePath(string normalizedRelativePath) =>
         normalizedRelativePath.Equals("config/packed_packs/profiles/resourcepacks/Default.profile.json", StringComparison.OrdinalIgnoreCase)

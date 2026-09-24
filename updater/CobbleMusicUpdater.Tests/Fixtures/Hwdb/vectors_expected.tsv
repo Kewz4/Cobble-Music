@@ -1,0 +1,247 @@
+# kind	input	matchingDeviceId	memoryGiB	cpuName	status	key	score	rule	ambiguous	provenance
+cpu	Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz	-	-	-	known	core i7-10750h	2605	exact	false	this-pc
+cpu	12th Gen Intel(R) Core(TM) i5-12400F	-	-	-	known	core i5-12400f	3485	exact	false	task
+cpu	Intel(R) Core(TM) Ultra 7 155H	-	-	-	known	core ultra 7 155h	3404	exact	false	task
+cpu	AMD Ryzen 5 3600 6-Core Processor	-	-	-	known	ryzen 5 3600	2557	exact	false	task
+cpu	AMD Ryzen 7 5800H with Radeon Graphics	-	-	-	known	ryzen 7 5800h	2987	exact	false	task
+cpu	AMD Ryzen 7 2700 Eight-Core Processor	-	-	-	known	ryzen 7 2700	2170	exact	false	task
+cpu	AMD Ryzen 7 5800X 8-Core Processor	-	-	-	known	ryzen 7 5800x	3448	exact	false	task
+cpu	Intel(R) Core(TM) i5-4460  CPU @ 3.20GHz	-	-	-	known	core i5-4460	1902	exact	false	pattern
+cpu	Intel(R) Core(TM) i5-6500 CPU @ 3.20GHz	-	-	-	known	core i5-6500	2088	exact	false	pattern
+cpu	Intel(R) Core(TM) i5-8400 CPU @ 2.80GHz	-	-	-	known	core i5-8400	2364	exact	false	pattern
+cpu	Intel(R) Core(TM) i5-9400F CPU @ 2.90GHz	-	-	-	known	core i5-9400f	2420	exact	false	pattern
+cpu	Intel(R) Core(TM) i5-10400 CPU @ 2.90GHz	-	-	-	known	core i5-10400	2556	exact	false	pattern
+cpu	Intel(R) Core(TM) i5-10400F CPU @ 2.90GHz	-	-	-	known	core i5-10400f	2540	exact	false	pattern
+cpu	13th Gen Intel(R) Core(TM) i5-13400	-	-	-	known	core i5-13400	3584	exact	false	pattern
+cpu	13th Gen Intel(R) Core(TM) i5-13400F	-	-	-	known	core i5-13400f	3628	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-4770 CPU @ 3.40GHz	-	-	-	known	core i7-4770	2170	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-4790K CPU @ 4.00GHz	-	-	-	known	core i7-4790k	2464	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-6700 CPU @ 3.40GHz	-	-	-	known	core i7-6700	2274	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-6700K CPU @ 4.00GHz	-	-	-	known	core i7-6700k	2495	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-8700 CPU @ 3.20GHz	-	-	-	known	core i7-8700	2624	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz	-	-	-	known	core i7-8700k	2713	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-9700K CPU @ 3.60GHz	-	-	-	known	core i7-9700k	2857	exact	false	pattern
+cpu	Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz	-	-	-	known	core i9-9900k	2908	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-10700K CPU @ 3.80GHz	-	-	-	known	core i7-10700k	3035	exact	false	pattern
+cpu	11th Gen Intel(R) Core(TM) i5-11400F @ 2.60GHz	-	-	-	known	core i5-11400f	2979	exact	false	pattern
+cpu	11th Gen Intel(R) Core(TM) i7-1165G7 @ 2.80GHz	-	-	-	known	core i7-1165g7	2715	exact	false	pattern
+cpu	11th Gen Intel(R) Core(TM) i5-1135G7 @ 2.40GHz	-	-	-	known	core i5-1135g7	2594	exact	false	pattern
+cpu	11th Gen Intel(R) Core(TM) i7-11800H @ 2.30GHz	-	-	-	known	core i7-11800h	3005	exact	false	pattern
+cpu	12th Gen Intel(R) Core(TM) i7-12700H	-	-	-	known	core i7-12700h	3480	exact	false	pattern
+cpu	12th Gen Intel(R) Core(TM) i5-12450H	-	-	-	known	core i5-12450h	3269	exact	false	pattern
+cpu	12th Gen Intel(R) Core(TM) i7-12700K	-	-	-	known	core i7-12700k	4003	exact	false	pattern
+cpu	12th Gen Intel(R) Core(TM) i5-1235U	-	-	-	known	core i5-1235u	3046	exact	false	pattern
+cpu	13th Gen Intel(R) Core(TM) i9-13900K	-	-	-	known	core i9-13900k	4595	exact	false	pattern
+cpu	13th Gen Intel(R) Core(TM) i7-13700H	-	-	-	known	core i7-13700h	3550	exact	false	pattern
+cpu	13th Gen Intel(R) Core(TM) i5-13500H	-	-	-	known	core i5-13500h	3371	exact	false	pattern
+cpu	14th Gen Intel(R) Core(TM) i7-14700K	-	-	-	known	core i7-14700k	4454	exact	false	pattern
+cpu	14th Gen Intel(R) Core(TM) i5-14600KF	-	-	-	known	core i5-14600kf	4252	exact	false	pattern
+cpu	Intel(R) Core(TM) Ultra 9 285K	-	-	-	known	core ultra 9 285k	5086	exact	false	pattern
+cpu	Intel(R) Core(TM) Ultra 5 125H	-	-	-	known	core ultra 5 125h	3317	exact	false	pattern
+cpu	Intel(R) Core(TM) Ultra 7 258V	-	-	-	known	core ultra 7 258v	4013	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-8750H CPU @ 2.20GHz	-	-	-	known	core i7-8750h	2262	exact	false	pattern
+cpu	Intel(R) Core(TM) i5-8250U CPU @ 1.60GHz	-	-	-	known	core i5-8250u	1869	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-9750H CPU @ 2.60GHz	-	-	-	known	core i7-9750h	2382	exact	false	pattern
+cpu	Intel(R) Core(TM) i5-10300H CPU @ 2.50GHz	-	-	-	known	core i5-10300h	2520	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-7700HQ CPU @ 2.80GHz	-	-	-	known	core i7-7700hq	2045	exact	false	pattern
+cpu	Intel(R) Core(TM) i3-10100F CPU @ 3.60GHz	-	-	-	known	core i3-10100f	2579	exact	false	pattern
+cpu	Intel(R) Core(TM) i3-N305	-	-	-	known	core i3-n305	2036	exact	false	pattern
+cpu	Intel(R) N100	-	-	-	known	n100	1880	exact	false	pattern
+cpu	Intel(R) Pentium(R) CPU G4560 @ 3.50GHz	-	-	-	known	pentium g4560	2072	exact	false	pattern
+cpu	Intel(R) Pentium(R) Gold G5400 CPU @ 3.70GHz	-	-	-	known	pentium gold g5400	2181	exact	false	pattern
+cpu	Intel(R) Celeron(R) N4020 CPU @ 1.10GHz	-	-	-	known	celeron n4020	1122	exact	false	pattern
+cpu	Intel(R) Celeron(R) N4500 @ 1.10GHz	-	-	-	known	celeron n4500	1252	exact	false	pattern
+cpu	Intel(R) Pentium(R) Silver N5000 CPU @ 1.10GHz	-	-	-	known	pentium silver n5000	1123	exact	false	pattern
+cpu	Intel(R) Core(TM)2 Duo CPU     E8400  @ 3.00GHz	-	-	-	known	core2 duo e8400	1235	exact	false	pattern
+cpu	Intel(R) Core(TM)2 Quad CPU    Q6600  @ 2.40GHz	-	-	-	known	core2 quad q6600	953	exact	false	pattern
+cpu	Intel(R) Core(TM) i5 CPU       750  @ 2.67GHz	-	-	-	known	core i5-750	1223	exact	false	pattern
+cpu	Intel(R) Core(TM) i7 CPU         920  @ 2.67GHz	-	-	-	known	core i7-920	1213	exact	false	pattern
+cpu	Intel(R) Core(TM) i5-2500K CPU @ 3.30GHz	-	-	-	known	core i5-2500k	1698	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-3770 CPU @ 3.40GHz	-	-	-	known	core i7-3770	2070	exact	false	pattern
+cpu	Intel(R) Xeon(R) CPU E5-2680 v2 @ 2.80GHz	-	-	-	known	xeon e5-2680 v2	1781	exact	false	pattern
+cpu	Intel(R) Xeon(R) CPU E5-2670 0 @ 2.60GHz	-	-	-	known	xeon e5-2670	1467	exact	false	pattern
+cpu	Intel(R) Xeon(R) CPU E3-1231 v3 @ 3.40GHz	-	-	-	known	xeon e3-1231 v3	2139	exact	false	pattern
+cpu	Intel(R) Xeon(R) W-2123 CPU @ 3.60GHz	-	-	-	known	xeon w-2123	2175	exact	false	pattern
+cpu	Intel(R) Xeon(R) Gold 6130 CPU @ 2.10GHz	-	-	-	known	xeon gold 6130	2072	exact	false	pattern
+cpu	Intel(R) Core(TM) m3-7Y30 CPU @ 1.00GHz	-	-	-	known	core m3-7y30	1336	exact	false	pattern
+cpu	Intel(R) Atom(TM) x5-Z8350  CPU @ 1.44GHz	-	-	-	known	atom x5-z8350	472	exact	false	pattern
+cpu	Intel(R) Core(TM) 7 150U	-	-	-	known	core 7 150u	3502	exact	false	pattern
+cpu	12th Gen Intel(R) Core(TM) i9-12900HK	-	-	-	known	core i9-12900hk	3514	exact	false	pattern
+cpu	Intel(R) Core(TM) i7-4710HQ CPU @ 2.50GHz	-	-	-	known	core i7-4710hq	1771	exact	false	pattern
+cpu	AMD Ryzen 5 1600 Six-Core Processor	-	-	-	known	ryzen 5 1600	2064	exact	false	pattern
+cpu	AMD Ryzen 5 2600 Six-Core Processor	-	-	-	known	ryzen 5 2600	2233	exact	false	pattern
+cpu	AMD Ryzen 5 5600 6-Core Processor	-	-	-	known	ryzen 5 5600	3253	exact	false	pattern
+cpu	AMD Ryzen 5 5600X 6-Core Processor	-	-	-	known	ryzen 5 5600x	3366	exact	false	pattern
+cpu	AMD Ryzen 5 7600 6-Core Processor	-	-	-	known	ryzen 5 7600	3908	exact	false	pattern
+cpu	AMD Ryzen 5 7600X 6-Core Processor	-	-	-	known	ryzen 5 7600x	4129	exact	false	pattern
+cpu	AMD Ryzen 7 7800X3D 8-Core Processor	-	-	-	known	ryzen 7 7800x3d	3759	exact	false	pattern
+cpu	AMD Ryzen 7 5700X3D 8-Core Processor	-	-	-	known	ryzen 7 5700x3d	2969	exact	false	pattern
+cpu	AMD Ryzen 9 5900X 12-Core Processor	-	-	-	known	ryzen 9 5900x	3465	exact	false	pattern
+cpu	AMD Ryzen 9 7950X 16-Core Processor	-	-	-	known	ryzen 9 7950x	4252	exact	false	pattern
+cpu	AMD Ryzen 7 1700 Eight-Core Processor	-	-	-	known	ryzen 7 1700	1996	exact	false	pattern
+cpu	AMD Ryzen 7 2700X Eight-Core Processor	-	-	-	known	ryzen 7 2700x	2413	exact	false	pattern
+cpu	AMD Ryzen 5 2400G with Radeon Vega Graphics	-	-	-	known	ryzen 5 2400g	2139	exact	false	pattern
+cpu	AMD Ryzen 5 3400G with Radeon Vega Graphics	-	-	-	known	ryzen 5 3400g	2304	exact	false	pattern
+cpu	AMD Ryzen 5 5600G with Radeon Graphics	-	-	-	known	ryzen 5 5600g	3178	exact	false	pattern
+cpu	AMD Ryzen 7 5700G with Radeon Graphics	-	-	-	known	ryzen 7 5700g	3282	exact	false	pattern
+cpu	AMD Ryzen 5 5500U with Radeon Graphics	-	-	-	known	ryzen 5 5500u	2388	exact	false	pattern
+cpu	AMD Ryzen 7 3750H with Radeon Vega Mobile Gfx	-	-	-	known	ryzen 7 3750h	2049	exact	false	pattern
+cpu	AMD Ryzen 7 4800H with Radeon Graphics	-	-	-	known	ryzen 7 4800h	2579	exact	false	pattern
+cpu	AMD Ryzen 7 6800H with Radeon Graphics	-	-	-	known	ryzen 7 6800h	3181	exact	false	pattern
+cpu	AMD Ryzen 7 7840HS w/ Radeon 780M Graphics	-	-	-	known	ryzen 7 7840hs	3701	exact	false	pattern
+cpu	AMD Ryzen 9 7940HS w/ Radeon 780M Graphics	-	-	-	known	ryzen 9 7940hs	3848	exact	false	pattern
+cpu	AMD Ryzen 7 8845HS w/ Radeon 780M Graphics	-	-	-	known	ryzen 7 8845hs	3720	exact	false	pattern
+cpu	AMD Ryzen AI 9 HX 370 w/ Radeon 890M	-	-	-	known	ryzen ai 9 hx 370	3937	exact	false	pattern
+cpu	AMD Ryzen 5 PRO 4650G with Radeon Graphics	-	-	-	known	ryzen 5 pro 4650g	2641	exact	false	pattern
+cpu	AMD Ryzen Threadripper 3970X 32-Core Processor	-	-	-	known	ryzen threadripper 3970x	2658	exact	false	pattern
+cpu	AMD Ryzen Threadripper PRO 5995WX 64-Cores	-	-	-	known	ryzen threadripper pro 5995wx	3217	exact	false	pattern
+cpu	AMD Ryzen 5 3500U with Radeon Vega Mobile Gfx	-	-	-	known	ryzen 5 3500u	1900	exact	false	pattern
+cpu	AMD Athlon Silver 3050U with Radeon Graphics	-	-	-	known	athlon silver 3050u	1686	exact	false	pattern
+cpu	AMD Athlon 3000G with Radeon Vega Graphics	-	-	-	known	athlon 3000g	1948	exact	false	pattern
+cpu	AMD FX(tm)-8350 Eight-Core Processor	-	-	-	known	fx-8350	1580	exact	false	pattern
+cpu	AMD FX(tm)-6300 Six-Core Processor	-	-	-	known	fx-6300	1486	exact	false	pattern
+cpu	AMD A10-7850K Radeon R7, 12 Compute Cores 4C+8G	-	-	-	known	a10-7850k	1492	exact	false	pattern
+cpu	AMD A10-9700 RADEON R7, 10 COMPUTE CORES 4C+6G	-	-	-	known	a10-9700	1619	exact	false	pattern
+cpu	AMD Phenom(tm) II X4 965 Processor	-	-	-	known	phenom ii x4 965	1371	exact	false	pattern
+cpu	AMD Ryzen 5 7535HS with Radeon Graphics	-	-	-	known	ryzen 5 7535hs	3095	exact	false	pattern
+cpu	AMD Ryzen 7 7735HS with Radeon Graphics	-	-	-	known	ryzen 7 7735hs	3238	exact	false	pattern
+cpu	AMD Ryzen 7 5700X 8-Core Processor	-	-	-	known	ryzen 7 5700x	3386	exact	false	pattern
+cpu	AMD Ryzen 5 5500	-	-	-	known	ryzen 5 5500	3062	exact	false	pattern
+cpu	AMD Ryzen 9 9950X 16-Core Processor	-	-	-	known	ryzen 9 9950x	4728	exact	false	pattern
+cpu	AMD Ryzen 7 9800X3D 8-Core Processor	-	-	-	known	ryzen 7 9800x3d	4421	exact	false	pattern
+cpu	AMD Ryzen Z1 Extreme	-	-	-	known	ryzen z1 extreme	3524	exact	false	pattern
+cpu	AMD Ryzen 5 5600H with Radeon Graphics	-	-	-	known	ryzen 5 5600h	2869	exact	false	pattern
+cpu	AMD Ryzen 5 4600H with Radeon Graphics	-	-	-	known	ryzen 5 4600h	2411	exact	false	pattern
+cpu	AMD Ryzen 5 PRO 7535U with Radeon Graphics	-	-	-	known	ryzen 5 pro 7535u	2948	exact	false	pattern
+cpu	Snapdragon(R) X Elite - X1E78100 - Qualcomm(R) Oryon(TM) CPU	-	-	-	known	snapdragon x elite - x1e78100	3038	exact	false	pattern
+cpu	Genuine Intel(R) CPU 0000 @ 2.40GHz	-	-	-	unknown	genuine 0000	-	no-entry	false	pattern
+cpu	QEMU Virtual CPU version 2.5+	-	-	-	unknown	qemu virtual version 2.5+	-	no-entry	false	pattern
+cpu	AMD Custom APU 0405	-	-	-	unknown	custom 0405	-	no-entry	false	pattern
+gpu	NVIDIA GeForce RTX 2070 Super	pci\ven_10de&dev_1e91&subsys_12b41462	8	Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz	known	geforce rtx 2070 super max-q	13206	nvidia-mobile-by-device-id	true	this-pc
+gpu	Intel(R) UHD Graphics	PCI\VEN_8086&DEV_9BC4&SUBSYS_12B41462	-	Intel(R) Core(TM) i7-10750H CPU @ 2.60GHz	known	uhd	1539	exact	false	this-pc
+gpu	NVIDIA GeForce RTX 3050	PCI\VEN_10DE&DEV_2507	8	AMD Ryzen 7 2700 Eight-Core Processor	known	geforce rtx 3050 8gb	12459	memory-variant	false	task
+gpu	NVIDIA GeForce RTX 3050	PCI\VEN_10DE&DEV_2584	6	-	known	geforce rtx 3050 6gb	10740	memory-variant	false	task
+gpu	NVIDIA GeForce RTX 3050	-	-	-	known	geforce rtx 3050 6gb	10740	memory-variant-lower	true	task
+gpu	NVIDIA GeForce RTX 3050 Laptop GPU	PCI\VEN_10DE&DEV_25A2	4	-	known	geforce rtx 3050 laptop	11966	exact	false	task
+gpu	NVIDIA GeForce RTX 2070 Super with Max-Q Design	-	8	-	known	geforce rtx 2070 super max-q	13206	exact	false	task
+gpu	AMD Radeon RX 6600	PCI\VEN_1002&DEV_73FF	8	-	known	radeon rx 6600	15047	exact	false	task
+gpu	AMD Radeon(TM) Graphics	PCI\VEN_1002&DEV_1638	-	AMD Ryzen 7 5800H with Radeon Graphics	known	radeon@ryzen 7 5800h	2736	amd-igpu-by-cpu	false	task
+gpu	Intel(R) UHD Graphics 630	PCI\VEN_8086&DEV_3E92	-	-	known	uhd 630	735	exact	false	task
+gpu	Intel(R) Iris(R) Xe Graphics	PCI\VEN_8086&DEV_9A49	-	-	known	iris xe	2588	exact	false	task
+gpu	NVIDIA GeForce RTX 3080	PCI\VEN_10DE&DEV_2206	10	AMD Ryzen 7 5800X 8-Core Processor	known	geforce rtx 3080	24978	exact	false	task
+gpu	NVIDIA GeForce RTX 3080	PCI\VEN_10DE&DEV_220A	12	-	known	geforce rtx 3080 12gb	26559	memory-variant	false	passmark
+gpu	NVIDIA GeForce RTX 2070 SUPER	PCI\VEN_10DE&DEV_1E84	8	-	known	geforce rtx 2070 super	18124	exact	false	passmark
+gpu	NVIDIA GeForce RTX 3050 6GB Laptop GPU	-	6	-	known	geforce rtx 3050 6gb laptop	10126	exact	false	passmark
+gpu	NVIDIA GeForce RTX 3050 Ti Laptop GPU	-	4	-	known	geforce rtx 3050 ti laptop	10065	exact	false	passmark
+gpu	NVIDIA GeForce RTX 3050 OEM	-	8	-	known	geforce rtx 3050 oem	11866	exact	false	passmark
+gpu	NVIDIA GeForce RTX 3050 A Laptop GPU	-	4	-	known	geforce rtx 3050 a laptop	10814	exact	false	passmark
+gpu	NVIDIA GeForce GTX 960	-	2	-	known	geforce gtx 960	6149	exact	false	passmark
+gpu	NVIDIA GeForce GTX 970	-	4	-	known	geforce gtx 970	9634	exact	false	passmark
+gpu	NVIDIA GeForce GTX 750 Ti	-	2	-	known	geforce gtx 750 ti	3900	exact	false	passmark
+gpu	NVIDIA GeForce GTX 1050 Ti	-	4	-	known	geforce gtx 1050 ti	6366	exact	false	passmark
+gpu	NVIDIA GeForce GTX 1060 6GB	PCI\VEN_10DE&DEV_1C03	6	-	known	geforce gtx 1060	10021	memory-token-dropped	false	pattern
+gpu	NVIDIA GeForce GTX 1060 3GB	PCI\VEN_10DE&DEV_1C02	3	-	known	geforce gtx 1060 3gb	9855	exact	false	passmark
+gpu	NVIDIA GeForce GTX 1060	PCI\VEN_10DE&DEV_1C20	6	-	known	geforce gtx 1060 max-q	7818	nvidia-mobile-by-device-id	true	pattern
+gpu	NVIDIA GeForce GTX 1060 with Max-Q Design	-	6	-	known	geforce gtx 1060 max-q	7818	exact	false	passmark
+gpu	NVIDIA GeForce GTX 1070	-	8	-	known	geforce gtx 1070	13510	exact	false	passmark
+gpu	NVIDIA GeForce GTX 1080 Ti	-	11	-	known	geforce gtx 1080 ti	18599	exact	false	passmark
+gpu	NVIDIA GeForce GTX 1650	PCI\VEN_10DE&DEV_1F82	4	-	known	geforce gtx 1650	7867	exact	false	passmark
+gpu	NVIDIA GeForce GTX 1650	PCI\VEN_10DE&DEV_1F91	4	-	known	geforce gtx 1650 max-q	6379	nvidia-mobile-by-device-id	true	pattern
+gpu	NVIDIA GeForce GTX 1650 SUPER	-	4	-	known	geforce gtx 1650 super	10193	exact	false	passmark
+gpu	NVIDIA GeForce GTX 1660	-	6	-	known	geforce gtx 1660	11608	exact	false	passmark
+gpu	NVIDIA GeForce GTX 1660 SUPER	-	6	-	known	geforce gtx 1660 super	12659	exact	false	passmark
+gpu	NVIDIA GeForce GTX 1660 Ti	-	6	-	known	geforce gtx 1660 ti	12566	exact	false	passmark
+gpu	NVIDIA GeForce GTX 1660 Ti with Max-Q Design	-	6	-	known	geforce gtx 1660 ti max-q	8589	exact	false	passmark
+gpu	NVIDIA GeForce RTX 2060	PCI\VEN_10DE&DEV_1F08	6	-	known	geforce rtx 2060	14073	exact	false	passmark
+gpu	NVIDIA GeForce RTX 2060	PCI\VEN_10DE&DEV_1F03	12	-	known	geforce rtx 2060 12gb	15915	memory-variant	false	pattern
+gpu	NVIDIA GeForce RTX 2060	PCI\VEN_10DE&DEV_1F15	6	-	known	geforce rtx 2060 max-q	9586	nvidia-mobile-by-device-id	true	pattern
+gpu	NVIDIA GeForce RTX 2060 SUPER	-	8	-	known	geforce rtx 2060 super	16455	exact	false	passmark
+gpu	NVIDIA GeForce RTX 2060 with Max-Q Design	-	6	-	known	geforce rtx 2060 max-q	9586	exact	false	passmark
+gpu	NVIDIA GeForce RTX 2070	PCI\VEN_10DE&DEV_1F10	8	-	known	geforce rtx 2070 max-q	11390	nvidia-mobile-by-device-id	true	pattern
+gpu	NVIDIA GeForce RTX 2080 Ti	-	11	-	known	geforce rtx 2080 ti	21414	exact	false	passmark
+gpu	NVIDIA GeForce RTX 2050	-	4	-	known	geforce rtx 2050	7729	exact	false	passmark
+gpu	NVIDIA GeForce RTX 3060	-	12	-	known	geforce rtx 3060 12gb	16705	memory-variant	false	passmark
+gpu	NVIDIA GeForce RTX 3060	-	8	-	known	geforce rtx 3060 8gb	15201	memory-variant	false	passmark
+gpu	NVIDIA GeForce RTX 3060	-	-	-	known	geforce rtx 3060	16881	exact	false	passmark
+gpu	NVIDIA GeForce RTX 3060 Laptop GPU	-	6	-	known	geforce rtx 3060 laptop	13099	exact	false	passmark
+gpu	NVIDIA GeForce RTX 3060 Ti	-	8	-	known	geforce rtx 3060 ti	20216	exact	false	passmark
+gpu	NVIDIA GeForce RTX 3070	-	8	-	known	geforce rtx 3070	22071	exact	false	passmark
+gpu	NVIDIA GeForce RTX 3070 Laptop GPU	-	8	-	known	geforce rtx 3070 laptop	15005	exact	false	passmark
+gpu	NVIDIA GeForce RTX 3080 Laptop GPU	-	16	-	known	geforce rtx 3080 laptop	16034	exact	false	passmark
+gpu	NVIDIA GeForce RTX 4050 Laptop GPU	-	6	-	known	geforce rtx 4050 laptop	14207	exact	false	passmark
+gpu	NVIDIA GeForce RTX 4060	-	8	-	known	geforce rtx 4060	19486	exact	false	passmark
+gpu	NVIDIA GeForce RTX 4060 Laptop GPU	-	8	-	known	geforce rtx 4060 laptop	17334	exact	false	passmark
+gpu	NVIDIA GeForce RTX 4060 Ti	-	16	-	known	geforce rtx 4060 ti 16gb	22552	memory-variant	false	passmark
+gpu	NVIDIA GeForce RTX 4060 Ti	-	8	-	known	geforce rtx 4060 ti	22596	exact	false	passmark
+gpu	NVIDIA GeForce RTX 4070 SUPER	-	12	-	known	geforce rtx 4070 super	29939	exact	false	passmark
+gpu	NVIDIA GeForce RTX 4090	-	24	-	known	geforce rtx 4090	38035	exact	false	passmark
+gpu	NVIDIA GeForce RTX 5060	-	8	-	known	geforce rtx 5060	20626	exact	false	passmark
+gpu	NVIDIA GeForce RTX 5060 Ti	-	16	-	known	geforce rtx 5060 ti 16gb	22611	memory-variant	false	pattern
+gpu	NVIDIA GeForce GT 1030	-	2	-	known	geforce gt 1030	2396	exact	false	passmark
+gpu	NVIDIA GeForce MX450	-	2	-	known	geforce mx450	3711	exact	false	passmark
+gpu	NVIDIA GeForce MX150	-	2	-	known	geforce mx150	2246	exact	false	passmark
+gpu	NVIDIA Quadro RTX 4000	-	8	-	known	quadro rtx 4000	14835	exact	false	passmark
+gpu	NVIDIA RTX A2000	-	6	-	known	rtx a2000	13402	exact	false	passmark
+gpu	NVIDIA RTX A2000 Laptop GPU	-	4	-	known	rtx a2000 laptop	9406	exact	false	passmark
+gpu	NVIDIA T600	-	4	-	known	t600	6375	exact	false	passmark
+gpu	Radeon RX 580 Series	PCI\VEN_1002&DEV_67DF	8	-	known	radeon rx 580	8782	exact	false	pattern
+gpu	AMD Radeon RX 580 2048SP	-	8	-	known	radeon rx 580 2048sp	7609	exact	false	passmark
+gpu	Radeon RX 570 Series	-	4	-	known	radeon rx 570	7908	exact	false	pattern
+gpu	Radeon (TM) RX 480 Graphics	-	8	-	known	radeon rx 480	8525	exact	false	pattern
+gpu	AMD Radeon R9 390 Series	-	8	-	known	radeon r9 390	8751	exact	false	pattern
+gpu	AMD Radeon RX 5500 XT	-	8	-	known	radeon rx 5500 xt	9048	exact	false	passmark
+gpu	AMD Radeon RX 5600 XT	-	6	-	known	radeon rx 5600 xt	13382	exact	false	passmark
+gpu	AMD Radeon RX 5700 XT	-	8	-	known	radeon rx 5700 xt	16033	exact	false	passmark
+gpu	AMD Radeon RX 6500 XT	-	4	-	known	radeon rx 6500 xt	9616	exact	false	passmark
+gpu	AMD Radeon RX 6600 XT	-	8	-	known	radeon rx 6600 xt	16438	exact	false	passmark
+gpu	AMD Radeon RX 6650 XT	-	8	-	known	radeon rx 6650 xt	17093	exact	false	passmark
+gpu	AMD Radeon RX 6700 XT	-	12	-	known	radeon rx 6700 xt	19718	exact	false	passmark
+gpu	AMD Radeon RX 6800 XT	-	16	-	known	radeon rx 6800 xt	25100	exact	false	passmark
+gpu	AMD Radeon RX 6600M	-	8	-	known	radeon rx 6600m	13764	exact	false	passmark
+gpu	AMD Radeon RX 7600	-	8	-	known	radeon rx 7600	16446	exact	false	passmark
+gpu	AMD Radeon RX 7800 XT	-	16	-	known	radeon rx 7800 xt	24470	exact	false	passmark
+gpu	AMD Radeon RX 9070 XT	-	16	-	known	radeon rx 9070 xt	26906	exact	false	passmark
+gpu	AMD Radeon(TM) Graphics	PCI\VEN_1002&DEV_1638	-	AMD Ryzen 5 5600G with Radeon Graphics	known	radeon@ryzen 5 5600g	2531	amd-igpu-by-cpu	false	pattern
+gpu	AMD Radeon(TM) Graphics	PCI\VEN_1002&DEV_164C	-	AMD Ryzen 5 5500U with Radeon Graphics	known	radeon@ryzen 5 5500u	1970	amd-igpu-by-cpu	false	pattern
+gpu	AMD Radeon(TM) Graphics	PCI\VEN_1002&DEV_164E	-	AMD Ryzen 7 7800X3D 8-Core Processor	known	radeon@ryzen 7 7800x3d	1786	amd-igpu-by-cpu	false	pattern
+gpu	AMD Radeon(TM) Graphics	PCI\VEN_1002&DEV_164E	-	AMD Ryzen 5 7600 6-Core Processor	known	radeon@ryzen 5 7600	1663	amd-igpu-by-cpu	false	pattern
+gpu	AMD Radeon(TM) Graphics	-	-	-	known	radeon	7823	amd-igpu-generic-max	true	pattern
+gpu	AMD Radeon(TM) Vega 8 Graphics	-	-	AMD Ryzen 5 3500U with Radeon Vega Mobile Gfx	known	radeon vega 8@ryzen 5 3500u	1350	amd-igpu-by-cpu	false	pattern
+gpu	AMD Radeon(TM) Vega 8 Graphics	-	-	AMD Ryzen 3 3200G with Radeon Vega Graphics	known	radeon vega 8@ryzen 3 3200g	1689	amd-igpu-by-cpu	false	pattern
+gpu	AMD Radeon(TM) Vega 8 Graphics	-	-	-	known	radeon vega 8	1561	exact	false	pattern
+gpu	AMD Radeon(TM) RX Vega 11 Graphics	-	-	AMD Ryzen 5 3400G with Radeon Vega Graphics	known	radeon rx vega 11@ryzen 5 3400g	2096	amd-igpu-by-cpu	false	pattern
+gpu	AMD Radeon(TM) RX Vega 11 Graphics	-	-	AMD Ryzen 5 2400G with Radeon Vega Graphics	known	radeon rx vega 11	1915	exact	false	pattern
+gpu	AMD Radeon 780M Graphics	PCI\VEN_1002&DEV_15BF	-	AMD Ryzen 7 7840HS w/ Radeon 780M Graphics	known	radeon 780m	6745	exact	false	pattern
+gpu	AMD Radeon(TM) 680M	PCI\VEN_1002&DEV_1681	-	AMD Ryzen 7 6800H with Radeon Graphics	known	radeon 680m@ryzen 7 6800h	2663	amd-igpu-by-cpu	false	pattern
+gpu	AMD Radeon 890M Graphics	-	-	AMD Ryzen AI 9 HX 370 w/ Radeon 890M	known	radeon 890m	8072	exact	false	pattern
+gpu	AMD Radeon 760M Graphics	-	-	-	known	radeon 760m	5302	exact	false	pattern
+gpu	AMD Custom GPU 0405	-	-	-	known	custom 0405	2948	exact	false	pattern
+gpu	Intel(R) UHD Graphics 620	-	-	-	known	uhd 620	1038	exact	false	passmark
+gpu	Intel(R) UHD Graphics 730	-	-	-	known	uhd 730	1543	exact	false	passmark
+gpu	Intel(R) UHD Graphics 770	-	-	-	known	uhd 770	1346	exact	false	passmark
+gpu	Intel(R) HD Graphics 620	-	-	-	known	hd 620	917	exact	false	pattern
+gpu	Intel(R) HD Graphics 530	-	-	-	known	hd 530	985	exact	false	pattern
+gpu	Intel(R) HD Graphics 4600	-	-	-	known	hd 4600	631	exact	false	pattern
+gpu	Intel(R) HD Graphics 4000	-	-	-	known	hd 4000	340	exact	false	pattern
+gpu	Intel(R) HD Graphics	-	-	-	known	hd	466	exact	false	pattern
+gpu	Intel(R) Iris(R) Plus Graphics	-	-	-	known	iris plus	1773	exact	false	pattern
+gpu	Intel(R) Iris(R) Plus Graphics 655	-	-	-	known	iris plus 655	1722	exact	false	pattern
+gpu	Intel(R) Arc(TM) Graphics	-	-	-	known	arc	5478	exact	false	pattern
+gpu	Intel(R) Arc(TM) 140V GPU (16GB)	-	-	-	known	arc 140v	5141	memory-token-dropped	false	pattern
+gpu	Intel(R) Arc(TM) A770 Graphics	-	16	-	known	arc a770	13360	exact	false	pattern
+gpu	Intel(R) Arc(TM) A750 Graphics	-	8	-	known	arc a750	12652	exact	false	pattern
+gpu	Intel(R) Arc(TM) A380 Graphics	-	6	-	known	arc a380	6321	exact	false	pattern
+gpu	Intel(R) Arc(TM) B580 Graphics	-	12	-	known	arc b580	16080	exact	false	pattern
+gpu	Intel(R) Graphics	-	-	-	known	intel graphics	3260	exact	false	pattern
+gpu	Microsoft Basic Display Adapter	-	-	-	ignore	-	-	virtual-or-non-gpu-vendor	false	pattern
+gpu	Microsoft Basic Render Driver	-	-	-	ignore	-	-	virtual-or-non-gpu-vendor	false	pattern
+gpu	Microsoft Remote Display Adapter	SWD\RemoteDisplayEnum	-	-	ignore	-	-	virtual-or-non-gpu-vendor	false	pattern
+gpu	spacedesk Graphics Adapter	ROOT\spacedesk	-	-	ignore	-	-	virtual-or-non-gpu-vendor	false	pattern
+gpu	Virtual Desktop Monitor	ROOT\VirtualDesktopMonitor	-	-	ignore	-	-	virtual-or-non-gpu-vendor	false	pattern
+gpu	Parsec Virtual Display Adapter	ROOT\Parsec\VDA	-	-	ignore	-	-	virtual-or-non-gpu-vendor	false	pattern
+gpu	DisplayLink USB Device	USB\VID_17E9&PID_4301	-	-	ignore	-	-	virtual-or-non-gpu-vendor	false	pattern
+gpu	Citrix Indirect Display Adapter	-	-	-	ignore	-	-	virtual-or-non-gpu-vendor	false	pattern
+gpu	Meta Virtual Monitor	-	-	-	ignore	-	-	virtual-or-non-gpu-vendor	false	pattern
+gpu	Matrox G200eW3 (Nuvoton) WDDM 2.0	PCI\VEN_102B&DEV_0536	-	-	ignore	-	-	virtual-or-non-gpu-vendor	false	pattern
+gpu	ASPEED Graphics Family(WDDM)	PCI\VEN_1A03&DEV_2000	-	-	ignore	-	-	virtual-or-non-gpu-vendor	false	pattern
+gpu	NVIDIA GeForce RTX 9999	PCI\VEN_10DE&DEV_FFFF	8	-	unknown	geforce rtx 9999	-	no-entry	false	pattern

@@ -26,3 +26,4 @@ NuGet.Config text eol=lf
 *.png binary
 *.wav binary
 *.zip binary
+*.tsv text eol=lf

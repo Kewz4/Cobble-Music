@@ -96,6 +96,12 @@ internal static class PerformanceLedgerStore
             entry.Path = path;
             result.Settings.Add(entry);
         }
+        if (ledger.ModCheck is { Length: 67 or 72 } check
+            && (check.StartsWith("ok:", StringComparison.Ordinal) || check.StartsWith("refused:", StringComparison.Ordinal))
+            && IsHash(check[(check.IndexOf(':') + 1)..]))
+        {
+            result.ModCheck = check;
+        }
         return result;
     }
 
@@ -182,144 +188,101 @@ internal sealed partial class UpdateEngine
         };
     }
 
-    private async Task<(PerformanceMode Mode, string Status)> DecideAutomaticallyAsync(PerformanceDetectionRules rules,
+    // Table lookup, no measurement (round 2). Re-decided automatically only when the hardware fingerprint (processor
+    // name + real graphics cards), the built-in table's version or the signed lines change; otherwise the stored pick
+    // is kept. A launch where the hardware could not be read keeps the stored pick and saves nothing.
+    private Task<(PerformanceMode Mode, string Status)> DecideAutomaticallyAsync(PerformanceDetectionRules rules,
         bool checkOnly, CancellationToken token)
     {
-        string storePath = MachinePerformanceStore.PathFor(_paths);
-        MachinePerformanceRecord? record = MachinePerformanceStore.Load(storePath);
+        token.ThrowIfCancellationRequested();
+        var readErrors = new List<string>();
         string cpuName;
-        try { cpuName = _performanceEnvironment.ReadCpuName(); }
+        try { cpuName = _performanceEnvironment.ReadCpuName() ?? ""; }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
-            cpuName = "unknown processor";
-            _log($"The processor name could not be read ({exception.GetType().Name}).");
+            cpuName = "";
+            readErrors.Add($"processor name ({exception.GetType().Name}: {exception.Message})");
         }
         IReadOnlyList<GpuAdapterInfo> gpus;
-        string gpuError = "";
-        try { gpus = _performanceEnvironment.ReadGpus(); }
+        try { gpus = _performanceEnvironment.ReadGpus() ?? []; }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
             gpus = [];
-            gpuError = $"{exception.GetType().Name}: {exception.Message}";
+            readErrors.Add($"graphics cards ({exception.GetType().Name}: {exception.Message})");
+        }
+        HardwareDb db;
+        try { db = _performanceEnvironment.Database(); }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _log($"Performance check: the built-in hardware list could not be loaded ({exception.GetType().Name}: {exception.Message}); result FULL.");
+            return Task.FromResult((PerformanceMode.Full, "the built-in hardware list could not be read. Picked: full."));
         }
 
-        bool sameProcessor = record is not null && string.Equals(record.CpuName, cpuName, StringComparison.Ordinal);
-        bool needProbe = !checkOnly && (!sameProcessor
-            || (record!.CpuScore is null && record.CpuAttempts < _performanceEnvironment.MaximumCpuAttempts));
-        if (needProbe)
+        HardwareDecision decision = HardwareVerdict.Decide(cpuName, gpus, db, rules);
+        string storePath = MachinePerformanceStore.PathFor(_paths);
+        MachinePerformanceRecord? stored = MachinePerformanceStore.Load(storePath);
+        bool sameInputs = stored is not null
+            && string.Equals(stored.Fingerprint, decision.Fingerprint, StringComparison.Ordinal)
+            && string.Equals(stored.DatabaseVersion, decision.DatabaseVersion, StringComparison.Ordinal)
+            && stored.CpuSingleThreadBelow == rules.CpuSingleThreadBelow
+            && stored.GpuScoreBelow == rules.GpuScoreBelow;
+        PerformanceMode mode;
+        string decided;
+        if (sameInputs)
         {
-            Report(UpdatePhase.Validating, "Checking this computer’s speed (only once)…");
-            (double? score, double? qps, double? interference, double? busyScore, string error) = await RunCpuProbeAsync(token);
-            record = new MachinePerformanceRecord
-            {
-                MeasuredAtUtc = DateTimeOffset.UtcNow,
-                UpdaterVersion = BuildInfo.Version,
-                CpuName = cpuName,
-                CpuScore = score,
-                CpuQuantaPerSecond = qps,
-                CpuInterference = interference,
-                CpuBusyScore = busyScore,
-                CpuError = error,
-                CpuAttempts = (sameProcessor ? record!.CpuAttempts : 0) + 1,
-                Gpus = gpus.ToList(),
-                GpuError = gpuError
-            };
-            MachinePerformanceStore.Save(storePath, record, _log);
+            mode = stored!.Verdict == "lite" ? PerformanceMode.Lite : PerformanceMode.Full;
+            decided = "kept from " + MachinePerformanceStore.FormatDate(stored.DecidedAtUtc) + " (same hardware, table and lines)";
+            if (mode != decision.Mode) decided += $"; note: a fresh lookup reads {decision.Mode.ToString().ToUpperInvariant()}";
         }
-        else if (!sameProcessor)
+        else if (readErrors.Count > 0 && stored is not null)
         {
-            record = null; // check-only run on an unmeasured PC: no processor vote.
+            mode = stored.Verdict == "lite" ? PerformanceMode.Lite : PerformanceMode.Full;
+            decided = $"could not read the {string.Join(" and the ", readErrors)}, so the pick from {MachinePerformanceStore.FormatDate(stored.DecidedAtUtc)} ({mode.ToString().ToUpperInvariant()}) is kept";
         }
-        else if (record!.Gpus.Count != gpus.Count || !record.Gpus.Select(g => g.Name).SequenceEqual(gpus.Select(g => g.Name)))
+        else
         {
-            if (!checkOnly && gpuError.Length == 0)
+            mode = decision.Mode;
+            string why = stored is null ? "first decision on this computer"
+                : !string.Equals(stored.Fingerprint, decision.Fingerprint, StringComparison.Ordinal) ? "the hardware changed"
+                : !string.Equals(stored.DatabaseVersion, decision.DatabaseVersion, StringComparison.Ordinal) ? "the built-in table changed"
+                : "the lines in this release changed";
+            decided = "decided now (" + why + ")";
+            if (readErrors.Count > 0) decided += $"; could not read the {string.Join(" and the ", readErrors)}, so nothing is saved and it is decided again next launch";
+            else if (!checkOnly)
             {
-                record.Gpus = gpus.ToList();
-                record.GpuError = "";
-                MachinePerformanceStore.Save(storePath, record, _log);
+                MachinePerformanceStore.Save(storePath, ToRecord(decision), _log);
             }
         }
-
-        double? cpuScore = record?.CpuScore;
-        bool cpuLite = cpuScore is not null && cpuScore.Value < rules.CpuScoreThreshold;
-        GpuTier gpuTier = GpuTierList.ClassifyMachine(gpus, rules);
-        bool gpuLite = gpuTier == GpuTier.Lite;
-        PerformanceMode mode = cpuLite || gpuLite ? PerformanceMode.Lite : PerformanceMode.Full;
-
-        string cpuText = cpuScore is null
-            ? $"processor \"{cpuName}\" not measured ({(record?.CpuError is { Length: > 0 } e ? e : "no result")})"
-            : $"processor \"{cpuName}\" score {cpuScore.Value.ToString("0", CultureInfo.InvariantCulture)} (lite below {rules.CpuScoreThreshold})";
-        string gpuText = gpus.Count == 0
-            ? $"graphics card not read ({(gpuError.Length > 0 ? gpuError : "no adapter found")})"
-            : "graphics " + string.Join(", ", gpus.Select(g => $"\"{g.Name}\" ({TierWords(GpuTierList.Classify(g.Name, rules))})"));
-        string because = mode == PerformanceMode.Full
-            ? (cpuScore is null && gpuTier != GpuTier.Lite ? "no lite reason could be measured" : "neither is below the lite line")
-            : cpuLite && gpuLite ? "processor and graphics card" : cpuLite ? "processor" : "graphics card";
-        string measuredAt = record is null ? "not measured yet" : "measured " + record.MeasuredAtUtc.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-        _log($"Performance check: {cpuText}; {gpuText}; result {mode.ToString().ToUpperInvariant()} ({because}); {measuredAt}. Override: cobble-music-updater/{PerformanceModeFile.FileName}");
-
-        string cpuStatus = cpuScore is null
-            ? "processor not measured"
-            : $"processor score {cpuScore.Value.ToString("0", CultureInfo.InvariantCulture)} (lite below {rules.CpuScoreThreshold})";
-        string gpuStatus = gpus.Count == 0
-            ? "graphics card not read"
-            : "graphics card " + string.Join(" + ", gpus.Select(g => $"{g.Name} ({TierWords(GpuTierList.Classify(g.Name, rules))})"));
-        return (mode, $"{cpuStatus}, {gpuStatus}. Picked: {mode.ToString().ToLowerInvariant()}.");
+        _log(HardwareVerdict.LogLine(decision, decided));
+        return Task.FromResult((mode, HardwareVerdict.StatusText(decision, mode)));
     }
 
-    private static string TierWords(GpuTier tier) => tier switch
+    private static MachinePerformanceRecord ToRecord(HardwareDecision decision) => new()
     {
-        GpuTier.Full => "full list",
-        GpuTier.Lite => "lite list",
-        _ => "not on either list"
+        DecidedAtUtc = DateTimeOffset.UtcNow,
+        UpdaterVersion = BuildInfo.Version,
+        Fingerprint = decision.Fingerprint,
+        DatabaseVersion = decision.DatabaseVersion,
+        CpuSingleThreadBelow = decision.Rules.CpuSingleThreadBelow,
+        GpuScoreBelow = decision.Rules.GpuScoreBelow,
+        Verdict = decision.Mode == PerformanceMode.Lite ? "lite" : "full",
+        Reason = decision.Reason,
+        CpuName = decision.CpuName,
+        CpuKey = decision.Cpu.Key ?? "",
+        CpuScore = decision.Cpu.Score,
+        Gpus = decision.Adapters.Select(item => new GpuAdapterInfo
+        {
+            Name = item.Adapter.Name,
+            DeviceId = item.Adapter.DeviceId,
+            HardwareId = item.Adapter.HardwareId,
+            MemoryBytes = item.Adapter.MemoryBytes,
+            RegistryKey = item.Adapter.RegistryKey,
+            Present = item.Adapter.Present,
+            TableKey = item.Match.Key ?? "",
+            Score = item.Match.Score,
+            Note = item.Real ? item.Match.Rule : "not counted: " + item.NotRealReason
+        }).ToList()
     };
-
-    private async Task<(double? Score, double? QuantaPerSecond, double? Interference, double? BusyScore, string Error)> RunCpuProbeAsync(
-        CancellationToken token)
-    {
-        using var probeCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-        Task<CpuProbeResult> probe = Task.Factory.StartNew(
-            () => _performanceEnvironment.MeasureCpu(probeCancellation.Token),
-            probeCancellation.Token,
-            TaskCreationOptions.LongRunning,
-            TaskScheduler.Default);
-        _ = probe.ContinueWith(task => _ = task.Exception, CancellationToken.None,
-            TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
-        using var delayCancellation = CancellationTokenSource.CreateLinkedTokenSource(token);
-        Task finished = await Task.WhenAny(probe, Task.Delay(_performanceEnvironment.ProbeTimeout, delayCancellation.Token));
-        delayCancellation.Cancel();
-        token.ThrowIfCancellationRequested();
-        if (finished != probe)
-        {
-            probeCancellation.Cancel();
-            string timeout = $"the processor check timed out after {_performanceEnvironment.ProbeTimeout.TotalSeconds:0.#} s";
-            _log($"Performance check: {timeout}; it does not count toward lite.");
-            return (null, null, null, null, timeout);
-        }
-        if (probe.IsFaulted || probe.IsCanceled)
-        {
-            string failure = probe.IsCanceled ? "the processor check was cancelled"
-                : $"the processor check failed ({probe.Exception!.InnerException?.GetType().Name}: {probe.Exception.InnerException?.Message})";
-            _log($"Performance check: {failure}; it does not count toward lite.");
-            return (null, null, null, null, failure);
-        }
-        CpuProbeResult result = probe.Result;
-        if (!double.IsFinite(result.Score) || result.Score <= 0 || result.Score > 1_000_000 || !double.IsFinite(result.Interference))
-        {
-            return (null, null, null, null, "the processor check returned an invalid score");
-        }
-        double interference = Math.Round(result.Interference, 2);
-        if (interference > _performanceEnvironment.MaximumInterference)
-        {
-            // Other programs slowed the check down (a disturbed run can read a third of the real speed), so this
-            // score would wrongly call the PC slow. It does not vote; the next launch measures again.
-            string busy = $"the computer was busy during the processor check (score {result.Score.ToString("0", CultureInfo.InvariantCulture)}, "
-                + $"typical step {(interference * 100).ToString("0", CultureInfo.InvariantCulture)}% slower than the fastest)";
-            _log($"Performance check: {busy}; it does not count toward lite and is measured again next launch.");
-            return (null, null, interference, Math.Round(result.Score, 1), busy);
-        }
-        return (Math.Round(result.Score, 1), Math.Round(result.QuantaPerSecond, 1), interference, null, "");
-    }
 
     // Never fails the update: an error rolls this one transaction back, is logged, and Minecraft starts with the
     // pack exactly as it was before the switch. Only a failed crash recovery (or cancellation) propagates.
@@ -507,6 +470,17 @@ internal sealed partial class UpdateEngine
         var wanted = plan.Mode == PerformanceMode.Lite && plan.Lite is not null
             ? plan.Lite.DisabledMods.Where(files.ContainsKey).ToHashSet(StringComparer.OrdinalIgnoreCase)
             : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (wanted.Count > 0)
+        {
+            (bool allowed, bool checkChanged) = CheckLiteModList(target, wanted, next, token);
+            changed |= checkChanged;
+            if (!allowed) wanted.Clear(); // refused: every mod stays (or is switched back) on; packs and settings still apply
+        }
+        else if (next.ModCheck.Length != 0)
+        {
+            next.ModCheck = "";
+            changed = true;
+        }
         var turnedOn = new List<string>();
         var turnedOff = new List<string>();
 
@@ -609,6 +583,52 @@ internal sealed partial class UpdateEngine
         return changed;
     }
 
+    // The dependency rule (LiteModGuard) over the jars this PC actually has: every top-level mods/*.jar stays enabled
+    // except the listed ones, which are read from <jar> or their lite copy <jar>.disabled. Runs once per release and
+    // list (the result is kept in the lite record); a refusal is logged and switches no mod off.
+    private (bool Allowed, bool Changed) CheckLiteModList(UpdateManifest target, HashSet<string> wanted, PerformanceLedger next,
+        CancellationToken token)
+    {
+        string identity = string.Join('\n', target.Files.Where(file => PathSafety.IsLiteModPath(file.Path) || PathSafety.IsNeverDisabledModPath(file.Path))
+                .Select(file => file.Path.ToLowerInvariant() + ":" + file.Sha256.ToLowerInvariant()).Order(StringComparer.Ordinal))
+            + "\n--\n" + string.Join('\n', wanted.Select(path => path.ToLowerInvariant()).Order(StringComparer.Ordinal));
+        string key = Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(identity))).ToLowerInvariant();
+        if (next.ModCheck == "ok:" + key) return (true, false);
+        if (next.ModCheck == "refused:" + key) return (false, false);
+        token.ThrowIfCancellationRequested();
+        string modsDirectory = SafeLocal("mods");
+        var enabled = new List<(string Label, string Path)>();
+        var off = new List<(string Label, string Path)>();
+        var problems = new List<string>();
+        if (Directory.Exists(modsDirectory))
+        {
+            foreach (string jar in Directory.GetFiles(modsDirectory, "*.jar", SearchOption.TopDirectoryOnly).Order(StringComparer.OrdinalIgnoreCase))
+            {
+                string relative = "mods/" + Path.GetFileName(jar);
+                if (!wanted.Contains(relative)) enabled.Add((Path.GetFileName(jar), jar));
+            }
+        }
+        foreach (string path in wanted.Order(StringComparer.OrdinalIgnoreCase))
+        {
+            string jar = SafeLocal(path);
+            string source = File.Exists(jar) ? jar : jar + ".disabled";
+            if (File.Exists(source)) off.Add((Path.GetFileName(path), source));
+            else problems.Add($"{Path.GetFileName(path)} is not on this computer, so its dependencies cannot be checked");
+        }
+        problems.AddRange(LiteModGuard.Check(enabled, off));
+        bool allowed = problems.Count == 0;
+        next.ModCheck = (allowed ? "ok:" : "refused:") + key;
+        if (allowed)
+        {
+            _log($"Performance mode: the lite mod list passed the dependency check ({off.Count} mods off, {enabled.Count} mods stay on).");
+        }
+        else
+        {
+            _log("Performance mode: the lite mod list is refused, so no mod is switched off: " + string.Join("; ", problems) + ".");
+        }
+        return (allowed, true);
+    }
+
     private static bool SetModEntry(PerformanceLedger ledger, PerformanceModEntry? entry, ManifestFile signed, string state)
     {
         if (entry is not null && entry.State == state && entry.Size == signed.Size
@@ -668,7 +688,15 @@ internal sealed partial class UpdateEngine
                 continue;
             }
 
-            if (sameRevision && entry!.ListedIds.ToHashSet(StringComparer.Ordinal).SetEquals(wanted)) continue; // applied once
+            bool signedCopyBack = sameRevision && entry!.Removed.Count > 0
+                && PathSafety.IsExpectedHash(currentHash, Convert.ToHexString(SHA256.HashData(Convert.FromBase64String(entry.OriginalBase64))).ToLowerInvariant());
+            if (sameRevision && !signedCopyBack && entry!.ListedIds.ToHashSet(StringComparer.Ordinal).SetEquals(wanted)) continue; // applied once
+            if (signedCopyBack)
+            {
+                // The unfiltered copy is back (the player deleted the profile and convergence restored the signed
+                // revision): it is filtered again. A profile Packed Packs rewrote (other bytes) is never refiltered.
+                _log($"Performance mode: {Path.GetFileName(signed.Path)} came back unfiltered, so the lite packs are taken out again.");
+            }
             byte[] original = sameRevision ? Convert.FromBase64String(entry!.OriginalBase64) : current;
             PackProfileText.PackList? originalList = PackProfileText.Parse(original);
             if (originalList is null)
@@ -681,7 +709,7 @@ internal sealed partial class UpdateEngine
                 .Where(item => wantedSet.Contains(item.Id))
                 .Select(item => new PerformanceRemovedPack { Id = item.Id, Index = item.index }).ToList();
             byte[]? filtered;
-            if (sameRevision && !PathSafety.IsExpectedHash(currentHash, entry!.FilteredSha256))
+            if (sameRevision && !signedCopyBack && !PathSafety.IsExpectedHash(currentHash, entry!.FilteredSha256))
             {
                 // Packed Packs rewrote the file since lite filtered it: work on its current contents.
                 filtered = ReinsertPacks(current, entry.Removed.Where(item => !wantedSet.Contains(item.Id)).ToList(), wantedSet);
