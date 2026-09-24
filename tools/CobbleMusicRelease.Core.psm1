@@ -21,6 +21,10 @@ $script:PerformanceSettingTargets = @{
     'config/xaero/minimap/profiles/cobbleverse.cfg' = 'properties'
 }
 $script:PerformanceProfilesMinimumUpdater = [Version]'1.2.22'
+# Round 2: mods lite may never switch off (mirrors LiteModGuard.CriticalModIds in the updater). kewz_subtle_stub is the
+# Subtle Effects join fix, which every PC needs once Subtle Effects is off on lite PCs.
+$script:LiteCriticalModIds = @('minecraft', 'java', 'fabricloader', 'fabric-loader', 'fabric-api', 'fabric', 'cobblemon', 'sodium', 'iris',
+    'packed_packs', 'kewz_subtle_stub')
 $script:ReservedReleaseMetadataAssetCount = 2
 $script:MaximumPublicReleaseCount = 499
 $script:ExactRetiredV1013SeedIdentities = @{
@@ -1500,13 +1504,6 @@ function Test-CobbleShaderSettingPath {
         $name.StartsWith('oculus', [StringComparison]::OrdinalIgnoreCase)
 }
 
-function Get-CobbleGpuPatternKey {
-    param([AllowEmptyString()][string]$Pattern)
-    $cleaned = $Pattern -replace '\(R\)', ' ' -replace '\(TM\)', ' '
-    $tokens = @([regex]::Matches($cleaned, '[A-Za-z0-9#]+') | ForEach-Object { $_.Value.ToUpperInvariant() })
-    return ($tokens -join ' ')
-}
-
 function Test-CobbleJsonScalarLiteral {
     param([AllowEmptyString()][string]$Value)
     try {
@@ -1530,7 +1527,11 @@ function ConvertTo-CobblePerformanceProfiles {
         [Parameter(Mandatory)]$Profiles,
         [Parameter(Mandatory)]$FileSet,
         [Parameter(Mandatory)]$SeedFileSet,
-        [string]$Context = 'performanceProfiles'
+        [string]$Context = 'performanceProfiles',
+        # Round 2: the release tree's mods folder. When given, the list must pass the dependency rule over its jars
+        # (Get-CobbleLiteModListProblems); -ExtraModJars adds jars that are not in the folder yet.
+        [string]$ModsDirectory,
+        [string[]]$ExtraModJars = @()
     )
 
     foreach ($name in @(Get-CobblePropertyNames $Profiles)) {
@@ -1548,27 +1549,21 @@ function ConvertTo-CobblePerformanceProfiles {
 
     $detection = Get-CobbleOptionalPropertyValue $liteValue 'detection'
     if ($null -eq $detection) { throw "$Context.lite.detection is missing." }
-    [int]$threshold = 0
-    $thresholdValue = Get-CobbleOptionalPropertyValue $detection 'cpuScoreThreshold'
-    if ($null -eq $thresholdValue -or -not [int]::TryParse([string]$thresholdValue, [ref]$threshold) -or $threshold -lt 1 -or $threshold -gt 100000) {
-        throw "$Context.lite.detection.cpuScoreThreshold must be a whole number from 1 to 100000."
+    foreach ($name in @(Get-CobblePropertyNames $detection)) {
+        if ($name -cnotin @('cpuSingleThreadBelow', 'gpuScoreBelow')) { throw "$Context.lite.detection has an unknown property: $name" }
     }
-    $patternKeys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
-    $patternLists = [ordered]@{}
-    foreach ($listName in @('fullGpuPatterns', 'liteGpuPatterns')) {
-        $listValue = Get-CobbleOptionalPropertyValue $detection $listName
-        if ($null -eq $listValue) { throw "$Context.lite.detection.$listName is missing." }
-        $patterns = @(foreach ($pattern in @($listValue)) {
-            $text = [string]$pattern
-            if ($text.Length -gt 64 -or $text -cnotmatch '^[A-Za-z0-9 #-]+$' -or (Get-CobbleGpuPatternKey $text).Length -eq 0) {
-                throw "$Context.lite.detection.$listName has an invalid graphics card pattern: '$text'"
-            }
-            if (-not $patternKeys.Add((Get-CobbleGpuPatternKey $text))) { throw "$Context.lite.detection lists a graphics card pattern twice: '$text'" }
-            $text
-        })
-        $patternLists[$listName] = $patterns
+    # Round 2: lines against the updater's built-in score table (PassMark single-thread rating / G3D Mark).
+    $lines = [ordered]@{}
+    foreach ($line in @(@{ Name = 'cpuSingleThreadBelow'; Maximum = 100000 }, @{ Name = 'gpuScoreBelow'; Maximum = 1000000 })) {
+        [int]$number = 0
+        $value = Get-CobbleOptionalPropertyValue $detection $line.Name
+        if ($null -eq $value -or $value -is [string] -or $value -is [bool] -or
+            -not [int]::TryParse([string]$value, [Globalization.NumberStyles]::None, [Globalization.CultureInfo]::InvariantCulture, [ref]$number) -or
+            $number -lt 1 -or $number -gt $line.Maximum) {
+            throw "$Context.lite.detection.$($line.Name) must be a whole number from 1 to $($line.Maximum)."
+        }
+        $lines[$line.Name] = $number
     }
-    if ($patternKeys.Count -gt 400) { throw "$Context.lite.detection lists too many graphics card patterns." }
 
     $modSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $mods = @(foreach ($modValue in @(Get-CobbleOptionalPropertyValue $liteValue 'disabledMods')) {
@@ -1582,8 +1577,17 @@ function ConvertTo-CobblePerformanceProfiles {
             throw "$Context.lite.disabledMods names a mod that is not a managed top-level jar of this release: $path"
         }
         if (-not $modSet.Add($key)) { throw "$Context.lite.disabledMods lists a mod twice: $path" }
+        if ($path.StartsWith('mods/kewz-subtle-effects-stub', [StringComparison]::OrdinalIgnoreCase)) {
+            throw "$Context.lite.disabledMods names a mod lite may never switch off (the Subtle Effects join fix): $path"
+        }
         $path
     })
+    if ($PSBoundParameters.ContainsKey('ModsDirectory')) {
+        $modProblems = @(Get-CobbleLiteModListProblems -ModsDirectory $ModsDirectory -DisabledMods @($mods) -ExtraModJars @($ExtraModJars))
+        if ($modProblems.Count -gt 0) {
+            throw "$Context.lite.disabledMods is refused: $($modProblems -join '; ')"
+        }
+    }
     if ($mods.Count -gt 200) { throw "$Context.lite.disabledMods lists too many mods." }
 
     $packSet = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
@@ -1642,15 +1646,165 @@ function ConvertTo-CobblePerformanceProfiles {
         lite = [ordered]@{
             revisionId = $revisionId
             detection = [ordered]@{
-                cpuScoreThreshold = $threshold
-                fullGpuPatterns = @($patternLists['fullGpuPatterns'])
-                liteGpuPatterns = @($patternLists['liteGpuPatterns'])
+                cpuSingleThreadBelow = $lines['cpuSingleThreadBelow']
+                gpuScoreBelow = $lines['gpuScoreBelow']
             }
             disabledMods = @($mods)
             removedPackIds = @($packIds)
             settings = @($settings)
         }
     }
+}
+
+# Round 2: every fabric.mod.json in a jar and the jars it nests (Fabric "jars"), recursively. Same reading as the
+# updater's LiteModGuard: control characters inside strings become spaces (Fabric Loader accepts raw line breaks there,
+# EG Particle Interactions has one), comments and trailing commas are allowed.
+function Get-CobbleJsonChild {
+    param([Parameter(Mandatory)]$Element, [Parameter(Mandatory)][string]$Name)
+    if ($Element.ValueKind -ne [Text.Json.JsonValueKind]::Object) { return $null }
+    foreach ($property in $Element.EnumerateObject()) { if ($property.Name -ceq $Name) { return $property.Value } }
+    return $null
+}
+
+function Read-CobbleFabricModTree {
+    param([Parameter(Mandatory)][IO.Compression.ZipArchive]$Archive, [Parameter(Mandatory)][string]$Label, [int]$Depth = 0)
+    $entry = $Archive.GetEntry('fabric.mod.json')
+    if ($null -eq $entry) { return }
+    if ($entry.Length -gt 1MB) { throw "${Label}: fabric.mod.json is unusually large" }
+    $reader = [IO.StreamReader]::new($entry.Open(), [Text.UTF8Encoding]::new($false, $false))
+    try { $text = $reader.ReadToEnd().TrimStart([char]0xFEFF) } finally { $reader.Dispose() }
+    $text = [regex]::Replace($text, '"(?:[^"\\]|\\.)*"', { param($match) [regex]::Replace($match.Value, '[\x00-\x1F]', ' ') })
+    $options = [Text.Json.JsonDocumentOptions]::new()
+    $options.AllowTrailingCommas = $true
+    $options.CommentHandling = [Text.Json.JsonCommentHandling]::Skip
+    try { $document = [Text.Json.JsonDocument]::Parse($text, $options) }
+    catch { throw "${Label}: fabric.mod.json could not be read ($($_.Exception.Message))" }
+    try {
+        $root = $document.RootElement
+        $idValue = Get-CobbleJsonChild $root 'id'
+        if ($null -eq $idValue -or $idValue.ValueKind -ne [Text.Json.JsonValueKind]::String -or $idValue.GetString().Length -eq 0) {
+            throw "${Label}: fabric.mod.json has no mod id"
+        }
+        $provides = [Collections.Generic.List[string]]::new()
+        $providesValue = Get-CobbleJsonChild $root 'provides'
+        if ($null -ne $providesValue -and $providesValue.ValueKind -eq [Text.Json.JsonValueKind]::Array) {
+            foreach ($item in $providesValue.EnumerateArray()) {
+                if ($item.ValueKind -eq [Text.Json.JsonValueKind]::String) { $provides.Add($item.GetString()) }
+                elseif ($item.ValueKind -eq [Text.Json.JsonValueKind]::Object) {
+                    $providedId = Get-CobbleJsonChild $item 'id'
+                    if ($null -ne $providedId -and $providedId.ValueKind -eq [Text.Json.JsonValueKind]::String) { $provides.Add($providedId.GetString()) }
+                }
+            }
+        }
+        $depends = [Collections.Generic.List[string]]::new()
+        $dependsValue = Get-CobbleJsonChild $root 'depends'
+        if ($null -ne $dependsValue) {
+            if ($dependsValue.ValueKind -eq [Text.Json.JsonValueKind]::Object) {
+                foreach ($property in $dependsValue.EnumerateObject()) { $depends.Add($property.Name) }
+            }
+            elseif ($dependsValue.ValueKind -eq [Text.Json.JsonValueKind]::Array) {
+                foreach ($item in $dependsValue.EnumerateArray()) {
+                    if ($item.ValueKind -eq [Text.Json.JsonValueKind]::Object) { foreach ($property in $item.EnumerateObject()) { $depends.Add($property.Name) } }
+                    elseif ($item.ValueKind -eq [Text.Json.JsonValueKind]::String) { $depends.Add($item.GetString()) }
+                }
+            }
+        }
+        $library = $false
+        $custom = Get-CobbleJsonChild $root 'custom'
+        if ($null -ne $custom) {
+            $modmenu = Get-CobbleJsonChild $custom 'modmenu'
+            if ($null -ne $modmenu) {
+                $badges = Get-CobbleJsonChild $modmenu 'badges'
+                if ($null -ne $badges -and $badges.ValueKind -eq [Text.Json.JsonValueKind]::Array) {
+                    foreach ($badge in $badges.EnumerateArray()) {
+                        if ($badge.ValueKind -eq [Text.Json.JsonValueKind]::String -and $badge.GetString() -ceq 'library') { $library = $true }
+                    }
+                }
+            }
+        }
+        [pscustomobject]@{ Jar = $Label; Id = $idValue.GetString(); Provides = @($provides); Depends = @($depends); Library = $library; Depth = $Depth }
+        $jars = Get-CobbleJsonChild $root 'jars'
+        if ($null -eq $jars -or $jars.ValueKind -ne [Text.Json.JsonValueKind]::Array) { return }
+        if ($Depth -ge 4) { throw "${Label}: jars are nested too deeply" }
+        foreach ($jar in $jars.EnumerateArray()) {
+            $file = Get-CobbleJsonChild $jar 'file'
+            if ($null -eq $file -or $file.ValueKind -ne [Text.Json.JsonValueKind]::String) { continue }
+            $nested = $Archive.GetEntry($file.GetString())
+            if ($null -eq $nested) { throw "${Label}: nested jar $($file.GetString()) is listed but missing" }
+            if ($nested.Length -gt 128MB) { throw "${Label}: nested jar $($file.GetString()) is unusually large" }
+            $memory = [IO.MemoryStream]::new()
+            $stream = $nested.Open()
+            try { $stream.CopyTo($memory) } finally { $stream.Dispose() }
+            $memory.Position = 0
+            $inner = [IO.Compression.ZipArchive]::new($memory, [IO.Compression.ZipArchiveMode]::Read)
+            try { Read-CobbleFabricModTree -Archive $inner -Label $Label -Depth ($Depth + 1) }
+            finally { $inner.Dispose(); $memory.Dispose() }
+        }
+    }
+    finally { $document.Dispose() }
+}
+
+function Read-CobbleFabricModJar {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Label)
+    $archive = [IO.Compression.ZipFile]::OpenRead($Path)
+    try { return @(Read-CobbleFabricModTree -Archive $archive -Label $Label) } finally { $archive.Dispose() }
+}
+
+# Round 2 (Kewz's verifier fixes): a lite mod list is refused when a listed jar is a critical mod or a library, or when
+# switching the listed jars off would leave an enabled mod (top-level or nested) with a `depends` entry that only the
+# listed jars provide. Same rule as the updater's LiteModGuard; computed here from the release tree before signing.
+# Returns the problems (empty = the list is safe).
+function Get-CobbleLiteModListProblems {
+    param(
+        [Parameter(Mandatory)][string]$ModsDirectory,
+        [AllowEmptyCollection()][string[]]$DisabledMods = @(),
+        [AllowEmptyCollection()][string[]]$ExtraModJars = @()
+    )
+    if (-not (Test-Path -LiteralPath $ModsDirectory -PathType Container)) { return @("the mods folder $ModsDirectory does not exist") }
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $problems = [Collections.Generic.List[string]]::new()
+    $offNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in $DisabledMods) { [void]$offNames.Add([IO.Path]::GetFileName($path)) }
+    $enabledMods = [Collections.Generic.List[object]]::new()
+    $offMods = [Collections.Generic.List[object]]::new()
+    $jars = @(Get-ChildItem -LiteralPath $ModsDirectory -Filter '*.jar' -File | Sort-Object Name)
+    foreach ($jar in $jars) {
+        if ($offNames.Contains($jar.Name)) { continue }
+        try { foreach ($mod in @(Read-CobbleFabricModJar -Path $jar.FullName -Label $jar.Name)) { $enabledMods.Add($mod) } }
+        catch { $problems.Add("$($jar.Name) could not be read ($($_.Exception.Message)), so its dependencies cannot be checked") }
+    }
+    foreach ($extra in $ExtraModJars) {
+        $label = 'extra ' + [IO.Path]::GetFileName($extra)
+        try { foreach ($mod in @(Read-CobbleFabricModJar -Path ([IO.Path]::GetFullPath($extra)) -Label $label)) { $enabledMods.Add($mod) } }
+        catch { $problems.Add("$label could not be read ($($_.Exception.Message))") }
+    }
+    foreach ($path in $DisabledMods) {
+        $name = [IO.Path]::GetFileName($path)
+        $local = Join-Path $ModsDirectory $name
+        if (-not (Test-Path -LiteralPath $local -PathType Leaf)) { $problems.Add("$name is not in the release tree"); continue }
+        try { $mods = @(Read-CobbleFabricModJar -Path $local -Label $name) }
+        catch { $problems.Add("$name could not be read ($($_.Exception.Message))"); continue }
+        if ($mods.Count -eq 0) { $problems.Add("$name is not a Fabric mod"); continue }
+        $top = $mods[0]
+        $critical = @(@($top.Id) + @($top.Provides) | Where-Object { $script:LiteCriticalModIds -ccontains $_ })
+        if ($critical.Count -gt 0) { $problems.Add("$name is a mod lite may never switch off ($($critical -join ', '))") }
+        if ($top.Library) { $problems.Add("$name ($($top.Id)) is a library") }
+        foreach ($mod in $mods) { $offMods.Add($mod) }
+    }
+    $after = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($mod in $enabledMods) { [void]$after.Add($mod.Id); foreach ($id in $mod.Provides) { [void]$after.Add($id) } }
+    $before = [Collections.Generic.HashSet[string]]::new($after, [StringComparer]::Ordinal)
+    foreach ($mod in $offMods) { [void]$before.Add($mod.Id); foreach ($id in $mod.Provides) { [void]$before.Add($id) } }
+    foreach ($mod in $enabledMods) {
+        foreach ($dependency in @($mod.Depends | Select-Object -Unique)) {
+            if ($before.Contains($dependency) -and -not $after.Contains($dependency)) {
+                $owners = @($offMods | Where-Object { $_.Id -ceq $dependency -or $_.Provides -ccontains $dependency } | ForEach-Object { $_.Jar } | Select-Object -Unique)
+                $nested = if ($mod.Depth -gt 0) { ', nested' } else { '' }
+                $problems.Add("$($mod.Jar) ($($mod.Id)$nested) depends on $dependency, which only $($owners -join ', ') provides")
+            }
+        }
+    }
+    return @($problems)
 }
 
 # Manifest-level check shared by the v1 and v2 assertions: a performanceProfiles section needs updater 1.2.22.
@@ -1679,6 +1833,8 @@ function Assert-CobblePerformanceProfilesManifest {
 
 Export-ModuleMember -Function @(
     'Test-CobbleShaderSettingPath',
+    'Get-CobbleLiteModListProblems',
+    'Read-CobbleFabricModJar',
     'ConvertTo-CobblePerformanceProfiles',
     'Assert-CobblePerformanceProfilesManifest',
     'Get-CobbleOptionalPropertyValue',

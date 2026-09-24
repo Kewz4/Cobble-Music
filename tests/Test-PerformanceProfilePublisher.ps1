@@ -20,6 +20,7 @@ function Assert-Throws([scriptblock]$Action, [string]$Message) {
 
 $files = ConvertTo-CobbleFileRecordSet -Entries @(
     (New-Record 'mods/atmospherics-2.6.6.jar' 10 'a'),
+    (New-Record 'mods/kewz-subtle-effects-stub-1.0.0+mc1.21.1.jar' 13 '2'),
     (New-Record 'mods/InventoryParticles-3.0.0.jar' 11 'b'),
     (New-Record 'config/packed_packs/profiles/resourcepacks/Default.profile.json' 12 'c')
 ) -Context 'fixture files'
@@ -34,7 +35,7 @@ function New-Profile {
     return [pscustomobject]@{
         lite = [pscustomobject]@{
             revisionId = 'lite-1.0.61-v1'
-            detection = [pscustomobject]@{ cpuScoreThreshold = 1050; fullGpuPatterns = @('RTX 3080'); liteGpuPatterns = @('RTX 3050', 'RADEON ###M') }
+            detection = [pscustomobject]@{ cpuSingleThreadBelow = 2500; gpuScoreBelow = 13000 }
             disabledMods = @('mods/atmospherics-2.6.6.jar')
             removedPackIds = @("file/Toasty's Fresher Ferns.zip")
             settings = @([pscustomobject]@{ path = 'config/sodium-options.json'; format = 'json'; key = 'quality.leaves_quality'; value = '"FAST"' })
@@ -44,7 +45,7 @@ function New-Profile {
 
 $normalized = ConvertTo-CobblePerformanceProfiles -Profiles (New-Profile) -FileSet $files -SeedFileSet $seeds
 $json = [ordered]@{ performanceProfiles = $normalized } | ConvertTo-Json -Depth 12 -Compress
-Assert-True ($json -ceq '{"performanceProfiles":{"lite":{"revisionId":"lite-1.0.61-v1","detection":{"cpuScoreThreshold":1050,"fullGpuPatterns":["RTX 3080"],"liteGpuPatterns":["RTX 3050","RADEON ###M"]},"disabledMods":["mods/atmospherics-2.6.6.jar"],"removedPackIds":["file/Toasty''s Fresher Ferns.zip"],"settings":[{"path":"config/sodium-options.json","format":"json","key":"quality.leaves_quality","value":"\"FAST\""}]}}}') `
+Assert-True ($json -ceq '{"performanceProfiles":{"lite":{"revisionId":"lite-1.0.61-v1","detection":{"cpuSingleThreadBelow":2500,"gpuScoreBelow":13000},"disabledMods":["mods/atmospherics-2.6.6.jar"],"removedPackIds":["file/Toasty''s Fresher Ferns.zip"],"settings":[{"path":"config/sodium-options.json","format":"json","key":"quality.leaves_quality","value":"\"FAST\""}]}}}') `
     "Canonical performanceProfiles JSON changed: $json"
 Assert-True (Test-CobbleShaderSettingPath -Path 'config/iris.properties') 'Iris settings were not recognized as shader settings.'
 Assert-True (Test-CobbleShaderSettingPath -Path 'shaderpacks/ComplementaryReimagined_r5.5.1.zip.txt') 'Shaderpack options were not recognized.'
@@ -67,9 +68,14 @@ $rejections = @(
     @{ Why = 'the vanilla pack'; Edit = { param($p) $p.lite.removedPackIds = @('vanilla') } },
     @{ Why = 'a duplicate pack'; Edit = { param($p) $p.lite.removedPackIds = @('a', 'a') } },
     @{ Why = 'a bad revision id'; Edit = { param($p) $p.lite.revisionId = 'Lite V1' } },
-    @{ Why = 'a zero threshold'; Edit = { param($p) $p.lite.detection.cpuScoreThreshold = 0 } },
-    @{ Why = 'a regex graphics pattern'; Edit = { param($p) $p.lite.detection.liteGpuPatterns = @('RTX.*') } },
-    @{ Why = 'a duplicate graphics pattern'; Edit = { param($p) $p.lite.detection.fullGpuPatterns = @('RTX 3050') } },
+    @{ Why = 'a zero processor line'; Edit = { param($p) $p.lite.detection.cpuSingleThreadBelow = 0 } },
+    @{ Why = 'a zero graphics line'; Edit = { param($p) $p.lite.detection.gpuScoreBelow = 0 } },
+    @{ Why = 'a processor line above the ceiling'; Edit = { param($p) $p.lite.detection.cpuSingleThreadBelow = 100001 } },
+    @{ Why = 'a line written as text'; Edit = { param($p) $p.lite.detection.gpuScoreBelow = '13000' } },
+    @{ Why = 'a fractional line'; Edit = { param($p) $p.lite.detection.cpuSingleThreadBelow = 2500.5 } },
+    @{ Why = 'a missing graphics line'; Edit = { param($p) $p.lite.detection = [pscustomobject]@{ cpuSingleThreadBelow = 2500 } } },
+    @{ Why = 'the round-1 threshold field'; Edit = { param($p) $p.lite.detection | Add-Member -NotePropertyName 'cpuScoreThreshold' -NotePropertyValue 1050 } },
+    @{ Why = 'the Subtle Effects join fix'; Edit = { param($p) $p.lite.disabledMods = @('mods/kewz-subtle-effects-stub-1.0.0+mc1.21.1.jar') } },
     @{ Why = 'an unknown property'; Edit = { param($p) $p.lite | Add-Member -NotePropertyName 'shaders' -NotePropertyValue @() } }
 )
 foreach ($case in $rejections) {
@@ -89,4 +95,63 @@ Assert-True (-not (Assert-CobblePerformanceProfilesManifest -Manifest ([pscustom
 $orderedManifest = [ordered]@{ minimumUpdaterVersion = '1.2.22'; performanceProfiles = $normalized }
 Assert-True (Assert-CobblePerformanceProfilesManifest -Manifest ([pscustomobject]$orderedManifest) -FileSet $files -SeedFileSet $seeds) 'The publisher''s own ordered manifest shape was rejected.'
 
-Write-Host 'Performance profile publisher checks passed: canonical JSON, shader/Iris/keybind/pack-list rejection, exact managed jars, 1.2.22 floor.'
+# Round 2: the dependency rule over a release tree's jars (same rule as the updater's LiteModGuard).
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$work = Join-Path ([IO.Path]::GetTempPath()) ('cobble-lite-closure-' + [guid]::NewGuid().ToString('N'))
+$mods = Join-Path $work 'mods'
+New-Item -ItemType Directory -Path $mods -Force | Out-Null
+function New-ZipBytes([hashtable]$Entries) {
+    $memory = [IO.MemoryStream]::new()
+    $archive = [IO.Compression.ZipArchive]::new($memory, [IO.Compression.ZipArchiveMode]::Create, $true)
+    foreach ($name in @($Entries.Keys | Sort-Object)) {
+        $entry = $archive.CreateEntry($name)
+        $stream = $entry.Open()
+        $bytes = if ($Entries[$name] -is [byte[]]) { $Entries[$name] } else { [Text.Encoding]::UTF8.GetBytes([string]$Entries[$name]) }
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Dispose()
+    }
+    $archive.Dispose()
+    return ,$memory.ToArray()
+}
+function New-ModJar([string]$Folder, [string]$Name, [string]$Json, [hashtable]$Nested = @{}) {
+    $entries = @{ 'fabric.mod.json' = $Json }
+    foreach ($key in $Nested.Keys) { $entries[$key] = $Nested[$key] }
+    [IO.File]::WriteAllBytes((Join-Path $Folder $Name), (New-ZipBytes $entries))
+}
+try {
+    $libX = New-ZipBytes @{ 'fabric.mod.json' = '{"schemaVersion":1,"id":"libx","version":"1"}' }
+    New-ModJar $mods 'atmospherics-2.6.6.jar' ("{`"schemaVersion`":1,`"id`":`"atmospherics`",`"version`":`"2.6.6`",`"description`":`"line one`nline two`",`"jars`":[{`"file`":`"META-INF/jars/libx.jar`"}]}") @{ 'META-INF/jars/libx.jar' = $libX }
+    New-ModJar $mods 'InventoryParticles-3.0.0.jar' '{"schemaVersion":1,"id":"inventoryparticles","version":"3.0.0","recommends":{"atmospherics":"*"}}'
+    New-ModJar $mods 'kewz-subtle-effects-stub-1.0.0+mc1.21.1.jar' '{"schemaVersion":1,"id":"kewz_subtle_stub","version":"1.0.0","depends":{"minecraft":"1.21.1"}}'
+    $safe = @(Get-CobbleLiteModListProblems -ModsDirectory $mods -DisabledMods @('mods/atmospherics-2.6.6.jar'))
+    Assert-True ($safe.Count -eq 0) "A safe list was refused (recommends only, raw line break in a string): $($safe -join ' | ')"
+    $ok = ConvertTo-CobblePerformanceProfiles -Profiles (New-Profile) -FileSet $files -SeedFileSet $seeds -ModsDirectory $mods
+    Assert-True (@($ok['lite']['disabledMods']).Count -eq 1) 'The tree check dropped the mod list.'
+
+    New-ModJar $mods 'libuser.jar' '{"schemaVersion":1,"id":"libuser","version":"1","depends":{"libx":">=1"}} // comment'
+    $lost = @(Get-CobbleLiteModListProblems -ModsDirectory $mods -DisabledMods @('mods/atmospherics-2.6.6.jar'))
+    Assert-True ($lost.Count -eq 1 -and $lost[0] -like 'libuser.jar (libuser) depends on libx, which only atmospherics-2.6.6.jar provides') "A library lost with its host was not caught: $($lost -join ' | ')"
+    Assert-Throws { ConvertTo-CobblePerformanceProfiles -Profiles (New-Profile) -FileSet $files -SeedFileSet $seeds -ModsDirectory $mods | Out-Null } 'The publisher accepted a list that breaks a dependency.'
+    New-ModJar $mods 'holder.jar' '{"schemaVersion":1,"id":"holder","version":"1","jars":[{"file":"META-INF/jars/libx.jar"}],}' @{ 'META-INF/jars/libx.jar' = $libX }
+    Assert-True (@(Get-CobbleLiteModListProblems -ModsDirectory $mods -DisabledMods @('mods/atmospherics-2.6.6.jar')).Count -eq 0) 'A library another enabled jar nests was treated as lost.'
+
+    New-ModJar $mods 'sky-addon.jar' '{"schemaVersion":1,"id":"sky_addon","version":"1","depends":{"atmospherics":">=2.6"}}'
+    Assert-True (@(Get-CobbleLiteModListProblems -ModsDirectory $mods -DisabledMods @('mods/atmospherics-2.6.6.jar')).Count -eq 1) 'A direct depends on an off mod was not caught.'
+    Remove-Item -LiteralPath (Join-Path $mods 'sky-addon.jar')
+    $extra = Join-Path $work 'extra-addon.jar'
+    New-ModJar $work 'extra-addon.jar' '{"schemaVersion":1,"id":"extra_addon","version":"1","depends":{"atmospherics":"*"}}'
+    Assert-True (@(Get-CobbleLiteModListProblems -ModsDirectory $mods -DisabledMods @('mods/atmospherics-2.6.6.jar') -ExtraModJars @($extra)).Count -eq 1) 'An extra jar was not checked.'
+
+    New-ModJar $mods 'join-fix.jar' '{"schemaVersion":1,"id":"kewz_subtle_stub","version":"1.0.0"}'
+    $stubProblems = @(Get-CobbleLiteModListProblems -ModsDirectory $mods -DisabledMods @('mods/join-fix.jar'))
+    Assert-True ($stubProblems.Count -eq 1 -and $stubProblems[0] -like '*may never switch off (kewz_subtle_stub)*') "The join fix under another file name was not refused: $($stubProblems -join ' | ')"
+    New-ModJar $mods 'somelib.jar' '{"schemaVersion":1,"id":"somelib","version":"1","custom":{"modmenu":{"badges":["library"]}}}'
+    Assert-True (@(Get-CobbleLiteModListProblems -ModsDirectory $mods -DisabledMods @('mods/somelib.jar'))[0] -like '*is a library') 'A library was not refused.'
+    New-ModJar $mods 'sodium.jar' '{"schemaVersion":1,"id":"sodium","version":"0.8.13"}'
+    Assert-True (@(Get-CobbleLiteModListProblems -ModsDirectory $mods -DisabledMods @('mods/sodium.jar')).Count -eq 1) 'A critical mod was not refused.'
+}
+finally {
+    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host 'Performance profile publisher checks passed: canonical JSON, table lines, shader/Iris/keybind/pack-list rejection, exact managed jars, join fix never listed, dependency/critical/library refusal from the tree, 1.2.22 floor.'

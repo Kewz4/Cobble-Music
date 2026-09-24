@@ -1247,11 +1247,13 @@ try {
     $performanceProfiles = $null
     if (-not [string]::IsNullOrWhiteSpace($PerformanceProfileManifest)) {
         $rawPerformanceProfiles = Read-JsonFile -Path $PerformanceProfileManifest -Description 'Performance profile manifest'
-        $performanceProfiles = ConvertTo-CobblePerformanceProfiles -Profiles $rawPerformanceProfiles -FileSet $currentSet -SeedFileSet $seedSet
+        # Round 2: the mod list must also pass the dependency rule over this release tree's own jars.
+        $performanceProfiles = ConvertTo-CobblePerformanceProfiles -Profiles $rawPerformanceProfiles -FileSet $currentSet -SeedFileSet $seedSet `
+            -ModsDirectory (Join-Path $SourceMinecraftDir 'mods')
         if ([Version]$releaseMinimumUpdaterVersion -lt [Version]'1.2.22') { $releaseMinimumUpdaterVersion = '1.2.22' }
         $performanceLite = $performanceProfiles['lite']
         if ($null -ne $performanceLite) {
-            Write-Host "Lite profile $($performanceLite['revisionId']): $(@($performanceLite['disabledMods']).Count) mods, $(@($performanceLite['removedPackIds']).Count) pack ids, $(@($performanceLite['settings']).Count) settings; cpu threshold $($performanceLite['detection']['cpuScoreThreshold'])."
+            Write-Host "Lite profile $($performanceLite['revisionId']): $(@($performanceLite['disabledMods']).Count) mods, $(@($performanceLite['removedPackIds']).Count) pack ids, $(@($performanceLite['settings']).Count) settings; lines: processor below $($performanceLite['detection']['cpuSingleThreadBelow']), graphics below $($performanceLite['detection']['gpuScoreBelow'])."
         }
     }
     # Players run whatever the signed stable channel names. A release that needs a newer updater than the channel
