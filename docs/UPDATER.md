@@ -126,6 +126,46 @@ recorded version already matches. 1.2.21 also accepts one more reviewed one-time
 `options-ftb-force-complete-c-v1`: FTB Quests 2101.1.36 put "Force-complete Hovered" on C, the key Cobblemon's
 Summary uses; exactly that default line becomes unbound, and a manifest carrying it requires updater 1.2.21.
 
+Updater 1.2.22 adds **lite mode** for weak PCs (Kewz, 2026-09-23: a Ryzen 7 2700 + RTX 3050 should run the pack
+well with shaders). Everything a lite PC changes is listed in the signed manifest's `performanceProfiles.lite`, so
+the lists change per release without an updater release. Lite never changes shaderpack options, Iris settings or the
+shader profiles; the updater refuses such targets. The invariants:
+
+- **Decision.** `minecraft/cobble-music-updater/performance-mode.txt` holds `mode=auto|lite|full` and is honoured
+  every launch (the updater creates it with `mode=auto` and only ever refreshes its `# This computer:` status line).
+  With `auto`, the PC is lite when the processor score is below `detection.cpuScoreThreshold` **or** every real
+  display adapter matches `detection.liteGpuPatterns` (a card on `fullGpuPatterns`, or one on neither list, keeps
+  graphics neutral). Patterns are whole words, `#` = one digit. The processor score comes from a ~1 s single-thread
+  probe (score 1000 = Kewz's i7-10750H) run once per PC on its own thread with a 5 s timeout; the raw numbers are
+  kept machine-wide in `%LOCALAPPDATA%\CobbleMusicUpdater\performance-detection.json` and re-measured only for a new
+  processor. A failed, timed-out or disturbed run (typical work step more than 90% slower than the fastest, e.g.
+  Minecraft already running) never votes lite and is retried on the next launch, at most three times. Adapter names
+  come from the display-class registry key (no WMI). Nothing readable = full. One log line states processor, score,
+  adapters, verdict and reason.
+- **Mods** listed in `disabledMods` (exact managed top-level jars) are renamed to `<jar>.disabled`, the Prism
+  convention Fabric Loader ignores. Convergence counts an exact `.disabled` copy as installed (lite-listed mod while
+  lite, or one this instance's ledger says lite switched off), so it is never downloaded again, and full renames it
+  back byte-exact. A player's own `.disabled` copies are never deleted; a mod the player turns back on by hand stays
+  on. A release that updates a lite mod delivers the new jar and lite switches it off again; a release that retires
+  one also removes lite's disabled copy.
+- **Resource packs** in `removedPackIds` are taken out of the two official Packed Packs profiles once per signed
+  profile revision (the profile's own formatting is kept). Full writes back the saved original bytes, or re-inserts
+  the ids at their old positions when Packed Packs re-serialized the file.
+- **Settings** in `settings` are edited once, one value each, only in a compiled allow-list of player-owned files
+  (`options.txt` key:value; Sodium, Sodium Extra, Voxy, voxy-server-side, AS-Outline, AsyncParticles and Gnetum JSON
+  by dotted key path to a scalar; Xaero world map / minimap `cobbleverse.cfg` key = value). The key must occur exactly
+  once; the previous value is recorded; every other byte (order, spacing, comments, CRLF, BOM) is kept. A value the
+  player changes afterwards is never overwritten, and full puts back the recorded value only while the lite value is
+  still there. A missing file or key is skipped (retried on later launches), never created.
+- **Transactions.** Each switch is one journaled transaction after normal convergence, recorded in
+  `minecraft/cobble-music-updater/performance-state.json` (journal field `performanceOutcomes`). A failure rolls it
+  back and is logged; Minecraft still starts with the pack as it was. A release without a lite list, or `mode=full`,
+  undoes everything in the ledger. FULL PCs with an empty ledger are not touched at all.
+- **Compatibility.** A manifest with `performanceProfiles` must require updater 1.2.22 (parser and publisher).
+  Proven with the unchanged 1.2.21 source: it ignores the unknown section when the floor is 1.2.21 (full pack) and
+  rejects the release ("requires updater 1.2.22") when the floor is 1.2.22, so the stable channel must serve 1.2.22
+  before such a release is published (the publisher refuses otherwise).
+
 Network trouble, GitHub rate limiting, a missing release, or invalid remote
 content leaves the last known-good local pack unchanged and lets Prism launch.
 A run that ends **Blocked** (local recovery needs attention, an integrity or
@@ -648,6 +688,28 @@ Unblock-File -LiteralPath $path
 
 This optional manual form intentionally is **not** an `irm | iex` command. The
 script is downloaded, verified by a pinned checksum, and only then run.
+
+### Lite mode lists (updater 1.2.22)
+
+Pass the lite profile with `-PerformanceProfileManifest <file.json>`; the file holds the `performanceProfiles`
+object:
+
+```json
+{ "lite": {
+    "revisionId": "lite-1.0.61-v1",
+    "detection": { "cpuScoreThreshold": 1050, "fullGpuPatterns": ["RTX 3060"], "liteGpuPatterns": ["RTX 3050"] },
+    "disabledMods": ["mods/<exact managed jar>.jar"],
+    "removedPackIds": ["file/<pack>.zip"],
+    "settings": [ { "path": "config/sodium-options.json", "format": "json", "key": "quality.leaves_quality", "value": "\"FAST\"" } ] } }
+```
+
+The Core module validates it (`ConvertTo-CobblePerformanceProfiles`, the same rules as the updater's
+`PerformanceProfilePolicy`), embeds it, and raises `minimumUpdaterVersion` to 1.2.22. The publisher refuses to stage
+when the signed stable channel serves an older updater than the release requires, and refuses a source instance that
+is itself in lite mode (a `performance-state.json` with content or any `mods/*.jar.disabled`), so a lite PC's
+disabled jars can never become the pack. Before publishing, `CobbleMusicUpdater.Tests --check-performance-profile
+<signed manifest> <profile.json> <seed dir> <profile dir> <preview dir>` runs the file through the updater's own
+validation, prints every setting's current value, and writes the filtered Packed Packs profiles a lite PC will get.
 
 ## Publish a pack update
 
